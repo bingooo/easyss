@@ -57,9 +57,10 @@ jobs:
           zip easyss-darwin-amd64.zip ./easyss
           zip easyss-server-darwin-amd64.zip ./easyss-server
           zip easyss-with-notray-darwin-arm64.zip ./easyss-with-notray
-      - name: Release
+      - name: NightlyRelease
         uses: softprops/action-gh-release@v1
         with:
-          name: Release ${{ github.ref_name }}
+          name: Nightly
+          tag_name: ${{ github.event.inputs.tags }}
           body: TODO
           files: bin/*.zip
