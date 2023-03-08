@@ -71,11 +71,15 @@ func TestEasyss(t *testing.T) {
 
 type EasyssSuite struct {
 	suite.Suite
-	ss     *Easyss
-	server *EasyServer
+	certPath string
+	keyPath  string
+	caPath   string
+	tempDir  string
+	ss       *Easyss
+	server   *EasyServer
 }
 
-func (es *EasyssSuite) SetupSuite() {
+func (es *EasyssSuite) SetupTest() {
 	tempDir := es.T().TempDir()
 	certPath := filepath.Join(tempDir, "cert.pem")
 	err := os.WriteFile(certPath, []byte(ServerCert), os.ModePerm)
@@ -84,22 +88,28 @@ func (es *EasyssSuite) SetupSuite() {
 	err = os.WriteFile(keyPath, []byte(ServerKey), os.ModePerm)
 	es.Require().Nil(err)
 
-	server := NewServer(&ServerConfig{
-		Server:     Server,
-		ServerPort: ServerPort,
-		Password:   Password,
-		CertPath:   certPath,
-		KeyPath:    keyPath,
-	})
-	server.disableValidateAddr = true
-	es.server = server
-
-	go es.server.Start()
-	time.Sleep(time.Second)
-
 	caPath := filepath.Join(tempDir, "ca.pem")
 	err = os.WriteFile(caPath, []byte(CACert), os.ModePerm)
 	es.Require().Nil(err)
+	es.caPath = caPath
+
+	es.tempDir = tempDir
+	es.certPath = certPath
+	es.keyPath = keyPath
+}
+
+func (es *EasyssSuite) BeforeTest(suiteName, testName string) {
+	serverConfig := &ServerConfig{
+		Server:     Server,
+		ServerPort: ServerPort,
+		Password:   Password,
+		CertPath:   es.certPath,
+		KeyPath:    es.keyPath,
+	}
+	serverConfig.SetDefaultValue()
+	server := NewServer(serverConfig)
+	server.disableValidateAddr = true
+	es.server = server
 
 	config := &Config{
 		Server:     Server,
@@ -108,21 +118,35 @@ func (es *EasyssSuite) SetupSuite() {
 		Password:   Password,
 		Method:     Method,
 		ProxyRule:  "proxy",
-		CAPath:     caPath,
+		CAPath:     es.caPath,
 	}
 	config.SetDefaultValue()
+
+	switch testName {
+	case "TestDisableTLS":
+		serverConfig.DisableTLS = true
+		config.DisableTLS = true
+	case "TestHTTPTunnelOutbound":
+		serverConfig.EnableHTTPInbound = true
+		config.OutboundProto = "https"
+		config.ServerPort = ServerPort + 1000
+	}
+
+	go es.server.Start()
+	time.Sleep(time.Second)
+
 	ss, err := New(config)
 	es.Nilf(err, "New Easyss failed")
 	ss.disableValidateAddr = true
 	es.ss = ss
 
-	es.Nilf(ss.InitTcpPool(), "init tcp pool failed")
-	go ss.LocalSocks5()
-	go ss.LocalHttp()
+	es.Nilf(es.ss.InitTcpPool(), "init tcp pool failed")
+	go es.ss.LocalSocks5()
+	go es.ss.LocalHttp()
 	time.Sleep(time.Second)
 }
 
-func (es *EasyssSuite) TearDownSuite() {
+func (es *EasyssSuite) TearDownTest() {
 	es.ss.Close()
 	es.server.Close()
 }
@@ -139,7 +163,7 @@ func (es *EasyssSuite) TestEasySuit() {
 		},
 	}
 	body, err := clientGet(client, "https://baidu.com")
-	es.Require().Nilf(err, "http get baidu.com failed")
+	es.Require().Nilf(err, "http get baidu.com failed:%s", err)
 	es.Greater(len(body), 1000)
 
 	client2 := &http.Client{
@@ -168,6 +192,14 @@ func (es *EasyssSuite) TestCloseWrite() {
 	msg := "hello"
 	ret := closeWriteClient(msg)
 	es.Equal(msg, ret)
+}
+
+func (es *EasyssSuite) TestDisableTLS() {
+	es.TestEasySuit()
+}
+
+func (es *EasyssSuite) TestHTTPTunnelOutbound() {
+	es.TestEasySuit()
 }
 
 func clientGet(client *http.Client, url string) (body []byte, err error) {

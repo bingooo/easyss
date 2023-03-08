@@ -26,6 +26,7 @@ import (
 	"github.com/miekg/dns"
 	"github.com/nange/easypool"
 	"github.com/nange/easyss/v2/cipherstream"
+	"github.com/nange/easyss/v2/httptunnel"
 	"github.com/nange/easyss/v2/util"
 	"github.com/oschwald/geoip2-golang"
 	utls "github.com/refraction-networking/utls"
@@ -43,6 +44,13 @@ const (
 const (
 	UDPLocksCount    = 256
 	UDPLocksAndOpVal = 255
+)
+
+const (
+	MaxCap      int           = 40
+	MaxIdle     int           = 5
+	IdleTime    time.Duration = time.Minute
+	MaxLifetime time.Duration = 15 * time.Minute
 )
 
 var (
@@ -178,6 +186,10 @@ type Easyss struct {
 
 	// only used for testing
 	disableValidateAddr bool
+
+	// only used for http outbound proto
+	httpOutboundClient *http.Client
+
 	// the mu Mutex to protect below fields
 	mu               *sync.RWMutex
 	tcpPool          easypool.Pool
@@ -206,6 +218,8 @@ func New(config *Config) (*Easyss, error) {
 	}
 	ss.proxyRule = proxyRule
 
+	ss.cmdBeforeStartup()
+
 	db, err := geoip2.FromBytes(geoIPCNPrivate)
 	if err != nil {
 		panic(err)
@@ -232,6 +246,11 @@ func New(config *Config) (*Easyss, error) {
 		return nil, err
 	}
 
+	if err := ss.initHTTPOutboundClient(); err != nil {
+		log.Errorf("[EASYSS] init http outbound client:%v", err)
+		return nil, err
+	}
+
 	// get origin dns on darwin
 	ds, err := util.SysDNS()
 	if err != nil {
@@ -239,7 +258,7 @@ func New(config *Config) (*Easyss, error) {
 	}
 	ss.originDNS = ds
 
-	go ss.printStatistics()
+	go ss.background()
 
 	return ss, err
 }
@@ -312,7 +331,15 @@ func (ss *Easyss) initServerIPAndDNSCache() error {
 
 		if msg != nil && msgAAAA != nil {
 			if len(msg.Answer) > 0 {
-				ss.serverIP = msg.Answer[0].(*dns.A).A.String()
+				for _, an := range msg.Answer {
+					if a, ok := an.(*dns.A); ok {
+						ss.serverIP = a.A.String()
+						break
+					}
+				}
+				if ss.serverIP == "" {
+					return errors.New("can't query server ip from dns")
+				}
 				_ = ss.SetDNSCache(msg, true, true)
 				_ = ss.SetDNSCache(msg, true, false)
 				_ = ss.SetDNSCache(msgAAAA, true, true)
@@ -350,32 +377,27 @@ func (ss *Easyss) initLocalGatewayAndDevice() error {
 }
 
 func (ss *Easyss) InitTcpPool() error {
+	if !ss.IsNativeOutboundProto() {
+		log.Infof("[EASYSS] outbound proto is %v, don't need init tcp pool", ss.OutboundProto())
+		return nil
+	}
+
+	if ss.DisableTLS() {
+		log.Infof("[EASYSS] TLS is disabled")
+	} else {
+		log.Infof("[EASYSS] TLS is enabled")
+	}
 	if ss.DisableUTLS() {
 		log.Infof("[EASYSS] uTLS is disabled")
 	} else {
 		log.Infof("[EASYSS] uTLS is enabled")
 	}
+	log.Infof("[EASYSS] initializing tcp pool with easy server: %v", ss.ServerAddr())
 
-	var certPool *x509.CertPool
-	if ss.CAPath() != "" {
-		e, err := util.FileExists(ss.CAPath())
-		if err != nil {
-			log.Errorf("[EASYSS] lookup self-signed ca cert:%v", err)
-			return err
-		}
-		if !e {
-			log.Warnf("[EASYSS] ca cert: %s is set but not exists, so self-signed cert is no effect", ss.CAPath())
-		} else {
-			log.Infof("[EASYSS] using self-signed ca cert: %s", ss.CAPath())
-			certPool = x509.NewCertPool()
-			caBuf, err := os.ReadFile(ss.CAPath())
-			if err != nil {
-				return err
-			}
-			if ok := certPool.AppendCertsFromPEM(caBuf); !ok {
-				return errors.New("append certs from pem failed")
-			}
-		}
+	certPool, err := ss.loadCustomCertPool()
+	if err != nil {
+		log.Errorf("[EASYSS] load custom cert pool:%v", err)
+		return err
 	}
 
 	network := "tcp"
@@ -383,9 +405,12 @@ func (ss *Easyss) InitTcpPool() error {
 		network = "tcp4"
 	}
 	factory := func() (net.Conn, error) {
+		if ss.DisableTLS() {
+			return net.DialTimeout(network, ss.ServerAddr(), ss.Timeout())
+		}
+
 		ctx, cancel := context.WithTimeout(context.Background(), ss.Timeout())
 		defer cancel()
-
 		if ss.DisableUTLS() {
 			dialer := &tls.Dialer{
 				Config: &tls.Config{RootCAs: certPool},
@@ -413,17 +438,91 @@ func (ss *Easyss) InitTcpPool() error {
 	}
 
 	config := &easypool.PoolConfig{
-		InitialCap:  5,
-		MaxCap:      40,
-		MaxIdle:     5,
-		Idletime:    time.Minute,
-		MaxLifetime: 15 * time.Minute,
+		InitialCap:  MaxIdle,
+		MaxCap:      MaxCap,
+		MaxIdle:     MaxIdle,
+		Idletime:    IdleTime,
+		MaxLifetime: MaxLifetime,
 		Factory:     factory,
 	}
 	tcpPool, err := easypool.NewHeapPool(config)
 	ss.SetPool(tcpPool)
 
 	return err
+}
+
+func (ss *Easyss) loadCustomCertPool() (*x509.CertPool, error) {
+	if ss.CAPath() == "" {
+		return nil, nil
+	}
+	var certPool *x509.CertPool
+	e, err := util.FileExists(ss.CAPath())
+	if err != nil {
+		log.Errorf("[EASYSS] lookup self-signed ca cert:%v", err)
+		return certPool, err
+	}
+	if !e {
+		log.Warnf("[EASYSS] ca cert: %s is set but not exists, so self-signed cert is no effect", ss.CAPath())
+	} else {
+		log.Infof("[EASYSS] using self-signed ca cert: %s", ss.CAPath())
+		certPool = x509.NewCertPool()
+		caBuf, err := os.ReadFile(ss.CAPath())
+		if err != nil {
+			return certPool, err
+		}
+		if ok := certPool.AppendCertsFromPEM(caBuf); !ok {
+			return certPool, errors.New("append certs from pem failed")
+		}
+	}
+
+	return certPool, nil
+}
+
+func (ss *Easyss) initHTTPOutboundClient() error {
+	if !ss.IsHTTPOutboundProto() && !ss.IsHTTPSOutboundProto() {
+		return nil
+	}
+
+	certPool, err := ss.loadCustomCertPool()
+	if err != nil {
+		log.Errorf("[EASYSS] load custom cert pool:%v", err)
+		return err
+	}
+
+	var transport http.RoundTripper
+	if ss.IsHTTPOutboundProto() {
+		transport = &http.Transport{
+			MaxIdleConns:          MaxIdle,
+			IdleConnTimeout:       MaxLifetime,
+			ResponseHeaderTimeout: ss.Timeout(),
+		}
+	} else {
+		if ss.DisableUTLS() {
+			transport = &http.Transport{
+				DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+					dialer := &tls.Dialer{
+						Config: &tls.Config{RootCAs: certPool},
+					}
+					return dialer.DialContext(ctx, network, ss.ServerAddr())
+				},
+				MaxIdleConns:          MaxIdle,
+				IdleConnTimeout:       MaxLifetime,
+				ResponseHeaderTimeout: ss.Timeout(),
+			}
+		} else {
+			transport = httptunnel.NewRoundTrip(ss.ServerAddr(), utls.HelloChrome_Auto, ss.Timeout(), certPool)
+		}
+	}
+
+	client := &http.Client{
+		Transport: transport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	ss.httpOutboundClient = client
+
+	return nil
 }
 
 func (ss *Easyss) ConfigClone() *Config {
@@ -518,6 +617,10 @@ func (ss *Easyss) DisableUTLS() bool {
 	return ss.config.DisableUTLS
 }
 
+func (ss *Easyss) DisableTLS() bool {
+	return ss.config.DisableTLS
+}
+
 func (ss *Easyss) DisableSysProxy() bool {
 	return ss.config.DisableSysProxy
 }
@@ -534,6 +637,26 @@ func (ss *Easyss) CAPath() string {
 	return ss.config.CAPath
 }
 
+func (ss *Easyss) HTTPOutboundClient() *http.Client {
+	return ss.httpOutboundClient
+}
+
+func (ss *Easyss) OutboundProto() string {
+	return ss.config.OutboundProto
+}
+
+func (ss *Easyss) IsNativeOutboundProto() bool {
+	return ss.config.OutboundProto == OutboundProtoNative
+}
+
+func (ss *Easyss) IsHTTPOutboundProto() bool {
+	return ss.config.OutboundProto == OutboundProtoHTTP
+}
+
+func (ss *Easyss) IsHTTPSOutboundProto() bool {
+	return ss.config.OutboundProto == OutboundProtoHTTPS
+}
+
 func (ss *Easyss) ConfigFilename() string {
 	if ss.config.ConfigFile == "" {
 		return ""
@@ -547,71 +670,89 @@ func (ss *Easyss) Pool() easypool.Pool {
 	return ss.tcpPool
 }
 
-func (ss *Easyss) AvailConnFromPool() (conn net.Conn, err error) {
-	pool := ss.Pool()
-	if pool == nil {
-		return nil, errors.New("pool is closed")
+func (ss *Easyss) AvailableConn() (conn net.Conn, err error) {
+	var pool easypool.Pool
+	var tryCount int
+	if ss.IsNativeOutboundProto() {
+		if pool = ss.Pool(); pool == nil {
+			return nil, errors.New("pool is closed")
+		}
+		tryCount = pool.Len() + 1
+	} else {
+		tryCount = MaxIdle + 1
 	}
 
-	poolLen := pool.Len()
-	for i := 0; i < poolLen+2; i++ {
-		conn, err = pool.Get()
+	pingTest := func(conn net.Conn) (er error) {
+		var csStream net.Conn
+		csStream, er = cipherstream.New(conn, ss.Password(), cipherstream.MethodAes256GCM, util.FrameTypePing)
+		if er != nil {
+			return er
+		}
+
+		cs := csStream.(*cipherstream.CipherStream)
+		defer func() {
+			if er != nil {
+				MarkCipherStreamUnusable(cs)
+				conn.Close()
+			}
+			cs.Release()
+		}()
+
+		start := time.Now()
+		ping := []byte(strconv.FormatInt(start.UnixNano(), 10))
+		if er = cs.WritePing(ping, util.FlagNeedACK); er != nil {
+			return
+		}
+
+		timeout := ss.Timeout() / 3
+		if timeout < time.Second {
+			timeout = time.Second
+		}
+		if er = SetCipherDeadline(cs, time.Now().Add(timeout)); er != nil {
+			return
+		}
+		var payload []byte
+		if payload, er = cs.ReadPing(); er != nil {
+			return
+		} else if !bytes.Equal(ping, payload) {
+			er = errors.New("the payload of ping not equals send value")
+			return
+		}
+
+		since := time.Since(start)
+		ss.pingLatency <- since
+		log.Debugf("[EASYSS] ping %s latency:%v", ss.Server(), since)
+		if since > time.Second {
+			log.Warnf("[EASYSS] got high latency:%v of ping %s", since, ss.Server())
+		} else if since > 500*time.Millisecond {
+			log.Infof("[EASYSS] got latency:%v of ping %s", since, ss.Server())
+		}
+
+		if er = SetCipherDeadline(cs, time.Time{}); er != nil {
+			return
+		}
+		return
+	}
+
+	for i := 0; i < tryCount; i++ {
+		switch ss.OutboundProto() {
+		case OutboundProtoHTTP:
+			conn, err = httptunnel.NewLocalConn(ss.HTTPOutboundClient(), "http://"+ss.ServerAddr())
+		case OutboundProtoHTTPS:
+			conn, err = httptunnel.NewLocalConn(ss.HTTPOutboundClient(), "https://"+ss.ServerAddr())
+		default:
+			conn, err = pool.Get()
+		}
 		if err != nil {
-			log.Warnf("[EASYSS] get conn from pool failed:%v", err)
+			log.Warnf("[EASYSS] get conn failed:%v", err)
 			continue
 		}
 
-		err = func() (er error) {
-			var csStream net.Conn
-			csStream, er = cipherstream.New(conn, ss.Password(), cipherstream.MethodAes256GCM, util.FrameTypePing)
-			if er != nil {
-				return er
-			}
-
-			cs := csStream.(*cipherstream.CipherStream)
-			defer func() {
-				if er != nil {
-					MarkCipherStreamUnusable(cs)
-					conn.Close()
-				}
-				cs.Release()
-			}()
-
-			start := time.Now()
-			ping := []byte(strconv.FormatInt(start.UnixNano(), 10))
-			if er = cs.WritePing(ping, util.FlagNeedACK); er != nil {
-				return
-			}
-			if er = SetCipherDeadline(cs, time.Now().Add(3*time.Second)); er != nil {
-				return
-			}
-			var payload []byte
-			if payload, er = cs.ReadPing(); er != nil {
-				return
-			} else if !bytes.Equal(ping, payload) {
-				er = errors.New("the payload of ping not equals send value")
-				return
-			}
-
-			since := time.Since(start)
-			ss.pingLatency <- since
-			log.Debugf("[EASYSS] ping %s latency:%v", ss.Server(), since)
-			if since > time.Second {
-				log.Warnf("[EASYSS] got high latency:%v of ping %s", since, ss.Server())
-			} else if since > 500*time.Millisecond {
-				log.Infof("[EASYSS] got latency:%v of ping %s", since, ss.Server())
-			}
-
-			if er = SetCipherDeadline(cs, time.Time{}); er != nil {
-				return
-			}
-			return
-		}()
+		err = pingTest(conn)
 		if err != nil {
 			log.Warnf("[EASYSS] ping easyss-server: %v", err)
 			continue
 		}
-
 		break
 	}
 
@@ -849,50 +990,4 @@ func (ss *Easyss) Close() error {
 		ss.closing = nil
 	}
 	return err
-}
-
-func (ss *Easyss) printStatistics() {
-	ss.mu.Lock()
-	closing := ss.closing
-	pingLatency := ss.pingLatency
-	ss.mu.Unlock()
-
-	var minLatency, avgLatency, maxLatency, total time.Duration
-	var count int64
-
-	ticker := time.NewTicker(time.Hour)
-	defer ticker.Stop()
-	ticker2 := time.NewTicker(30 * time.Second)
-	defer ticker2.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			sendSize := ss.stat.BytesSend.Load() / (1024 * 1024)
-			receiveSize := ss.stat.BytesReceive.Load() / (1024 * 1024)
-			log.Infof("[EASYSS] send size: %vMB, recive size: %vMB", sendSize, receiveSize)
-		case late := <-pingLatency:
-			count += 1
-			total += late
-			if minLatency == 0 && avgLatency == 0 && maxLatency == 0 {
-				minLatency, avgLatency, maxLatency = late, late, late
-				continue
-			}
-
-			if minLatency > late {
-				minLatency = late
-			} else if maxLatency < late {
-				maxLatency = late
-			}
-			avgLatency = total / time.Duration(count)
-		case <-ticker2.C:
-			if maxLatency == 0 {
-				continue
-			}
-			log.Infof("[EASYSS] ping easyss-server latency: min:%v, avg:%v, max:%v, count:%v",
-				minLatency, avgLatency, maxLatency, count)
-			minLatency, avgLatency, maxLatency, count, total = 0, 0, 0, 0, 0
-		case <-closing:
-			return
-		}
-	}
 }

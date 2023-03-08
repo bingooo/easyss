@@ -20,15 +20,29 @@ var ProxyRules = map[string]struct{}{
 	"direct": {},
 }
 
+const (
+	OutboundProtoNative = "native"
+	OutboundProtoHTTP   = "http"
+	OutboundProtoHTTPS  = "https"
+)
+
 type ServerConfig struct {
-	Server      string `json:"server"`
-	ServerPort  int    `json:"server_port"`
-	Password    string `json:"password"`
-	Timeout     int    `json:"timeout"`
-	DisableUTLS bool   `json:"disable_utls"`
-	CertPath    string `json:"cert_path"`
-	KeyPath     string `json:"key_path"`
-	CAPath      string `json:"ca_path"`
+	Server            string `json:"server"`
+	ServerPort        int    `json:"server_port"`
+	Password          string `json:"password"`
+	Timeout           int    `json:"timeout"`
+	DisableUTLS       bool   `json:"disable_utls"`
+	DisableTLS        bool   `json:"disable_tls"`
+	CertPath          string `json:"cert_path"`
+	KeyPath           string `json:"key_path"`
+	EnableHTTPInbound bool   `json:"enable_http_inbound"`
+	HTTPInboundPort   int    `json:"http_inbound_port"`
+	CAPath            string `json:"ca_path,omitempty"`
+	Default           bool   `json:"default,omitempty"`
+	OutboundProto     string `json:"outbound_proto,omitempty"`
+	CMDBeforeStartup  string `json:"cmd_before_startup,omitempty"`
+	CMDInterval       string `json:"cmd_interval,omitempty"`
+	CMDIntervalTime   int    `json:"cmd_interval_time,omitempty"`
 }
 
 type Config struct {
@@ -45,12 +59,17 @@ type Config struct {
 	DisableUTLS       bool           `json:"disable_utls"`
 	DisableSysProxy   bool           `json:"disable_sys_proxy"`
 	DisableIPV6       bool           `json:"disable_ipv6"`
+	DisableTLS        bool           `json:"disable_tls"`
 	EnableForwardDNS  bool           `json:"enable_forward_dns"`
 	EnableTun2socks   bool           `json:"enable_tun2socks"`
 	DirectIPsFile     string         `json:"direct_ips_file"`
 	DirectDomainsFile string         `json:"direct_domains_file"`
 	ProxyRule         string         `json:"proxy_rule"`
 	CAPath            string         `json:"ca_path"`
+	OutboundProto     string         `json:"outbound_proto"`
+	CMDBeforeStartup  string         `json:"cmd_before_startup"`
+	CMDInterval       string         `json:"cmd_interval"`
+	CMDIntervalTime   int            `json:"cmd_interval_time"`
 	ConfigFile        string         `json:"-"`
 }
 
@@ -79,6 +98,11 @@ func (c *Config) Validate() error {
 		if _, ok := ProxyRules[c.ProxyRule]; !ok {
 			return fmt.Errorf("unsupported proxy rule:%s, supported rules:[auto, proxy, direct]", c.ProxyRule)
 		}
+	}
+	if c.OutboundProto != OutboundProtoNative && c.OutboundProto != OutboundProtoHTTP &&
+		c.OutboundProto != OutboundProtoHTTPS {
+		return fmt.Errorf("outbound proto must be one of [%s, %s, %s]",
+			OutboundProtoNative, OutboundProtoHTTP, OutboundProtoHTTPS)
 	}
 
 	return nil
@@ -141,11 +165,9 @@ func OverrideConfig[T any](dst, src *T) {
 func (c *Config) SetDefaultValue() {
 	// if server is empty, try to use the first item in server list instead
 	if c.Server == "" && len(c.ServerList) > 0 {
-		c.Server = c.ServerList[0].Server
-		c.ServerPort = c.ServerList[0].ServerPort
-		c.Password = c.ServerList[0].Password
-		c.DisableUTLS = c.ServerList[0].DisableUTLS
-		c.CAPath = c.ServerList[0].CAPath
+		sc := c.DefaultServerConfigFrom(c.ServerList)
+		sc.SetDefaultValue()
+		c.OverrideFrom(sc)
 	}
 
 	if c.LocalPort == 0 {
@@ -161,7 +183,7 @@ func (c *Config) SetDefaultValue() {
 		c.LogLevel = "info"
 	}
 	if c.Timeout <= 0 || c.Timeout > 60 {
-		c.Timeout = 60
+		c.Timeout = 30
 	}
 	if c.DirectIPsFile == "" {
 		c.DirectIPsFile = "direct_ips.txt"
@@ -172,18 +194,82 @@ func (c *Config) SetDefaultValue() {
 	if c.ProxyRule == "" {
 		c.ProxyRule = "auto"
 	}
+	if c.OutboundProto == "" {
+		c.OutboundProto = OutboundProtoNative
+	}
+	if c.CMDIntervalTime == 0 {
+		c.CMDIntervalTime = 600
+	}
+}
+
+func (c *Config) OverrideFrom(sc *ServerConfig) {
+	if sc != nil {
+		c.Server = sc.Server
+		c.ServerPort = sc.ServerPort
+		c.Password = sc.Password
+		c.Timeout = sc.Timeout
+		c.DisableUTLS = sc.DisableUTLS
+		c.DisableTLS = sc.DisableTLS
+		c.CAPath = sc.CAPath
+		c.OutboundProto = sc.OutboundProto
+		c.CMDInterval = sc.CMDInterval
+		c.CMDBeforeStartup = sc.CMDBeforeStartup
+		c.CMDIntervalTime = sc.CMDIntervalTime
+	}
+}
+
+func (c *Config) DefaultServerConfigFrom(list []ServerConfig) *ServerConfig {
+	if len(list) == 0 {
+		return nil
+	}
+	if len(list) == 1 {
+		return &list[0]
+	}
+	for _, v := range list {
+		if v.Default {
+			return &v
+		}
+	}
+
+	return &list[0]
 }
 
 func (c *ServerConfig) SetDefaultValue() {
 	if c.Timeout <= 0 || c.Timeout > 60 {
-		c.Timeout = 60
+		c.Timeout = 30
+	}
+	if c.OutboundProto == "" {
+		c.OutboundProto = OutboundProtoNative
+	}
+	if c.CMDIntervalTime == 0 {
+		c.CMDIntervalTime = 600
+	}
+	if c.HTTPInboundPort == 0 {
+		c.HTTPInboundPort = c.ServerPort + 1000
 	}
 }
 
 func (c *ServerConfig) Validate() error {
-	if c.Server == "" || c.ServerPort == 0 || c.Password == "" {
-		return errors.New("server address, server port and password should not empty")
+	if !c.DisableTLS && (c.KeyPath == "" || c.CertPath == "") {
+		if c.Server == "" {
+			return errors.New("server address should not empty")
+		}
 	}
+	if c.ServerPort == 0 {
+		return errors.New("server port should not empty")
+	}
+	if c.Password == "" {
+		return errors.New("password should not empty")
+	}
+	if c.OutboundProto != OutboundProtoNative && c.OutboundProto != OutboundProtoHTTP &&
+		c.OutboundProto != OutboundProtoHTTPS {
+		return fmt.Errorf("outbound proto must be one of [%s, %s, %s]",
+			OutboundProtoNative, OutboundProtoHTTP, OutboundProtoHTTPS)
+	}
+	if c.EnableHTTPInbound && c.HTTPInboundPort == 0 {
+		return errors.New("http inbound port should not empty")
+	}
+
 	return nil
 }
 
@@ -204,13 +290,14 @@ func ExampleJSONConfig() string {
 
 func ExampleServerJSONConfig() string {
 	example := ServerConfig{
-		Server:      "example.com",
-		ServerPort:  9999,
-		Password:    "your-pass",
-		Timeout:     30,
-		DisableUTLS: false,
-		CertPath:    "",
-		KeyPath:     "",
+		Server:            "example.com",
+		ServerPort:        9999,
+		Password:          "your-pass",
+		Timeout:           30,
+		DisableUTLS:       false,
+		CertPath:          "",
+		KeyPath:           "",
+		EnableHTTPInbound: true,
 	}
 
 	b, _ := json.MarshalIndent(example, "", "    ")

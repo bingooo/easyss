@@ -94,7 +94,7 @@ func (ss *Easyss) localRelay(localConn net.Conn, addr string) (err error) {
 		}
 	}
 
-	stream, err := ss.AvailConnFromPool()
+	stream, err := ss.AvailableConn()
 	if err != nil {
 		log.Errorf("[TCP_PROXY] get stream from pool failed:%v", err)
 		return
@@ -122,7 +122,11 @@ func (ss *Easyss) localRelay(localConn net.Conn, addr string) (err error) {
 		return
 	}
 
-	n1, n2 := relay(csStream, localConn, ss.Timeout())
+	tryReuse := true
+	if !ss.IsNativeOutboundProto() {
+		tryReuse = false
+	}
+	n1, n2 := relay(csStream, localConn, ss.Timeout(), tryReuse)
 	csStream.(*cipherstream.CipherStream).Release()
 
 	log.Debugf("[TCP_PROXY] send %v bytes to %v, recive %v bytes", n1, addr, n2)

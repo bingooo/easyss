@@ -122,7 +122,7 @@ func (ss *Easyss) UDPHandle(s *socks5.Server, addr *net.UDPAddr, d *socks5.Datag
 		return send(ue, d.Data)
 	}
 
-	stream, err := ss.AvailConnFromPool()
+	stream, err := ss.AvailableConn()
 	if err != nil {
 		log.Errorf("[UDP_PROXY] get stream from pool err:%+v", err)
 		return err
@@ -179,7 +179,9 @@ func (ss *Easyss) UDPHandle(s *socks5.Server, addr *net.UDPAddr, d *socks5.Datag
 
 		if !reuse {
 			MarkCipherStreamUnusable(ue.RemoteConn)
-			log.Warnf("[UDP_PROXY] underlying proxy connection is unhealthy, need close it")
+			if tryReuse {
+				log.Warnf("[UDP_PROXY] underlying proxy connection is unhealthy, need close it")
+			}
 		} else {
 			log.Debugf("[UDP_PROXY] underlying proxy connection is healthy, so reuse it")
 		}
@@ -190,6 +192,9 @@ func (ss *Easyss) UDPHandle(s *socks5.Server, addr *net.UDPAddr, d *socks5.Datag
 
 	go func(ue *UDPExchange, dst string) {
 		var tryReuse = true
+		if !ss.IsNativeOutboundProto() {
+			tryReuse = false
+		}
 
 		defer func() {
 			ss.lockKey(exchKey)

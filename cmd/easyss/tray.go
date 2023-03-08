@@ -63,12 +63,15 @@ func (st *SysTray) AddSelectServerMenu() {
 		for _, addr := range addrs {
 			item := selectServer.AddSubMenuItemCheckbox(addr, "服务器地址", false)
 			subMenuItems = append(subMenuItems, item)
+			if addr == st.SS().ServerAddr() {
+				item.Check()
+			}
 		}
 	} else {
 		item := selectServer.AddSubMenuItemCheckbox(st.SS().ServerAddr(), "服务器地址", false)
 		subMenuItems = append(subMenuItems, item)
+		item.Check()
 	}
-	subMenuItems[0].Check()
 
 	for i, item := range subMenuItems {
 		go func(_i int, _item *systray.MenuItem) {
@@ -86,12 +89,9 @@ func (st *SysTray) AddSelectServerMenu() {
 						}
 
 						config := st.SS().ConfigClone()
-						serverConfig := st.SS().ServerList()[_i]
-						config.Server = serverConfig.Server
-						config.ServerPort = serverConfig.ServerPort
-						config.Password = serverConfig.Password
-						config.DisableUTLS = serverConfig.DisableUTLS
-						config.CAPath = serverConfig.CAPath
+						sc := st.SS().ServerList()[_i]
+						sc.SetDefaultValue()
+						config.OverrideFrom(&sc)
 						if err := st.RestartService(config); err != nil {
 							log.Errorf("[SYSTRAY] changing server to:%s err:%v", addrs[_i], err)
 						} else {

@@ -6,36 +6,46 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"strconv"
 
 	"github.com/caddyserver/certmagic"
 	"github.com/nange/easyss/v2/cipherstream"
+	httptunnel "github.com/nange/easyss/v2/httptunnel"
 	"github.com/nange/easyss/v2/util"
 	log "github.com/sirupsen/logrus"
 )
 
 func (es *EasyServer) Start() {
+	if err := es.initTLSConfig(); err != nil {
+		log.Fatalf("[REMOTE] init tls config:%v", err)
+	}
+	if es.EnabledHTTPInbound() {
+		go es.startHTTPTunnelServer()
+	}
 	es.startTCPServer()
 }
 
-func (es *EasyServer) tlsConfig() (*tls.Config, error) {
+func (es *EasyServer) initTLSConfig() error {
+	if es.DisableTLS() {
+		return nil
+	}
+
 	var tlsConfig *tls.Config
 	var err error
 	if es.CertPath() != "" && es.KeyPath() != "" {
 		log.Infof("[REMOTE] using self-signed cert, cert-path:%s, key-path:%s", es.CertPath(), es.KeyPath())
 		var cer tls.Certificate
 		if cer, err = tls.LoadX509KeyPair(es.CertPath(), es.KeyPath()); err != nil {
-			return nil, err
+			return err
 		}
 		tlsConfig = &tls.Config{Certificates: []tls.Certificate{cer}}
 	} else {
 		tlsConfig, err = certmagic.TLS([]string{es.Server()})
 		if err != nil {
-			return nil, err
+			return err
 		}
 	}
 
-	tlsConfig.NextProtos = append(tlsConfig.NextProtos, []string{"h2", "http/1.1"}...)
+	tlsConfig.NextProtos = append([]string{"http/1.1", "h2"}, tlsConfig.NextProtos...)
 	if !es.DisableUTLS() {
 		tlsConfig.VerifyConnection = func(cs tls.ConnectionState) error {
 			for _, v := range tlsConfig.NextProtos {
@@ -46,21 +56,25 @@ func (es *EasyServer) tlsConfig() (*tls.Config, error) {
 			return fmt.Errorf("unsupported ALPN:%s", cs.NegotiatedProtocol)
 		}
 	}
+	es.tlsConfig = tlsConfig
 
-	return tlsConfig, nil
+	return nil
 }
 
 func (es *EasyServer) startTCPServer() {
-	addr := ":" + strconv.Itoa(es.ServerPort())
-	tlsConfig, err := es.tlsConfig()
+	var ln net.Listener
+	var err error
+
+	addr := es.ListenAddr()
+	if es.DisableTLS() {
+		ln, err = net.Listen("tcp", addr)
+	} else {
+		ln, err = tls.Listen("tcp", addr, es.tlsConfig)
+	}
 	if err != nil {
-		log.Fatalf("[REMOTE] get server tls config err:%v", err)
+		log.Fatalf("Listen %v: %v", addr, err)
 	}
 
-	ln, err := tls.Listen("tcp", addr, tlsConfig)
-	if err != nil {
-		log.Fatal(err)
-	}
 	es.mu.Lock()
 	es.ln = ln
 	es.mu.Unlock()
@@ -75,51 +89,76 @@ func (es *EasyServer) startTCPServer() {
 		}
 		log.Infof("[REMOTE] a new connection(ip) is accepted. addr:%v", conn.RemoteAddr())
 
-		go func() {
-			defer conn.Close()
-
-			for {
-				addr, method, protoType, err := es.handShakeWithClient(conn)
-				if err != nil {
-					if errors.Is(err, io.EOF) {
-						log.Debugf("[REMOTE] got EOF error when handshake with client-server, maybe the connection pool closed the idle conn")
-					} else {
-						log.Warnf("[REMOTE] handshake with client:%+v", err)
-					}
-					return
-				}
-
-				addrStr := string(addr)
-				if !es.disableValidateAddr {
-					if err := validateTargetAddr(addrStr); err != nil {
-						log.Warnf("[REMOTE] validate target address err:%s, close the connection directly", err.Error())
-						return
-					}
-				}
-
-				log.Infof("[REMOTE] target:%v", addrStr)
-
-				switch protoType {
-				case "tcp":
-					if err := es.remoteTCPHandle(conn, addrStr, method); err != nil {
-						log.Errorf("[REMOTE] tcp handle err:%v", err)
-						return
-					}
-				case "udp":
-					if err := es.remoteUDPHandle(conn, addrStr, method); err != nil {
-						log.Errorf("[REMOTE] udp handle err:%v", err)
-						return
-					}
-				default:
-					log.Errorf("[REMOTE] unsupported protoType:%s", protoType)
-					return
-				}
-			}
-		}()
+		go es.handleConn(conn, true)
 	}
 }
 
-func (es *EasyServer) remoteTCPHandle(conn net.Conn, addrStr, method string) error {
+func (es *EasyServer) startHTTPTunnelServer() {
+	server := httptunnel.NewServer(es.ListenHTTPTunnelAddr(), es.Timeout(), es.tlsConfig)
+	es.mu.Lock()
+	es.httpTunnelServer = server
+	es.mu.Unlock()
+
+	go server.Listen()
+
+	for {
+		conn, err := server.Accept()
+		if err != nil {
+			log.Error("[REMOTE] http tunnel server accept:", err)
+			break
+		}
+		log.Infof("[REMOTE] a http tunnel connection is accepted")
+
+		go es.handleConn(conn, false)
+	}
+}
+
+func (es *EasyServer) handleConn(conn net.Conn, tryReuse bool) {
+	defer conn.Close()
+
+	for {
+		addr, method, protoType, err := es.handShakeWithClient(conn)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				log.Debugf("[REMOTE] got EOF error when handshake with client-server, maybe the connection pool closed the idle conn")
+			} else {
+				log.Warnf("[REMOTE] handshake with client:%+v", err)
+			}
+			return
+		}
+
+		addrStr := string(addr)
+		if !es.disableValidateAddr {
+			if err := validateTargetAddr(addrStr); err != nil {
+				log.Warnf("[REMOTE] validate target address err:%s, close the connection directly", err.Error())
+				return
+			}
+		}
+
+		log.Infof("[REMOTE] target:%v", addrStr)
+
+		switch protoType {
+		case "tcp":
+			if err := es.remoteTCPHandle(conn, addrStr, method, tryReuse); err != nil {
+				log.Errorf("[REMOTE] tcp handle err:%v", err)
+				return
+			}
+		case "udp":
+			if err := es.remoteUDPHandle(conn, addrStr, method, tryReuse); err != nil {
+				log.Errorf("[REMOTE] udp handle err:%v", err)
+				return
+			}
+		default:
+			log.Errorf("[REMOTE] unsupported protoType:%s", protoType)
+			return
+		}
+		if !tryReuse {
+			return
+		}
+	}
+}
+
+func (es *EasyServer) remoteTCPHandle(conn net.Conn, addrStr, method string, tryReuse bool) error {
 	tConn, err := net.DialTimeout("tcp", addrStr, es.Timeout())
 	if err != nil {
 		return fmt.Errorf("net.Dial %v err:%v", addrStr, err)
@@ -130,7 +169,7 @@ func (es *EasyServer) remoteTCPHandle(conn net.Conn, addrStr, method string) err
 		return fmt.Errorf("new cipherstream err:%v, method:%v", err, method)
 	}
 
-	n1, n2 := relay(csStream, tConn, es.Timeout())
+	n1, n2 := relay(csStream, tConn, es.Timeout(), tryReuse)
 	csStream.(*cipherstream.CipherStream).Release()
 
 	log.Debugf("[REMOTE] send %v bytes to %v, and recive %v bytes", n2, addrStr, n1)
@@ -156,7 +195,7 @@ func (es *EasyServer) handShakeWithClient(conn net.Conn) (addr []byte, method st
 		}
 
 		if util.IsPingFrame(header) {
-			log.Infof("[REMOTE] got ping message, payload:%s", string(payload))
+			log.Debugf("[REMOTE] got ping message, payload:%s", string(payload))
 			if util.IsNeedACK(header) {
 				if er := cs.WritePing(payload, util.FlagACK); er != nil {
 					return nil, "", "", er
