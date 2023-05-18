@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"reflect"
 )
@@ -27,22 +28,28 @@ const (
 )
 
 type ServerConfig struct {
-	Server            string `json:"server"`
-	ServerPort        int    `json:"server_port"`
-	Password          string `json:"password"`
-	Timeout           int    `json:"timeout"`
-	DisableUTLS       bool   `json:"disable_utls"`
-	DisableTLS        bool   `json:"disable_tls"`
-	CertPath          string `json:"cert_path"`
-	KeyPath           string `json:"key_path"`
-	EnableHTTPInbound bool   `json:"enable_http_inbound"`
-	HTTPInboundPort   int    `json:"http_inbound_port"`
-	CAPath            string `json:"ca_path,omitempty"`
-	Default           bool   `json:"default,omitempty"`
-	OutboundProto     string `json:"outbound_proto,omitempty"`
-	CMDBeforeStartup  string `json:"cmd_before_startup,omitempty"`
-	CMDInterval       string `json:"cmd_interval,omitempty"`
-	CMDIntervalTime   int    `json:"cmd_interval_time,omitempty"`
+	Server                 string `json:"server"`
+	ServerPort             int    `json:"server_port"`
+	Password               string `json:"password"`
+	Timeout                int    `json:"timeout"`
+	DisableUTLS            bool   `json:"disable_utls"`
+	DisableTLS             bool   `json:"disable_tls"`
+	CertPath               string `json:"cert_path"`
+	KeyPath                string `json:"key_path"`
+	EnableHTTPInbound      bool   `json:"enable_http_inbound"`
+	HTTPInboundPort        int    `json:"http_inbound_port"`
+	NextProxyURL           string `json:"next_proxy_url"`
+	NextProxyDomainsFile   string `json:"next_proxy_domains_file"`
+	NextProxyIPsFile       string `json:"next_proxy_ips_file"`
+	EnableNextProxyUDP     bool   `json:"enable_next_proxy_udp"`
+	EnableNextProxyALLHost bool   `json:"enable_next_proxy_all_host"`
+	// the below fields only be used for easyss client
+	CAPath           string `json:"ca_path,omitempty"`
+	Default          bool   `json:"default,omitempty"`
+	OutboundProto    string `json:"outbound_proto,omitempty"`
+	CMDBeforeStartup string `json:"cmd_before_startup,omitempty"`
+	CMDInterval      string `json:"cmd_interval,omitempty"`
+	CMDIntervalTime  int    `json:"cmd_interval_time,omitempty"`
 }
 
 type Config struct {
@@ -55,6 +62,8 @@ type Config struct {
 	Method            string         `json:"method"` // encryption method
 	LogLevel          string         `json:"log_level"`
 	Timeout           int            `json:"timeout"`
+	AuthUsername      string         `json:"auth_username"`
+	AuthPassword      string         `json:"auth_password"`
 	BindALL           bool           `json:"bind_all"`
 	DisableUTLS       bool           `json:"disable_utls"`
 	DisableSysProxy   bool           `json:"disable_sys_proxy"`
@@ -166,7 +175,6 @@ func (c *Config) SetDefaultValue() {
 	// if server is empty, try to use the first item in server list instead
 	if c.Server == "" && len(c.ServerList) > 0 {
 		sc := c.DefaultServerConfigFrom(c.ServerList)
-		sc.SetDefaultValue()
 		c.OverrideFrom(sc)
 	}
 
@@ -207,8 +215,12 @@ func (c *Config) OverrideFrom(sc *ServerConfig) {
 		c.Server = sc.Server
 		c.ServerPort = sc.ServerPort
 		c.Password = sc.Password
-		c.Timeout = sc.Timeout
-		c.DisableUTLS = sc.DisableUTLS
+		if sc.Timeout != 0 {
+			c.Timeout = sc.Timeout
+		}
+		if sc.DisableUTLS {
+			c.DisableUTLS = sc.DisableUTLS
+		}
 		c.DisableTLS = sc.DisableTLS
 		c.CAPath = sc.CAPath
 		c.OutboundProto = sc.OutboundProto
@@ -247,6 +259,12 @@ func (c *ServerConfig) SetDefaultValue() {
 	if c.HTTPInboundPort == 0 {
 		c.HTTPInboundPort = c.ServerPort + 1000
 	}
+	if c.NextProxyDomainsFile == "" {
+		c.NextProxyDomainsFile = "next_proxy_domains.txt"
+	}
+	if c.NextProxyIPsFile == "" {
+		c.NextProxyIPsFile = "next_proxy_ips.txt"
+	}
 }
 
 func (c *ServerConfig) Validate() error {
@@ -268,6 +286,15 @@ func (c *ServerConfig) Validate() error {
 	}
 	if c.EnableHTTPInbound && c.HTTPInboundPort == 0 {
 		return errors.New("http inbound port should not empty")
+	}
+	if c.NextProxyURL != "" {
+		if u, err := url.Parse(c.NextProxyURL); err != nil {
+			return fmt.Errorf("next proxy url %s is invalid", c.NextProxyURL)
+		} else {
+			if u.Scheme != "socks5" { // only support 'socks5' for now
+				return fmt.Errorf("%s next proxy scheme is unsupported", u.Scheme)
+			}
+		}
 	}
 
 	return nil

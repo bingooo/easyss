@@ -1,22 +1,30 @@
 package httptunnel
 
 import (
+	"errors"
 	"net"
 	"time"
+
+	"github.com/nange/easyss/v2/httptunnel/bufpipe"
 )
 
 var _ net.Conn = (*ServerConn)(nil)
 
 type ServerConn struct {
+	reqID     string
+	closeHook func(reqID string)
+
 	local  net.Conn
 	remote net.Conn
 }
 
-func NewServerConn() *ServerConn {
-	read, write := net.Pipe()
+func NewServerConn(reqID string, closeHook func(reqID string)) *ServerConn {
+	local, remote := bufpipe.ConnPipe()
 	return &ServerConn{
-		local:  read,
-		remote: write,
+		reqID:     reqID,
+		closeHook: closeHook,
+		local:     local,
+		remote:    remote,
 	}
 }
 
@@ -37,7 +45,12 @@ func (c *ServerConn) Write(b []byte) (n int, err error) {
 }
 
 func (c *ServerConn) Close() error {
-	return c.remote.Close()
+	if c.closeHook != nil {
+		c.closeHook(c.reqID)
+	}
+	c.closeHook = nil
+
+	return errors.Join(c.local.Close(), c.remote.Close())
 }
 
 func (c *ServerConn) LocalAddr() net.Addr {

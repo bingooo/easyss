@@ -12,6 +12,7 @@ import (
 	httptunnel "github.com/nange/easyss/v2/httptunnel"
 	"github.com/nange/easyss/v2/util"
 	log "github.com/sirupsen/logrus"
+	"github.com/txthinking/socks5"
 )
 
 func (es *EasyServer) Start() {
@@ -140,12 +141,12 @@ func (es *EasyServer) handleConn(conn net.Conn, tryReuse bool) {
 		switch protoType {
 		case "tcp":
 			if err := es.remoteTCPHandle(conn, addrStr, method, tryReuse); err != nil {
-				log.Errorf("[REMOTE] tcp handle err:%v", err)
+				log.Infof("[REMOTE] tcp handle: %v", err)
 				return
 			}
 		case "udp":
 			if err := es.remoteUDPHandle(conn, addrStr, method, tryReuse); err != nil {
-				log.Errorf("[REMOTE] udp handle err:%v", err)
+				log.Infof("[REMOTE] udp handle: %v", err)
 				return
 			}
 		default:
@@ -159,45 +160,44 @@ func (es *EasyServer) handleConn(conn net.Conn, tryReuse bool) {
 }
 
 func (es *EasyServer) remoteTCPHandle(conn net.Conn, addrStr, method string, tryReuse bool) error {
-	tConn, err := net.DialTimeout("tcp", addrStr, es.Timeout())
+	tConn, err := es.targetConn("tcp", addrStr)
 	if err != nil {
 		return fmt.Errorf("net.Dial %v err:%v", addrStr, err)
 	}
+	defer tConn.Close()
 
-	csStream, err := cipherstream.New(conn, es.Password(), method, util.FrameTypeData, util.FlagTCP)
+	csStream, err := cipherstream.New(conn, es.Password(), method, cipherstream.FrameTypeData, cipherstream.FlagTCP)
 	if err != nil {
 		return fmt.Errorf("new cipherstream err:%v, method:%v", err, method)
 	}
 
-	n1, n2 := relay(csStream, tConn, es.Timeout(), tryReuse)
+	n1, n2, err := relay(csStream, tConn, es.Timeout(), tryReuse)
 	csStream.(*cipherstream.CipherStream).Release()
 
 	log.Debugf("[REMOTE] send %v bytes to %v, and recive %v bytes", n2, addrStr, n1)
 
-	_ = tConn.Close()
-
-	return nil
+	return err
 }
 
 func (es *EasyServer) handShakeWithClient(conn net.Conn) (addr []byte, method string, protoType string, err error) {
-	csStream, err := cipherstream.New(conn, es.Password(), cipherstream.MethodAes256GCM, util.FrameTypeUnknown)
+	csStream, err := cipherstream.New(conn, es.Password(), cipherstream.MethodAes256GCM, cipherstream.FrameTypeUnknown)
 	if err != nil {
 		return nil, "", "", err
 	}
 	cs := csStream.(*cipherstream.CipherStream)
 	defer cs.Release()
 
-	var header, payload []byte
+	var frame *cipherstream.Frame
 	for {
-		header, payload, err = cs.ReadHeaderAndPayload()
+		frame, err = cs.ReadFrame()
 		if err != nil {
 			return nil, "", "", err
 		}
 
-		if util.IsPingFrame(header) {
-			log.Debugf("[REMOTE] got ping message, payload:%s", string(payload))
-			if util.IsNeedACK(header) {
-				if er := cs.WritePing(payload, util.FlagACK); er != nil {
+		if frame.IsPingFrame() {
+			log.Debugf("[REMOTE] got ping message, payload:%s", string(frame.RawDataPayload()))
+			if frame.IsNeedACK() {
+				if er := cs.WritePing(frame.RawDataPayload(), cipherstream.FlagACK); er != nil {
 					return nil, "", "", er
 				}
 			}
@@ -205,20 +205,84 @@ func (es *EasyServer) handShakeWithClient(conn net.Conn) (addr []byte, method st
 		}
 		break
 	}
-	if util.IsTCPProto(header) {
+	if frame.IsTCPProto() {
 		protoType = "tcp"
-	} else if util.IsUDPProto(header) {
+	} else if frame.IsUDPProto() {
 		protoType = "udp"
 	}
 
-	length := len(payload)
+	rawData := frame.RawDataPayload()
+	length := len(rawData)
 	if length <= 1 {
 		err = errors.New("handshake: payload length is invalid")
 		return
 	}
-	method = DecodeCipherMethod(payload[length-1])
+	method = DecodeCipherMethod(rawData[length-1])
 
-	return payload[:length-1], method, protoType, nil
+	return rawData[:length-1], method, protoType, nil
+}
+
+func (es *EasyServer) targetConn(network, addr string) (net.Conn, error) {
+	var tConn net.Conn
+	var err error
+
+	nextProxy := func(host string) bool {
+		if network == "udp" && !es.EnableNextProxyUDP() {
+			return false
+		}
+		if es.EnableNextProxyALLHost() {
+			return true
+		}
+		if util.IsIP(host) {
+			if _, ok := es.nextProxyIPs[host]; ok {
+				return true
+			}
+			for _, v := range es.nextProxyCIDRIPs {
+				if v.Contains(net.ParseIP(host)) {
+					return true
+				}
+			}
+		} else {
+			if _, ok := es.nextProxyDomains[host]; ok {
+				return true
+			}
+			domain := domainRoot(host)
+			if _, ok := es.nextProxyDomains[domain]; ok {
+				return true
+			}
+		}
+		return false
+	}
+
+	if u := es.NextProxyURL(); u != nil {
+		host, _, _ := net.SplitHostPort(addr)
+		switch u.Scheme {
+		case "socks5":
+			var username, password string
+			if u.User != nil {
+				username = u.User.Username()
+				password, _ = u.User.Password()
+			}
+			if nextProxy(host) {
+				cli, _ := socks5.NewClient(u.Host, username, password, 0, 0)
+				tConn, err = cli.Dial(network, addr)
+			}
+		default:
+			err = fmt.Errorf("unsupported scheme:%s of next proxy url", u.Scheme)
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	if tConn != nil {
+		log.Infof("[REMOTE] next proxy for %s, network:%s", addr, network)
+	}
+
+	if tConn == nil {
+		tConn, err = net.DialTimeout(network, addr, es.Timeout())
+	}
+
+	return tConn, err
 }
 
 func validateTargetAddr(addr string) error {

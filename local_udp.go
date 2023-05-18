@@ -10,9 +10,7 @@ import (
 
 	"github.com/cespare/xxhash/v2"
 	"github.com/miekg/dns"
-	"github.com/nange/easypool"
 	"github.com/nange/easyss/v2/cipherstream"
-	"github.com/nange/easyss/v2/util"
 	"github.com/nange/easyss/v2/util/bytespool"
 	log "github.com/sirupsen/logrus"
 	"github.com/txthinking/socks5"
@@ -122,25 +120,13 @@ func (ss *Easyss) UDPHandle(s *socks5.Server, addr *net.UDPAddr, d *socks5.Datag
 		return send(ue, d.Data)
 	}
 
-	stream, err := ss.AvailableConn()
+	csStream, err := ss.handShakeWithRemote(rewrittenDst, cipherstream.FlagUDP)
 	if err != nil {
-		log.Errorf("[UDP_PROXY] get stream from pool err:%+v", err)
-		return err
-	}
-
-	if err := ss.handShakeWithRemote(stream, rewrittenDst, util.FlagUDP); err != nil {
 		log.Errorf("[UDP_PROXY] handshake with remote server err:%v", err)
-		if pc, ok := stream.(*easypool.PoolConn); ok {
-			log.Debugf("[UDP_PROXY] mark pool conn stream unusable")
-			pc.MarkUnusable()
-			stream.Close()
+		if csStream != nil {
+			MarkCipherStreamUnusable(csStream)
+			csStream.Close()
 		}
-		return err
-	}
-
-	csStream, err := cipherstream.New(stream, ss.Password(), ss.Method(), util.FrameTypeData, util.FlagUDP)
-	if err != nil {
-		log.Errorf("[UDP_PROXY] new cipherstream err:%v, method:%v", err, ss.Method())
 		return err
 	}
 
@@ -167,27 +153,24 @@ func (ss *Easyss) UDPHandle(s *socks5.Server, addr *net.UDPAddr, d *socks5.Datag
 			tryReuse = <-monitorCh
 		case tryReuse = <-monitorCh:
 		}
-		if err := SetCipherDeadline(ue.RemoteConn, time.Time{}); err != nil {
+		if err := ue.RemoteConn.SetReadDeadline(time.Time{}); err != nil {
 			tryReuse = false
 		}
 
-		reuse := false
 		if tryReuse {
 			log.Debugf("[UDP_PROXY] request is finished, try to reuse underlying tcp connection")
-			reuse = tryReuseInUDPClient(ue.RemoteConn, ss.Timeout())
-		}
-
-		if !reuse {
-			MarkCipherStreamUnusable(ue.RemoteConn)
-			if tryReuse {
-				log.Warnf("[UDP_PROXY] underlying proxy connection is unhealthy, need close it")
+			reuse := tryReuseInUDPClient(ue.RemoteConn, ss.Timeout())
+			if reuse != nil {
+				MarkCipherStreamUnusable(ue.RemoteConn)
+				log.Warnf("[UDP_PROXY] underlying proxy connection is unhealthy, need close it: %v", reuse)
+			} else {
+				log.Debugf("[UDP_PROXY] underlying proxy connection is healthy, so reuse it")
 			}
 		} else {
-			log.Debugf("[UDP_PROXY] underlying proxy connection is healthy, so reuse it")
+			MarkCipherStreamUnusable(ue.RemoteConn)
 		}
 
-		ue.RemoteConn.(*cipherstream.CipherStream).Release()
-		stream.Close()
+		ue.RemoteConn.Close()
 	}()
 
 	go func(ue *UDPExchange, dst string) {
@@ -218,9 +201,9 @@ func (ss *Easyss) UDPHandle(s *socks5.Server, addr *net.UDPAddr, d *socks5.Datag
 			if !hasAssoc {
 				var err error
 				if isDNSReq {
-					err = SetCipherDeadline(ue.RemoteConn, time.Now().Add(DefaultDNSTimeout))
+					err = ue.RemoteConn.SetReadDeadline(time.Now().Add(DefaultDNSTimeout))
 				} else {
-					err = SetCipherDeadline(ue.RemoteConn, time.Now().Add(ss.Timeout()))
+					err = ue.RemoteConn.SetReadDeadline(time.Now().Add(ss.Timeout()))
 				}
 				if err != nil {
 					log.Errorf("[UDP_PROXY] set the deadline for remote conn err:%v", err)
@@ -230,8 +213,9 @@ func (ss *Easyss) UDPHandle(s *socks5.Server, addr *net.UDPAddr, d *socks5.Datag
 			}
 			n, err := ue.RemoteConn.Read(buf[:])
 			if err != nil {
-				if err != cipherstream.ErrTimeout {
+				if !errors.Is(err, cipherstream.ErrTimeout) {
 					tryReuse = false
+					log.Infof("[UDP_PROXY] remote conn read: %v", err)
 				}
 				return
 			}
@@ -305,7 +289,7 @@ func responseDNSMsg(conn *net.UDPConn, localAddr *net.UDPAddr, msg *dns.Msg, rem
 }
 
 func expireConn(conn net.Conn) error {
-	return conn.SetDeadline(time.Unix(0, 0))
+	return conn.SetReadDeadline(time.Unix(0, 0))
 }
 
 func isDNSRequest(msg *dns.Msg) bool {
@@ -329,30 +313,30 @@ func isDNSResponse(msg *dns.Msg) bool {
 	return true
 }
 
-func tryReuseInUDPClient(cipher net.Conn, timeout time.Duration) bool {
-	if err := SetCipherDeadline(cipher, time.Now().Add(timeout)); err != nil {
-		return false
+func tryReuseInUDPClient(cipher net.Conn, timeout time.Duration) error {
+	if err := cipher.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		return err
 	}
 	if err := CloseWrite(cipher); err != nil {
-		return false
+		return err
 	}
-	if !ReadACKFromCipher(cipher) {
-		return false
+	if err := ReadACKFromCipher(cipher); err != nil {
+		return err
 	}
-	if !readFINFromCipher(cipher) {
-		return false
+	if err := readFINFromCipher(cipher); err != nil {
+		return err
 	}
 	if err := WriteACKToCipher(cipher); err != nil {
-		return false
+		return err
 	}
-	if err := SetCipherDeadline(cipher, time.Time{}); err != nil {
-		return false
+	if err := cipher.SetReadDeadline(time.Time{}); err != nil {
+		return err
 	}
 
-	return true
+	return nil
 }
 
-func readFINFromCipher(conn net.Conn) bool {
+func readFINFromCipher(conn net.Conn) error {
 	buf := bytespool.Get(RelayBufferSize)
 	defer bytespool.MustPut(buf)
 
@@ -363,5 +347,8 @@ func readFINFromCipher(conn net.Conn) bool {
 			break
 		}
 	}
-	return cipherstream.FINRSTStreamErr(err)
+	if errors.Is(err, cipherstream.ErrFINRSTStream) {
+		return nil
+	}
+	return err
 }

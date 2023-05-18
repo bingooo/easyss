@@ -7,17 +7,18 @@ Easyss是一款兼容socks5的安全代理上网工具，目标是使访问国�
 
 ## 特性
 
-* 简单稳定易用, 没有复杂的配置项
+* 简单稳定易用, 没有复杂的配置项; 无流量特征，不易被嗅探
 * 全平台支持(Linux, MacOS, Windows, Android等)
-* 支持SOCKS5(TCP/UDP)、HTTP 代理协议
-* 支持浏览器级别代理(设置系统代理), 和系统全局代理(基于Tun2socks,thanks [tun2socks](https://github.com/xjasonlyu/tun2socks)); 支持可选代理规则
+* 支持SOCKS5(TCP/UDP, thanks [socks5](https://github.com/txthinking/socks5))、HTTP 代理协议
+* 支持浏览器级别代理(设置系统代理), 和系统全局代理(thanks [tun2socks](https://github.com/xjasonlyu/tun2socks)); 可选代理规则
 * 支持TCP连接池 (默认启用，大幅降低请求延迟)
 * 支持系统托盘图标管理 (thanks [systray](https://github.com/getlantern/systray))
-* 支持可配置多服务器切换, 支持自定义直连白名单(IP/域名)
-* 基于TLS, 支持(AEAD类型)高强度加密通信, 如aes-256-gcm, chacha20-poly1305
+* 可配置多服务器切换; 自定义直连白名单(IP/域名)
+* 基于TLS底层传输(可禁用); 上层支持AEAD类型高强度加密通信, 如aes-256-gcm, chacha20-poly1305
 * http2帧格式交互 (更灵活通用, 更易扩展)
+* 支持http(s)出口协议(基于tcp over http(s)技术), 用于easyss-server位于http反向代理之后等特殊场景
+* 支持服务端(easyss-server)链式代理
 * 内建DNS服务器，支持DNS Forward转发，可用于透明代理部署时使用 (默认关闭，可通过命令行启用)
-* 无流量特征，不易被嗅探
 
 ## 下载安装
 
@@ -56,7 +57,8 @@ make easyss-server
   "local_port": 2080,
   "method": "aes-256-gcm",
   "timeout": 60,
-  "bind_all": false
+  "bind_all": false,
+  "outbound_proto": "native"
 }
 ```
 
@@ -67,7 +69,8 @@ make easyss-server
     {
       "server": "your-domain.com",
       "server_port": 7878,
-      "password": "your-pass"
+      "password": "your-pass",
+      "default": true
     },
     {
       "server": "your-domain2.com",
@@ -92,6 +95,7 @@ make easyss-server
 * timeout: 超时时间,单位秒(默认60)
 * bind_all: 是否将监听端口绑定到所有本地IP上(默认false)
 * ca_path: 自定义CA证书文件路径(当使用自定义tls证书时才配置)
+* outbound_proto: 出口协议，默认`native`，可选：`native`, `http`, `https`
 
 其他还有一些参数没有列出，如无必要，无需关心。除了3个必填的参数，其他都是可选的，甚至可以不要配置文件，全部通过命令行指定即可。
 
@@ -117,6 +121,7 @@ make easyss-server
 39.156.66.10
 110.242.68.66
 106.11.84.3
+206.0.68.0/23
 ```
 
 `direct_domains.txt`文件示例：
@@ -128,7 +133,7 @@ your-custom-domain.com
 
 ### 手机客户端
 
-手机客户端apk文件可直接在release页面下载。
+手机客户端apk文件可直接在[release页面](https://github.com/nange/easyss/releases)下载。
 
 手机客户端是基于Matsuri扩展修改而来，源代码在[Matsuri](https://github.com/bingooo/Matsuri/tree/easyss)，感谢 [bingooo](https://github.com/bingooo)
 
@@ -155,11 +160,11 @@ your-custom-domain.com
 
 执行:
 ```sh
-# 需sudo权限
 ./easyss-server
 ```
 
-**注意：在没有使用自定义证书情况下，服务器的443端口必须对外可访问，用于自动获取服务器域名证书的TLS校验使用。**
+**注意：在没有使用自定义证书且没有禁用TLS情况下，服务器的443端口必须对外可访问，用于自动获取服务器域名证书的TLS校验使用。
+并且这种情况需要sudo权限运行easyss-server**
 
 #### docker部署
 
@@ -172,6 +177,39 @@ docker run -d --name easyss --network host nange/docker-easyss:latest -p yourpor
 #### 生成自定义证书
 可根据自己的需求，使用`openssl`等工具生成自定义证书。也可以参考： `./scripts/self_signed_certs` 目录示例，使用`cfssl`生成自定义证书。
 示例就是使用IP而不是域名生成自定义证书，这样就可以无域名使用Easyss了。
+
+## 高级用法
+### 服务器部署在反向代理之后
+默认Easyss的出口协议为`native`，是基于TCP的一种特有协议。
+但由于各种网络情况的客观复杂性，有可能我们的Easyss-server服务器只能部署于HTTP(s)反向代理之后的，
+这时候`native`协议将无法工作，因此easyss支持了三种出口协议可选：`native`, `http`, `https`。
+`http`和`https`出口协议是对`native`的包装，基于tcp over http(s)技术实现。
+如果可能的话应该优先使用`native`协议，因为其性能和延迟都有最好的表现。
+
+在Easyss配置文件中，指定`outbound_proto: http` 或者 `outbound_proto: https`，
+并在Easyss-server配置文件中，指定`enable_http_inbound: true`，即可实现服务器部署在反向代理之后的场景。
+
+### 启动前或定期执行自定义命令
+同时Easyss还支持配置`cmd_before_startup`, `cmd_interval`参数，用于配置一个自定义命令，在Easyss启动前执行或者定期的执行。
+`cmd_interval_time`可用于控制定期执行间隔，默认10分钟执行一次。
+
+### 作为透明代理将Easyss部署在路由器或者软路由上
+直接将Easyss部署在路由器或这软路由上，可实现家里或公司网络自动透明代理，无需在终端设备上安装Easyss客户端。
+
+只需要在配置文件或者命令行指定`enable_tun2socks: true` 或者 `-enable-tun2socks=true`开启全局代理，
+并同时开启DNS流量转发`enable_forward_dns: true` 或者`-enable-forward-dns=true`，即可实现透明代理。
+
+### 服务端链式代理
+服务端(`easyss-server`)支持将请求再次转发给下一个代理(目前只支持`socks5`)。
+如服务器IP被ChatGPT屏蔽了，可以在服务器上部署上`Warp`，然后`easyss-server`将ChatGPT相关的请求转发给`Warp`，这样可突破ChatGPT的封锁。
+
+只需要在配置文件中指定`next_proxy_url: "socks5://your-ip:your-port"`，
+然后在`easyss-server`目录下创建`next_proxy_domains.txt`, `next_proxy_ips.txt`文件，用于指定对哪些域名或IP地址走链式代理。
+也可以在配置文件中手动指定自定义文件路径：`next_proxy_domains_file: "your_custom_domain_file.txt"`, `next_proxy_ips_file: "your_custom_ip_file.txt"`。
+如果想链式代理所有地址的请求，则可以配置：`enable_next_proxy_all_host: true`。
+
+另外需要注意的是，链式代理默认是不转发`UDP`请求的，主要原因是很多`socks5`代理都不支持`UDP`请求，如`Warp`就不支持。
+如果确定自己的代理是支持`UDP`请求的，又想开启`UDP`请求链式代理，则可以配置: `enable_next_proxy_udp: true`。
 
 ## LICENSE
 

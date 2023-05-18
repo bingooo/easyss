@@ -1,29 +1,24 @@
 package easyss
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"sync"
 	"time"
 
 	"github.com/nange/easyss/v2/cipherstream"
-	"github.com/nange/easyss/v2/util"
 	"github.com/nange/easyss/v2/util/bytespool"
 	log "github.com/sirupsen/logrus"
 )
 
 func (es *EasyServer) remoteUDPHandle(conn net.Conn, addrStr, method string, tryReuse bool) error {
-	rAddr, err := net.ResolveUDPAddr("udp", addrStr)
-	if err != nil {
-		return fmt.Errorf("net.ResolveUDPAddr %s err:%v", addrStr, err)
-	}
-
-	uConn, err := net.DialUDP("udp", nil, rAddr)
+	uConn, err := es.targetConn("udp", addrStr)
 	if err != nil {
 		return fmt.Errorf("net.DialUDP %v err:%v", addrStr, err)
 	}
 
-	csStream, err := cipherstream.New(conn, es.Password(), method, util.FrameTypeData, util.FlagUDP)
+	csStream, err := cipherstream.New(conn, es.Password(), method, cipherstream.FrameTypeData, cipherstream.FlagUDP)
 	if err != nil {
 		return fmt.Errorf("new cipherstream err:%v, method:%v", err, method)
 	}
@@ -41,7 +36,7 @@ func (es *EasyServer) remoteUDPHandle(conn net.Conn, addrStr, method string, try
 		for {
 			n, err := csStream.Read(buf[:])
 			if err != nil {
-				if cipherstream.FINRSTStreamErr(err) {
+				if errors.Is(err, cipherstream.ErrFINRSTStream) {
 					_tryReuse = true
 					log.Debugf("[REMOTE_UDP] received FIN when reading data from client, try to reuse the connectio")
 				} else {
@@ -81,15 +76,16 @@ func (es *EasyServer) remoteUDPHandle(conn net.Conn, addrStr, method string, try
 
 	wg.Wait()
 
-	var reuse bool
+	var reuse error
 	if tryReuse && _tryReuse {
 		log.Debugf("[REMOTE_UDP] request is finished, try to reuse underlying tcp connection")
 		reuse = tryReuseInUDPServer(csStream, es.Timeout())
 	}
 
-	if !reuse {
+	if reuse != nil {
 		MarkCipherStreamUnusable(csStream)
-		log.Warnf("[REMOTE_UDP] underlying proxy connection is unhealthy, need close it")
+		log.Warnf("[REMOTE_UDP] underlying proxy connection is unhealthy, need close it: %v", reuse)
+		return reuse
 	} else {
 		log.Debugf("[REMOTE_UDP] underlying proxy connection is healthy, so reuse it")
 	}
@@ -98,22 +94,22 @@ func (es *EasyServer) remoteUDPHandle(conn net.Conn, addrStr, method string, try
 	return nil
 }
 
-func tryReuseInUDPServer(cipher net.Conn, timeout time.Duration) bool {
-	if err := SetCipherDeadline(cipher, time.Now().Add(timeout)); err != nil {
-		return false
+func tryReuseInUDPServer(cipher net.Conn, timeout time.Duration) error {
+	if err := cipher.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		return err
 	}
 	if err := WriteACKToCipher(cipher); err != nil {
-		return false
+		return err
 	}
 	if err := CloseWrite(cipher); err != nil {
-		return false
+		return err
 	}
-	if !ReadACKFromCipher(cipher) {
-		return false
+	if err := ReadACKFromCipher(cipher); err != nil {
+		return err
 	}
-	if err := SetCipherDeadline(cipher, time.Time{}); err != nil {
-		return false
+	if err := cipher.SetReadDeadline(time.Time{}); err != nil {
+		return err
 	}
 
-	return true
+	return nil
 }

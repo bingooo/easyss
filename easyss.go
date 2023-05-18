@@ -145,15 +145,17 @@ type ProxyRule int
 const (
 	ProxyRuleUnknown ProxyRule = iota
 	ProxyRuleAuto
+	ProxyRuleReverseAuto
 	ProxyRuleProxy
 	ProxyRuleDirect
 )
 
 func ParseProxyRuleFromString(rule string) ProxyRule {
 	m := map[string]ProxyRule{
-		"auto":   ProxyRuleAuto,
-		"proxy":  ProxyRuleProxy,
-		"direct": ProxyRuleDirect,
+		"auto":         ProxyRuleAuto,
+		"reverse_auto": ProxyRuleReverseAuto,
+		"proxy":        ProxyRuleProxy,
+		"direct":       ProxyRuleDirect,
 	}
 	if r, ok := m[rule]; ok {
 		return r
@@ -218,7 +220,10 @@ func New(config *Config) (*Easyss, error) {
 	}
 	ss.proxyRule = proxyRule
 
-	ss.cmdBeforeStartup()
+	if err := ss.cmdBeforeStartup(); err != nil {
+		log.Errorf("[EASYSS] exectuing command before startup:%v", err)
+		return nil, err
+	}
 
 	db, err := geoip2.FromBytes(geoIPCNPrivate)
 	if err != nil {
@@ -227,13 +232,13 @@ func New(config *Config) (*Easyss, error) {
 	ss.geoipDB = db
 	ss.geosite = NewGeoSite(geoSiteCN)
 
-	if err := ss.loadCustomIPDomains(); err != nil {
-		log.Errorf("[EASYSS] load custom ip/domains err:%s", err.Error())
-	}
-
 	if err := ss.initDirectDNSServer(); err != nil {
 		log.Errorf("[EASYSS] init direct dns server:%v", err)
 		return nil, err
+	}
+
+	if err := ss.loadCustomIPDomains(); err != nil {
+		log.Errorf("[EASYSS] load custom ip/domains err:%s", err.Error())
 	}
 
 	if err := ss.initServerIPAndDNSCache(); err != nil {
@@ -271,6 +276,7 @@ func (ss *Easyss) loadCustomIPDomains() error {
 	if err != nil {
 		return err
 	}
+
 	if len(directIPs) > 0 {
 		log.Infof("[EASYSS] load custom direct ips success, len:%d", len(directIPs))
 		for k := range directIPs {
@@ -293,6 +299,24 @@ func (ss *Easyss) loadCustomIPDomains() error {
 	if len(directDomains) > 0 {
 		log.Infof("[EASYSS] load custom direct domains success, len:%d", len(directDomains))
 		ss.customDirectDomains = directDomains
+		// not only direct the domains but also the ips of domains
+		for domain := range directDomains {
+			msg, _, err := ss.DNSMsg(ss.directDNSServer, domain)
+			if err != nil {
+				log.Errorf("[EASYSS] query dns for custom direct domain %s: %v", domain, err)
+				continue
+			}
+			if msg == nil {
+				continue
+			}
+			for _, an := range msg.Answer {
+				if a, ok := an.(*dns.A); ok {
+					ss.customDirectIPs[a.A.String()] = struct{}{}
+				} else if aa, ok := an.(*dns.AAAA); ok {
+					ss.customDirectIPs[aa.AAAA.String()] = struct{}{}
+				}
+			}
+		}
 	}
 
 	return nil
@@ -319,10 +343,18 @@ func (ss *Easyss) initDirectDNSServer() error {
 
 func (ss *Easyss) initServerIPAndDNSCache() error {
 	if !util.IsIP(ss.Server()) {
-		msg, msgAAAA, err := ss.DNSMsg(ss.directDNSServer, ss.Server())
+		var msg, msgAAAA *dns.Msg
+		var err error
+		for i := 1; i <= 3; i++ {
+			msg, msgAAAA, err = ss.DNSMsg(ss.directDNSServer, ss.Server())
+			if err != nil {
+				log.Warnf("[EASYSS] query dns failed for %s from %s: %s, retry after %ds",
+					ss.Server(), ss.directDNSServer, err.Error(), i)
+				time.Sleep(time.Duration(i) * time.Second)
+				continue
+			}
+		}
 		if err != nil {
-			log.Errorf("[EASYSS] query dns failed for %s from %s err:%s",
-				ss.Server(), ss.directDNSServer, err.Error())
 			return err
 		}
 		if msg != nil {
@@ -601,6 +633,34 @@ func (ss *Easyss) Timeout() time.Duration {
 	return time.Duration(ss.config.Timeout) * time.Second
 }
 
+func (ss *Easyss) PingTimeout() time.Duration {
+	timeout := ss.Timeout() / 5
+	if timeout < time.Second {
+		timeout = time.Second
+	}
+	return timeout
+}
+
+func (ss *Easyss) TLSTimeout() time.Duration {
+	timeout := ss.Timeout() / 3
+	if timeout < time.Second {
+		timeout = time.Second
+	}
+	return timeout
+}
+
+func (ss *Easyss) CMDTimeout() time.Duration {
+	return ss.Timeout() * 3
+}
+
+func (ss *Easyss) AuthUsername() string {
+	return ss.config.AuthUsername
+}
+
+func (ss *Easyss) AuthPassword() string {
+	return ss.config.AuthPassword
+}
+
 func (ss *Easyss) LocalAddr() string {
 	return fmt.Sprintf("%s:%d", "127.0.0.1", ss.LocalPort())
 }
@@ -684,7 +744,7 @@ func (ss *Easyss) AvailableConn() (conn net.Conn, err error) {
 
 	pingTest := func(conn net.Conn) (er error) {
 		var csStream net.Conn
-		csStream, er = cipherstream.New(conn, ss.Password(), cipherstream.MethodAes256GCM, util.FrameTypePing)
+		csStream, er = cipherstream.New(conn, ss.Password(), cipherstream.MethodAes256GCM, cipherstream.FrameTypePing)
 		if er != nil {
 			return er
 		}
@@ -700,37 +760,10 @@ func (ss *Easyss) AvailableConn() (conn net.Conn, err error) {
 
 		start := time.Now()
 		ping := []byte(strconv.FormatInt(start.UnixNano(), 10))
-		if er = cs.WritePing(ping, util.FlagNeedACK); er != nil {
+		if er = cs.WritePing(ping, cipherstream.FlagNeedACK); er != nil {
 			return
 		}
 
-		timeout := ss.Timeout() / 3
-		if timeout < time.Second {
-			timeout = time.Second
-		}
-		if er = SetCipherDeadline(cs, time.Now().Add(timeout)); er != nil {
-			return
-		}
-		var payload []byte
-		if payload, er = cs.ReadPing(); er != nil {
-			return
-		} else if !bytes.Equal(ping, payload) {
-			er = errors.New("the payload of ping not equals send value")
-			return
-		}
-
-		since := time.Since(start)
-		ss.pingLatency <- since
-		log.Debugf("[EASYSS] ping %s latency:%v", ss.Server(), since)
-		if since > time.Second {
-			log.Warnf("[EASYSS] got high latency:%v of ping %s", since, ss.Server())
-		} else if since > 500*time.Millisecond {
-			log.Infof("[EASYSS] got latency:%v of ping %s", since, ss.Server())
-		}
-
-		if er = SetCipherDeadline(cs, time.Time{}); er != nil {
-			return
-		}
 		return
 	}
 
@@ -757,6 +790,28 @@ func (ss *Easyss) AvailableConn() (conn net.Conn, err error) {
 	}
 
 	return
+}
+
+func (ss *Easyss) PingHook(b []byte) error {
+	if len(b) == 0 {
+		return nil
+	}
+
+	ts, err := strconv.ParseInt(string(b), 10, 64)
+	if err != nil {
+		return err
+	}
+	since := time.Since(time.Unix(0, ts))
+	ss.pingLatency <- since
+
+	log.Debugf("[EASYSS] ping %s latency:%v", ss.Server(), since)
+	if since > time.Second {
+		log.Warnf("[EASYSS] got high latency:%v of ping %s", since, ss.Server())
+	} else if since > 500*time.Millisecond {
+		log.Infof("[EASYSS] got latency:%v of ping %s", since, ss.Server())
+	}
+
+	return nil
 }
 
 func (ss *Easyss) SetSocksServer(server *socks5.Server) {
@@ -906,6 +961,16 @@ func (ss *Easyss) HostShouldDirect(host string) bool {
 		return false
 	}
 
+	if ss.HostMatchCustomDirectConfig(host) {
+		return true
+	}
+	if ss.ProxyRule() == ProxyRuleReverseAuto {
+		return !ss.HostAtCNOrPrivate(host)
+	}
+	return ss.HostAtCNOrPrivate(host)
+}
+
+func (ss *Easyss) HostMatchCustomDirectConfig(host string) bool {
 	if util.IsIP(host) {
 		if _, ok := ss.customDirectIPs[host]; ok {
 			return true
@@ -923,13 +988,8 @@ func (ss *Easyss) HostShouldDirect(host string) bool {
 		if _, ok := ss.customDirectDomains[domain]; ok {
 			return true
 		}
-		// if the host end with .cn, return true
-		if strings.HasSuffix(host, ".cn") {
-			return true
-		}
 	}
-
-	return ss.HostAtCNOrPrivate(host)
+	return false
 }
 
 func (ss *Easyss) HostAtCNOrPrivate(host string) bool {
@@ -939,6 +999,10 @@ func (ss *Easyss) HostAtCNOrPrivate(host string) bool {
 
 	if util.IsIP(host) {
 		return ss.IPAtCNOrPrivate(host)
+	}
+	// if the host end with .cn, return true
+	if strings.HasSuffix(host, ".cn") {
+		return true
 	}
 
 	return ss.geosite.SiteAtCN(host)

@@ -3,11 +3,14 @@ package easyss
 import (
 	"crypto/tls"
 	"net"
+	"net/url"
 	"strconv"
 	"sync"
 	"time"
 
 	"github.com/nange/easyss/v2/httptunnel"
+	"github.com/nange/easyss/v2/util"
+	log "github.com/sirupsen/logrus"
 )
 
 type EasyServer struct {
@@ -17,12 +20,73 @@ type EasyServer struct {
 	httpTunnelServer *httptunnel.Server
 	tlsConfig        *tls.Config
 
+	nextProxyIPs     map[string]struct{}
+	nextProxyCIDRIPs []*net.IPNet
+	nextProxyDomains map[string]struct{}
+
 	// only used for testing
 	disableValidateAddr bool
 }
 
-func NewServer(config *ServerConfig) *EasyServer {
-	return &EasyServer{config: config}
+func NewServer(config *ServerConfig) (*EasyServer, error) {
+	es := &EasyServer{config: config}
+
+	if u := es.NextProxyURL(); u != nil {
+		log.Infof("[EASYSS_SERVER] next proxy is enabled. next_proxy_url: %v, enable_next_proxy_udp: %v, enable_next_proxy_all_host:%v",
+			u.String(), es.EnableNextProxyUDP(), es.EnableNextProxyALLHost())
+		if err := es.loadNextProxyIPDomains(); err != nil {
+			return nil, err
+		}
+	}
+
+	return es, nil
+}
+
+func (es *EasyServer) loadNextProxyIPDomains() error {
+	es.nextProxyIPs = make(map[string]struct{})
+	es.nextProxyDomains = make(map[string]struct{})
+
+	nextIPs, err := util.ReadFileLinesMap(es.config.NextProxyIPsFile)
+	if err != nil {
+		return err
+	}
+
+	if len(nextIPs) > 0 {
+		log.Infof("[EASYSS_SERVER] load next proxy ips success, len:%d", len(nextIPs))
+		for k := range nextIPs {
+			_, ipnet, err := net.ParseCIDR(k)
+			if err != nil {
+				continue
+			}
+			if ipnet != nil {
+				es.nextProxyCIDRIPs = append(es.nextProxyCIDRIPs, ipnet)
+				delete(nextIPs, k)
+			}
+		}
+		es.nextProxyIPs = nextIPs
+	}
+
+	nextDomains, err := util.ReadFileLinesMap(es.config.NextProxyDomainsFile)
+	if err != nil {
+		return err
+	}
+	if len(nextDomains) > 0 {
+		log.Infof("[EASYSS_SERVER] load next proxy domains success, len:%d", len(nextDomains))
+		es.nextProxyDomains = nextDomains
+		// not only proxy the domains but also the ips of domains
+		for domain := range nextDomains {
+			ips, err := net.LookupIP(domain)
+			if err != nil {
+				log.Warnf("[EASYSS_SERVER] lookup ip for %s: %v", domain, err)
+				continue
+			}
+			for _, ip := range ips {
+				es.nextProxyIPs[ip.String()] = struct{}{}
+			}
+		}
+	}
+
+	return nil
 }
 
 func (es *EasyServer) Server() string {
@@ -73,6 +137,30 @@ func (es *EasyServer) EnabledHTTPInbound() bool {
 
 func (es *EasyServer) HTTPInboundPort() int {
 	return es.config.HTTPInboundPort
+}
+
+func (es *EasyServer) NextProxyURL() *url.URL {
+	if es.config.NextProxyURL == "" {
+		return nil
+	}
+	u, _ := url.Parse(es.config.NextProxyURL)
+	return u
+}
+
+func (es *EasyServer) EnableNextProxyUDP() bool {
+	return es.config.EnableNextProxyUDP
+}
+
+func (es *EasyServer) EnableNextProxyALLHost() bool {
+	return es.config.EnableNextProxyALLHost
+}
+
+func (es *EasyServer) NextProxyDomainsFile() string {
+	return es.config.NextProxyDomainsFile
+}
+
+func (es *EasyServer) NextProxyIPsFile() string {
+	return es.config.NextProxyIPsFile
 }
 
 func (es *EasyServer) Close() (err error) {

@@ -62,6 +62,11 @@ const (
 )
 
 const (
+	TestHTTPSURL = "https://cloud.tencent.com"
+	TestHTTPURL  = "http://cloud.tencent.com"
+)
+
+const (
 	CloseWriteServerPort = "8888"
 )
 
@@ -107,7 +112,8 @@ func (es *EasyssSuite) BeforeTest(suiteName, testName string) {
 		KeyPath:    es.keyPath,
 	}
 	serverConfig.SetDefaultValue()
-	server := NewServer(serverConfig)
+	server, err := NewServer(serverConfig)
+	es.Nil(err)
 	server.disableValidateAddr = true
 	es.server = server
 
@@ -162,8 +168,8 @@ func (es *EasyssSuite) TestEasySuit() {
 			MaxConnsPerHost:     1,
 		},
 	}
-	body, err := clientGet(client, "https://baidu.com")
-	es.Require().Nilf(err, "http get baidu.com failed:%s", err)
+	body, err := clientGet(client, TestHTTPSURL)
+	es.Require().Nilf(err, "http get %s failed:%s", TestHTTPSURL, err)
 	es.Greater(len(body), 1000)
 
 	client2 := &http.Client{
@@ -176,12 +182,12 @@ func (es *EasyssSuite) TestEasySuit() {
 			MaxConnsPerHost:     1,
 		},
 	}
-	body2, err2 := clientGet(client2, "https://baidu.com")
-	es.Require().Nilf(err2, "http get baidu.com failed")
+	body2, err2 := clientGet(client2, TestHTTPSURL)
+	es.Require().Nilf(err2, "http get %s failed", TestHTTPSURL)
 	es.Greater(len(body2), 1000)
 
-	body3, err3 := clientGet(client2, "http://www.baidu.com")
-	es.Require().Nilf(err3, "http get baidu.com failed")
+	body3, err3 := clientGet(client2, TestHTTPURL)
+	es.Require().Nilf(err3, "http get %s failed", TestHTTPURL)
 	es.Greater(len(body3), 1000)
 }
 
