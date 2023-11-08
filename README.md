@@ -26,14 +26,14 @@ Easyss是一款兼容socks5的安全代理上网工具，目标是使访问国�
 
 [去下载](https://github.com/nange/easyss/releases)
 
-### 或者 通过源码安装(go version 1.20+ is required)
+### 或者 通过源码安装(go version 1.21+ is required)
 
 ```sh
 // Ubuntu20.04 or Debian11 
-apt-get install libgtk-3-dev libayatana-appindicator3-dev
+apt-get install gcc libgtk-3-dev libayatana-appindicator3-dev -y
 
 // Ubuntu18.04 or Debian10
-apt-get install libgtk-3-dev libappindicator3-dev -y
+apt-get install gcc libgtk-3-dev libappindicator3-dev -y
 
 // build easyss client
 make easyss
@@ -58,7 +58,8 @@ make easyss-server
   "method": "aes-256-gcm",
   "timeout": 60,
   "bind_all": false,
-  "outbound_proto": "native"
+  "outbound_proto": "native",
+  "log_file_path": "easyss.log"
 }
 ```
 
@@ -82,7 +83,8 @@ make easyss-server
   "method": "aes-256-gcm",
   "timeout": 60,
   "bind_all": false,
-  "ca_path": ""
+  "ca_path": "",
+  "log_file_path": "easyss.log"
 }
 ```
 
@@ -96,6 +98,7 @@ make easyss-server
 * bind_all: 是否将监听端口绑定到所有本地IP上(默认false)
 * ca_path: 自定义CA证书文件路径(当使用自定义tls证书时才配置)
 * outbound_proto: 出口协议，默认`native`，可选：`native`, `http`, `https`
+* log_file_path: 日志文件路径，为空则输出到系统标准输出
 
 其他还有一些参数没有列出，如无必要，无需关心。除了3个必填的参数，其他都是可选的，甚至可以不要配置文件，全部通过命令行指定即可。
 
@@ -135,7 +138,7 @@ your-custom-domain.com
 
 手机客户端apk文件可直接在[release页面](https://github.com/nange/easyss/releases)下载。
 
-手机客户端是基于Matsuri扩展修改而来，源代码在[Matsuri](https://github.com/bingooo/Matsuri/tree/easyss)，感谢 [bingooo](https://github.com/bingooo)
+手机客户端是基于NekoBoxForAndroid扩展修改而来，源代码在[NekoBoxForAndroid](https://github.com/bingooo/NekoBoxForAndroid/tree/easyss)，感谢 [bingooo](https://github.com/bingooo)
 
 用法：创建Easyss配置项：点击右上角+图标 -> 手动输入 -> 选择Easyss
 

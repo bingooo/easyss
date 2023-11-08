@@ -7,12 +7,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/miekg/dns"
 	"github.com/nange/easyss/v2/cipherstream"
+	"github.com/nange/easyss/v2/log"
 	"github.com/nange/easyss/v2/util/bytespool"
-	log "github.com/sirupsen/logrus"
 )
 
-func (es *EasyServer) remoteUDPHandle(conn net.Conn, addrStr, method string, tryReuse bool) error {
+func (es *EasyServer) remoteUDPHandle(conn net.Conn, addrStr, method string, isDNSProto, tryReuse bool) error {
 	uConn, err := es.targetConn("udp", addrStr)
 	if err != nil {
 		return fmt.Errorf("net.DialUDP %v err:%v", addrStr, err)
@@ -38,17 +39,24 @@ func (es *EasyServer) remoteUDPHandle(conn net.Conn, addrStr, method string, try
 			if err != nil {
 				if errors.Is(err, cipherstream.ErrFINRSTStream) {
 					_tryReuse = true
-					log.Debugf("[REMOTE_UDP] received FIN when reading data from client, try to reuse the connectio")
+					log.Debug("[REMOTE_UDP] received FIN when reading data from client, try to reuse the connection")
 				} else {
-					log.Warnf("[REMOTE_UDP] read data from client connection err:%v", err)
+					log.Warn("[REMOTE_UDP] read data from client connection", "err", err)
 				}
 
 				uConn.Close()
 				return
 			}
+			if isDNSProto {
+				// try to parse the dns request
+				msg := &dns.Msg{}
+				if err := msg.Unpack(buf[:n]); err == nil {
+					log.Info("[REMOTE_UDP] doing dns request for", "target", msg.Question[0].Name)
+				}
+			}
 			_, err = uConn.Write(buf[:n])
 			if err != nil {
-				log.Errorf("[REMOTE_UDP] write data to remote connection err:%v", err)
+				log.Error("[REMOTE_UDP] write data to remote connection", "err", err)
 				return
 			}
 		}
@@ -63,12 +71,12 @@ func (es *EasyServer) remoteUDPHandle(conn net.Conn, addrStr, method string, try
 		for {
 			n, err := uConn.Read(buf[:])
 			if err != nil {
-				log.Debugf("[REMOTE_UDP] read data from remote connection err:%v", err)
+				log.Debug("[REMOTE_UDP] read data from remote connection", "err", err)
 				return
 			}
 			_, err = csStream.Write(buf[:n])
 			if err != nil {
-				log.Errorf("[REMOTE_UDP] write data to tcp connection err:%v", err)
+				log.Error("[REMOTE_UDP] write data to tcp connection", "err", err)
 				return
 			}
 		}
@@ -78,16 +86,16 @@ func (es *EasyServer) remoteUDPHandle(conn net.Conn, addrStr, method string, try
 
 	var reuse error
 	if tryReuse && _tryReuse {
-		log.Debugf("[REMOTE_UDP] request is finished, try to reuse underlying tcp connection")
+		log.Debug("[REMOTE_UDP] request is finished, try to reuse underlying tcp connection")
 		reuse = tryReuseInUDPServer(csStream, es.Timeout())
 	}
 
 	if reuse != nil {
 		MarkCipherStreamUnusable(csStream)
-		log.Warnf("[REMOTE_UDP] underlying proxy connection is unhealthy, need close it: %v", reuse)
+		log.Warn("[REMOTE_UDP] underlying proxy connection is unhealthy, need close it", "reuse", reuse)
 		return reuse
 	} else {
-		log.Debugf("[REMOTE_UDP] underlying proxy connection is healthy, so reuse it")
+		log.Debug("[REMOTE_UDP] underlying proxy connection is healthy, so reuse it")
 	}
 	csStream.(*cipherstream.CipherStream).Release()
 

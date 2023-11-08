@@ -9,8 +9,8 @@ import (
 	"time"
 
 	"github.com/nange/easyss/v2/httptunnel"
+	"github.com/nange/easyss/v2/log"
 	"github.com/nange/easyss/v2/util"
-	log "github.com/sirupsen/logrus"
 )
 
 type EasyServer struct {
@@ -32,11 +32,14 @@ func NewServer(config *ServerConfig) (*EasyServer, error) {
 	es := &EasyServer{config: config}
 
 	if u := es.NextProxyURL(); u != nil {
-		log.Infof("[EASYSS_SERVER] next proxy is enabled. next_proxy_url: %v, enable_next_proxy_udp: %v, enable_next_proxy_all_host:%v",
-			u.String(), es.EnableNextProxyUDP(), es.EnableNextProxyALLHost())
+		log.Info("[EASYSS_SERVER] next proxy is enabled",
+			"next_proxy_url", u.String(),
+			"enable_next_proxy_udp", es.EnableNextProxyUDP(),
+			"enable_next_proxy_all_host", es.EnableNextProxyALLHost())
 		if err := es.loadNextProxyIPDomains(); err != nil {
 			return nil, err
 		}
+		es.printNextProxyInfo()
 	}
 
 	return es, nil
@@ -52,7 +55,7 @@ func (es *EasyServer) loadNextProxyIPDomains() error {
 	}
 
 	if len(nextIPs) > 0 {
-		log.Infof("[EASYSS_SERVER] load next proxy ips success, len:%d", len(nextIPs))
+		log.Info("[EASYSS_SERVER] load next proxy ips success", "len", len(nextIPs))
 		for k := range nextIPs {
 			_, ipnet, err := net.ParseCIDR(k)
 			if err != nil {
@@ -71,13 +74,13 @@ func (es *EasyServer) loadNextProxyIPDomains() error {
 		return err
 	}
 	if len(nextDomains) > 0 {
-		log.Infof("[EASYSS_SERVER] load next proxy domains success, len:%d", len(nextDomains))
+		log.Info("[EASYSS_SERVER] load next proxy domains success", "len", len(nextDomains))
 		es.nextProxyDomains = nextDomains
 		// not only proxy the domains but also the ips of domains
 		for domain := range nextDomains {
-			ips, err := net.LookupIP(domain)
+			ips, err := util.LookupIPV4From(DefaultDNSServer, domain)
 			if err != nil {
-				log.Warnf("[EASYSS_SERVER] lookup ip for %s: %v", domain, err)
+				log.Warn("[EASYSS_SERVER] lookup ip for", "domain", domain, "err", err)
 				continue
 			}
 			for _, ip := range ips {
@@ -87,6 +90,24 @@ func (es *EasyServer) loadNextProxyIPDomains() error {
 	}
 
 	return nil
+}
+
+func (es *EasyServer) printNextProxyInfo() {
+	keys := make([]string, 0, len(es.nextProxyDomains))
+
+	for k := range es.nextProxyDomains {
+		keys = append(keys, k)
+	}
+	log.Info("[EASYSS_SERVER] next proxy domains", "domains", keys)
+
+	keys = keys[:0]
+	for k := range es.nextProxyIPs {
+		keys = append(keys, k)
+	}
+	for _, v := range es.nextProxyCIDRIPs {
+		keys = append(keys, v.String())
+	}
+	log.Info("[EASYSS_SERVER] next proxy ips", "ips", keys)
 }
 
 func (es *EasyServer) Server() string {
