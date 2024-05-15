@@ -2,6 +2,9 @@ name: Nightly Release
 
 on:
   workflow_dispatch:
+    inputs:
+      tags:
+        description: 'Tags'
 
 jobs:
   linux:
@@ -101,13 +104,13 @@ jobs:
 
       - name: Build Arm64
         run: |
-          GOOS=darwin GOARCH=arm64 make easyss-with-notray
+          GOOS=darwin GOARCH=arm64 make easyss
           GOOS=darwin GOARCH=arm64 make easyss-server
 
       - name: Pack Arm64
         run: |
           cd bin
-          zip easyss-with-notray-darwin-arm64.zip ./easyss-with-notray
+          zip easyss-darwin-arm64.zip ./easyss
           zip easyss-server-darwin-arm64.zip ./easyss-server
 
       - name: Set outputs
