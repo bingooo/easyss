@@ -69,8 +69,7 @@ func (ss *Easyss) UDPHandle(s *socks5.Server, addr *net.UDPAddr, d *socks5.Datag
 			return ss.directUDPRelay(s, addr, d, true)
 		}
 
-		log.Info("[DNS_PROXY]", "domain", msg.Question[0].Name, "qtype", dns.TypeToString[msg.Question[0].Qtype])
-
+		log.Info("[DNS_PROXY]", "domain", msg.Question[0].Name, "qtype", dns.TypeToString[msg.Question[0].Qtype], "server", DefaultDNSServer)
 		log.Debug("[DNS_PROXY] rewrite dns dst to", "server", DefaultDNSServer)
 		rewrittenDst = DefaultDNSServer
 	}
