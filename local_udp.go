@@ -346,7 +346,6 @@ func isDNSRequest(msg *dns.Msg) bool {
 	if msg == nil || len(msg.Question) == 0 {
 		return false
 	}
-	q := msg.Question[0]
 	if msg.Response || msg.Opcode != dns.OpcodeQuery {
         return false
     }
