@@ -347,10 +347,10 @@ func isDNSRequest(msg *dns.Msg) bool {
 		return false
 	}
 	q := msg.Question[0]
-	if q.Qtype == dns.TypeA || q.Qtype == dns.TypeAAAA {
-		return true
-	}
-	return false
+	if msg.Response || msg.Opcode != dns.OpcodeQuery {
+        return false
+    }
+	return true
 }
 
 func isDNSResponse(msg *dns.Msg) bool {
