@@ -108,10 +108,8 @@ func (l *LocalConn) Pull() {
 }
 
 func (l *LocalConn) Push() {
-	defer l.PushClose()
-
 	if err := l.push(); err != nil {
-		if !errors.Is(err, io.EOF) {
+		if !errors.Is(err, io.EOF) && !errors.Is(err, netpipe.ErrPipeClosed) {
 			log.Error("[HTTP_TUNNEL_LOCAL] push", "err", err, "uuid", l.uuid)
 		}
 	}
@@ -123,14 +121,7 @@ func (l *LocalConn) PullClose() {
 	if l.respBody != nil {
 		_ = l.respBody.Close()
 	}
-	_ = l.conn2.Close()
-}
-
-func (l *LocalConn) PushClose() {
-	if l.respBody != nil {
-		_ = l.respBody.Close()
-	}
-	_ = l.conn.Close()
+	_ = l.conn2.(interface{ CloseWrite() error }).CloseWrite()
 }
 
 func (l *LocalConn) pull() error {
@@ -170,6 +161,21 @@ func (l *LocalConn) push() error {
 
 	buf := bytespool.Get(cipherstream.MaxCipherRelaySize)
 	defer bytespool.MustPut(buf)
+
+	defer func() {
+		p := &pushPayload{RequestUID: l.uuid}
+		_ = faker.FakeData(p)
+
+		payload, _ := json.Marshal(p)
+		resp, err := r.SetBody(payload).Post(l.serverAddr + "/push")
+		if err != nil {
+			log.Warn("[HTTP_TUNNEL_LOCAL] push end", "err", err, "uuid", l.uuid)
+			return
+		}
+		if _, err = resp.ToBytes(); err != nil {
+			log.Warn("[HTTP_TUNNEL_LOCAL] push end", "err", err, "uuid", l.uuid)
+		}
+	}()
 
 	for {
 		var resp *req.Response

@@ -23,7 +23,8 @@ import (
 const RelayBufferSize = cipherstream.MaxCipherRelaySize
 
 type Server struct {
-	addr string
+	addr    string
+	timeout time.Duration
 
 	sync.Mutex
 	connMap     map[string][]net.Conn
@@ -44,6 +45,7 @@ func NewServer(addr string, timeout time.Duration, tlsConfig *tls.Config) *Serve
 
 	return &Server{
 		addr:        addr,
+		timeout:     timeout,
 		connMap:     make(map[string][]net.Conn, 256),
 		connCh:      make(chan net.Conn, 1),
 		closing:     make(chan struct{}, 1),
@@ -145,6 +147,7 @@ func (s *Server) pull(w http.ResponseWriter, r *http.Request) {
 	var n int
 	var p = &pullResp{}
 	for {
+		_ = conns[0].SetReadDeadline(time.Now().Add(s.timeout))
 		n, err = conns[0].Read(buf)
 		if n > 0 {
 			_ = faker.FakeData(p)
@@ -165,12 +168,11 @@ func (s *Server) pull(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
-	if err != nil {
-		if !errors.Is(err, io.EOF) {
-			log.Warn("[HTTP_TUNNEL_SERVER] read from conn", "err", err)
-		}
-		s.CloseConn(reqID)
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, netpipe.ErrPipeClosed) {
+		log.Warn("[HTTP_TUNNEL_SERVER] read from conn", "err", err)
 	}
+
+	s.pullClose(reqID)
 	log.Info("[HTTP_TUNNEL_SERVER] Pull completed...", "uuid", reqID)
 }
 
@@ -227,6 +229,11 @@ func (s *Server) push(w http.ResponseWriter, r *http.Request) {
 	s.notifyPull(reqID)
 	s.Unlock()
 
+	if p.Payload == "" {
+		// client end push
+		_ = conns[0].(interface{ CloseWrite() error }).CloseWrite()
+		return
+	}
 	cipher, err := base64.StdEncoding.DecodeString(p.Payload)
 	if err != nil {
 		log.Warn("[HTTP_TUNNEL_SERVER] decode cipher", "err", err)
@@ -243,13 +250,12 @@ func (s *Server) push(w http.ResponseWriter, r *http.Request) {
 	writeSuccess(w)
 }
 
-func (s *Server) CloseConn(reqID string) {
+func (s *Server) pullClose(reqID string) {
 	s.Lock()
 	defer s.Unlock()
-	conns := s.connMap[reqID]
-	if len(conns) > 0 {
+
+	if conns, ok := s.connMap[reqID]; ok {
 		_ = conns[0].Close()
-		_ = conns[1].Close()
 	}
 
 	s.connMap[reqID] = nil

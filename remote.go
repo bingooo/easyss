@@ -14,6 +14,7 @@ import (
 	"github.com/nange/easyss/v2/httptunnel"
 	"github.com/nange/easyss/v2/log"
 	"github.com/nange/easyss/v2/util"
+	"github.com/nange/easyss/v2/util/netpipe"
 	"github.com/txthinking/socks5"
 )
 
@@ -90,7 +91,7 @@ func (es *EasyServer) startTCPServer() {
 }
 
 func (es *EasyServer) startHTTPTunnelServer() {
-	server := httptunnel.NewServer(es.ListenHTTPTunnelAddr(), es.Timeout(), es.tlsConfig.Clone())
+	server := httptunnel.NewServer(es.ListenHTTPTunnelAddr(), es.MaxConnWaitTimeout(), es.tlsConfig.Clone())
 	es.mu.Lock()
 	es.httpTunnelServer = server
 	es.mu.Unlock()
@@ -117,7 +118,7 @@ func (es *EasyServer) handleConn(conn net.Conn, tryReuse bool) {
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				log.Debug("[REMOTE] got EOF error when handshake with client-server, maybe the connection pool closed the idle conn")
-			} else {
+			} else if !errors.Is(err, netpipe.ErrReadDeadline) {
 				log.Warn("[REMOTE] handshake with client", "err", err)
 			}
 			return
@@ -189,9 +190,9 @@ func (es *EasyServer) handShakeWithClient(conn net.Conn) (hsRes, error) {
 	}
 	cs := csStream.(*cipherstream.CipherStream)
 
-	_ = csStream.SetDeadline(time.Now().Add(es.MaxConnWaitTimeout()))
+	_ = csStream.SetReadDeadline(time.Now().Add(es.MaxConnWaitTimeout()))
 	defer func() {
-		_ = csStream.SetDeadline(time.Time{})
+		_ = csStream.SetReadDeadline(time.Time{})
 		cs.Release()
 	}()
 
@@ -202,7 +203,7 @@ func (es *EasyServer) handShakeWithClient(conn net.Conn) (hsRes, error) {
 			return res, err
 		}
 
-		_ = csStream.SetDeadline(time.Now().Add(es.MaxConnWaitTimeout()))
+		_ = csStream.SetReadDeadline(time.Now().Add(es.MaxConnWaitTimeout()))
 
 		if frame.IsPingFrame() {
 			log.Debug("[REMOTE] got ping message",

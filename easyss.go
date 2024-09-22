@@ -467,12 +467,19 @@ func (ss *Easyss) tlsConfig() (*utls.Config, error) {
 	return &utls.Config{
 		ServerName: ss.ServerName(),
 		RootCAs:    certPool,
+		NextProtos: []string{"http/1.1"},
 	}, nil
 }
 
 func (ss *Easyss) InitTcpPool() error {
-	if !ss.IsNativeOutboundProto() {
-		log.Info("[EASYSS] outbound proto don't need init tcp pool", "proto", ss.OutboundProto())
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	if ss.tcpPool != nil {
+		return nil
+	}
+
+	if !ss.IsNativeOutboundProto() || ss.proxyRule == ProxyRuleDirect {
+		log.Info("[EASYSS] don't need init tcp pool", "proto", ss.OutboundProto(), "proxy_rule", ss.proxyRule)
 		return nil
 	}
 
@@ -502,7 +509,7 @@ func (ss *Easyss) InitTcpPool() error {
 			return nil, err
 		}
 
-		uConn := utls.UClient(conn, tlsConfig, utls.Hello360_Auto)
+		uConn := utls.UClient(conn, tlsConfig.Clone(), utls.Hello360_Auto)
 		if err := uConn.HandshakeContext(ctx); err != nil {
 			return nil, err
 		}
@@ -519,7 +526,7 @@ func (ss *Easyss) InitTcpPool() error {
 		Factory:     factory,
 	}
 	tcpPool, err := easypool.NewHeapPool(config)
-	ss.SetPool(tcpPool)
+	ss.tcpPool = tcpPool
 
 	return err
 }
@@ -598,7 +605,7 @@ func (ss *Easyss) initHTTPOutboundClient() error {
 				return nil, err
 			}
 
-			uConn := utls.UClient(conn, tlsConfig, utls.Hello360_Auto)
+			uConn := utls.UClient(conn, tlsConfig.Clone(), utls.Hello360_Auto)
 			if err := uConn.HandshakeContext(ctx); err != nil {
 				return nil, err
 			}
@@ -617,6 +624,10 @@ func (ss *Easyss) initHTTPOutboundClient() error {
 
 func (ss *Easyss) Config() *Config {
 	return ss.config
+}
+
+func (ss *Easyss) CurrConfig() *Config {
+	return ss.currConfig
 }
 
 func (ss *Easyss) LocalPort() int {
@@ -666,13 +677,43 @@ func (ss *Easyss) PingLatencyCh() chan string { return ss.pingLatCh }
 
 func (ss *Easyss) ServerListAddrs() []string {
 	var list []string
+	builder := strings.Builder{}
 	for _, s := range ss.config.ServerList {
 		if util.IsIPV6(s.Server) {
-			list = append(list, fmt.Sprintf("[%s]:%d", s.Server, s.ServerPort))
+			builder.WriteString(fmt.Sprintf("[%s]:%d", s.Server, s.ServerPort))
 		} else {
-			list = append(list, fmt.Sprintf("%s:%d", s.Server, s.ServerPort))
+			builder.WriteString(fmt.Sprintf("%s:%d", s.Server, s.ServerPort))
 		}
+		builder.WriteString(" [proto=")
+		proto := ss.Config().OutboundProto
+		if s.OutboundProto != "" {
+			proto = s.OutboundProto
+		}
+		builder.WriteString(proto)
+		if s.SN != "" {
+			builder.WriteString(", sn=")
+			builder.WriteString(s.SN)
+		} else if ss.Config().SN != "" {
+			builder.WriteString(", sn=")
+			builder.WriteString(ss.Config().SN)
+		}
+		builder.WriteString("]")
+		list = append(list, builder.String())
+		builder.Reset()
 	}
+
+	if len(list) == 0 {
+		builder.WriteString(ss.ServerAddr())
+		builder.WriteString(" [proto=")
+		builder.WriteString(ss.OutboundProto())
+		if ss.CurrConfig().SN != "" {
+			builder.WriteString(", sn=")
+			builder.WriteString(ss.CurrConfig().SN)
+		}
+		builder.WriteString("]")
+		list = append(list, builder.String())
+	}
+
 	return list
 }
 
@@ -809,15 +850,19 @@ func (ss *Easyss) Pool() easypool.Pool {
 }
 
 func (ss *Easyss) AvailableConn(needPingACK ...bool) (conn net.Conn, err error) {
-	var pool easypool.Pool
-	var tryCount int
+	var tryCount = 1
 	if ss.IsNativeOutboundProto() {
-		if pool = ss.Pool(); pool == nil {
-			return nil, errors.New("pool is closed")
+		if ss.Pool() == nil {
+			if ss.Closed() {
+				return nil, errors.New("pool is closed")
+			}
+			if err := ss.InitTcpPool(); err != nil {
+				return nil, err
+			}
 		}
-		tryCount = pool.Len() + 1
-	} else {
-		tryCount = MaxIdle + 1
+		if pool := ss.Pool(); pool != nil && pool.Len() > 3 {
+			tryCount = 3
+		}
 	}
 
 	pingTest := func(conn net.Conn) (er error) {
@@ -856,7 +901,7 @@ func (ss *Easyss) AvailableConn(needPingACK ...bool) (conn net.Conn, err error) 
 		case OutboundProtoHTTPS:
 			conn, err = httptunnel.NewLocalConn(ss.HTTPOutboundClient(), "https://"+ss.ServerAddr(), ss.ServerName())
 		default:
-			conn, err = pool.Get()
+			conn, err = ss.PoolConn()
 		}
 		if err != nil {
 			log.Warn("[EASYSS] get conn failed", "err", err)
@@ -877,6 +922,15 @@ func (ss *Easyss) AvailableConn(needPingACK ...bool) (conn net.Conn, err error) 
 	}
 
 	return
+}
+
+func (ss *Easyss) PoolConn() (net.Conn, error) {
+	ss.mu.RLock()
+	defer ss.mu.RUnlock()
+	if ss.tcpPool == nil {
+		return nil, errors.New("pool is closed or not be initialized")
+	}
+	return ss.tcpPool.Get()
 }
 
 func (ss *Easyss) SetSocksServer(server *socks5.Server) {
@@ -938,12 +992,6 @@ func (ss *Easyss) SetHttpProxyServer(server *http.Server) {
 	ss.mu.Lock()
 	defer ss.mu.Unlock()
 	ss.httpProxyServer = server
-}
-
-func (ss *Easyss) SetPool(pool easypool.Pool) {
-	ss.mu.Lock()
-	defer ss.mu.Unlock()
-	ss.tcpPool = pool
 }
 
 func (ss *Easyss) DNSCache(name, qtype string, isDirect bool) *dns.Msg {
@@ -1140,4 +1188,10 @@ func (ss *Easyss) Close() error {
 		ss.closing = nil
 	}
 	return err
+}
+
+func (ss *Easyss) Closed() bool {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	return ss.closing == nil
 }

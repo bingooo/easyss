@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/nange/easyss/v2/util/bytespool"
 	"github.com/smallnest/ringbuffer"
 )
 
@@ -23,7 +24,11 @@ func (d dupPipe) Write(b []byte) (n int, err error) {
 }
 
 func (d dupPipe) Close() error {
-	return d.Send.Close()
+	return errors.Join(d.Send.Close(), d.Recv.Close())
+}
+
+func (d dupPipe) CloseWrite() error {
+	return d.Send.CloseWrite()
 }
 
 func (d dupPipe) LocalAddr() net.Addr {
@@ -61,16 +66,26 @@ func Pipe(maxSize int, addrs ...net.Addr) (net.Conn, net.Conn) {
 		localAddr = addrs[1]
 	}
 
+	buf1 := bytespool.Get(maxSize)
 	sp := &pipe{
-		buf:        ringbuffer.New(maxSize),
+		buf:        ringbuffer.NewBuffer(buf1),
+		back:       buf1,
+		rdChan:     make(chan struct{}),
+		wdChan:     make(chan struct{}),
+		closing:    make(chan struct{}),
 		maxSize:    maxSize,
 		remoteAddr: remoteAddr,
 		localAddr:  localAddr,
 	}
 	sp.cond = *sync.NewCond(&sp.mu)
 
+	buf2 := bytespool.Get(maxSize)
 	rp := &pipe{
-		buf:        ringbuffer.New(maxSize),
+		buf:        ringbuffer.NewBuffer(buf2),
+		back:       buf2,
+		rdChan:     make(chan struct{}),
+		wdChan:     make(chan struct{}),
+		closing:    make(chan struct{}),
 		maxSize:    maxSize,
 		remoteAddr: remoteAddr,
 		localAddr:  localAddr,
