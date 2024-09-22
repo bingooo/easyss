@@ -74,8 +74,8 @@ func (ss *Easyss) UDPHandle(s *socks5.Server, addr *net.UDPAddr, d *socks5.Datag
 		log.Debug("[DNS_PROXY] rewrite dns dst to", "server", DefaultDNSServer)
 		rewrittenDst = DefaultDNSServer
 	}
-
 	dstHost, port, _ := net.SplitHostPort(rewrittenDst)
+	log.Info("[SOCKS5_UDP]", "dst", rewrittenDst)
 	if ss.MatchHostRule(dstHost) == HostRuleDirect {
 		return ss.directUDPRelay(s, addr, d, isDNSReq)
 	}
