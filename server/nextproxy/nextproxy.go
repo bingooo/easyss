@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -18,11 +19,62 @@ type NextProxy struct {
 	enableUDP   bool
 	allHost     bool
 	dialTimeout time.Duration
+	// dialer allows pluggable dialing backends (e.g. tsnet). If nil, use SOCKS5.
+	dialer func(ctx context.Context, network, addr string) (net.Conn, error)
 
 	mu      sync.RWMutex
 	ips     map[string]struct{}
 	cidrIPs []*net.IPNet
 	domains map[string]struct{}
+}
+
+var (
+	tsnetRegistryMu sync.Mutex
+	tsnetRegistry   []*NextProxy
+)
+
+func registerTSNETProxy(np *NextProxy) {
+	if np == nil {
+		return
+	}
+	tsnetRegistryMu.Lock()
+	defer tsnetRegistryMu.Unlock()
+	tsnetRegistry = append(tsnetRegistry, np)
+}
+
+// AddCIDR adds a CIDR to the NextProxy's routing list (thread-safe).
+func (np *NextProxy) AddCIDR(cidr string) {
+	if np == nil {
+		return
+	}
+	_, ipnet, err := net.ParseCIDR(cidr)
+	if err != nil || ipnet == nil {
+		return
+	}
+	np.mu.Lock()
+	np.cidrIPs = append(np.cidrIPs, ipnet)
+	np.mu.Unlock()
+}
+
+// applyDiscoveredRoute will add the discovered route string to all
+// registered tsnet NextProxy instances. The route can be an IP, CIDR or domain.
+func applyDiscoveredRoute(route string) {
+	if route == "" {
+		return
+	}
+	tsnetRegistryMu.Lock()
+	proxies := append([]*NextProxy(nil), tsnetRegistry...)
+	tsnetRegistryMu.Unlock()
+
+	for _, np := range proxies {
+		if strings.Contains(route, "/") {
+			np.AddCIDR(route)
+		} else if util.IsIP(route) {
+			np.AddIP(route)
+		} else {
+			np.AddDomain(route)
+		}
+	}
 }
 
 func New(proxyURL string, enableUDP, allHost bool) (*NextProxy, error) {
@@ -34,7 +86,15 @@ func New(proxyURL string, enableUDP, allHost bool) (*NextProxy, error) {
 	if err != nil {
 		return nil, err
 	}
-	if u.Scheme != "socks5" {
+	// Support socks5 and tsnet schemes. tsnet backend is provided by
+	// optional implementation files; when not compiled, initTSNET returns
+	// a stub dialer that reports not-compiled.
+	switch u.Scheme {
+	case "socks5":
+		// ok
+	case "tsnet":
+		// ok, handled below
+	default:
 		return nil, fmt.Errorf("unsupported next proxy scheme %q", u.Scheme)
 	}
 
@@ -44,6 +104,17 @@ func New(proxyURL string, enableUDP, allHost bool) (*NextProxy, error) {
 		allHost:   allHost,
 		ips:       make(map[string]struct{}),
 		domains:   make(map[string]struct{}),
+	}
+
+	// Initialize scheme-specific dialer if needed.
+	if u.Scheme == "tsnet" {
+		d, err := initTSNET(u, enableUDP)
+		if err != nil {
+			return nil, err
+		}
+		np.dialer = d
+		// register this instance for discovered-route updates
+		registerTSNETProxy(np)
 	}
 
 	return np, nil
@@ -173,6 +244,12 @@ func (np *NextProxy) Dial(network, addr string) (net.Conn, error) {
 }
 
 func (np *NextProxy) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	if np == nil {
+		return nil, fmt.Errorf("nextproxy nil")
+	}
+	if np.dialer != nil {
+		return np.dialer(ctx, network, addr)
+	}
 	return np.dialSOCKS5Context(ctx, network, addr)
 }
 
