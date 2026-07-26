@@ -8,7 +8,7 @@ GO := go
 GO_BUILD := go build -ldflags '$(LDFLAGS)'
 GO_BUILD_WIN := GOOS=windows GOARCH=amd64 CGO_ENABLED=1 go build -ldflags '-H windowsgui $(LDFLAGS)'
 GOMOBILE := $(shell go env GOPATH)/bin/gomobile
-GOMOBILE_BIND := $(GOMOBILE) bind -target=android/arm64,android/amd64 -androidapi 29 -ldflags '$(LDFLAGS)'
+GOMOBILE_BIND := $(GOMOBILE) bind -target=android/arm64 -androidapi 29 -ldflags '$(LDFLAGS)'
 
 .PHONY: easyss easyss-without-tray easyss-windows easyss-server easyss-server-windows easyss-android-aar easyss-android-tsnet-aar format test lint
 
@@ -54,7 +54,7 @@ easyss-android-tsnet-aar:
 		exit 1; \
 	fi
 	mkdir -p bin
-	$(GOMOBILE_BIND) -tags tsnet -javapkg io.github.nange.easyss -o bin/libeasyss.aar ./mobile/ ./config/
+	$(GOMOBILE) bind -target=android/arm64 -androidapi 29 -ldflags '$(LDFLAGS) -X "github.com/nange/easyss/v3/version.GitTag=nightly-tsnet-$(shell date +%Y%m%d)"' -tags tsnet -javapkg io.github.nange.easyss -o bin/libeasyss.aar ./mobile/ ./config/
 
 format:
 	$(GO) fmt ./...

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/nange/easyss/v3/client/router"
+	"github.com/nange/easyss/v3/client/tsnet"
 	"github.com/nange/easyss/v3/config"
 	"github.com/nange/easyss/v3/log"
 	"github.com/nange/easyss/v3/protocol"
@@ -137,6 +138,12 @@ func (s *HTTPProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Serve /tsnet for direct requests to the proxy (Tailscale status).
+	if r.URL.Host == "" && r.URL.Path == "/tsnet" {
+		s.serveTsnetStatus(w)
+		return
+	}
+
 	// Prevent forwarding loops: reject requests that would be forwarded
 	// back to the proxy itself (both relative and absolute URLs).
 	if s.isSelfTarget(r) {
@@ -160,6 +167,14 @@ func (s *HTTPProxyServer) serveStats(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(snap); err != nil {
 		log.Warn("[HTTP-PROXY] encode stats", "err", err)
+	}
+}
+
+func (s *HTTPProxyServer) serveTsnetStatus(w http.ResponseWriter) {
+	status := tsnet.Status()
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	if _, err := w.Write([]byte(status)); err != nil {
+		log.Warn("[HTTP-PROXY] write tsnet status", "err", err)
 	}
 }
 
