@@ -415,6 +415,24 @@ func (r *Router) AddDirectIP(ip string) {
 	r.customMu.Unlock()
 }
 
+// AddDirectCIDR adds a CIDR network to the custom direct CIDR set (thread-safe).
+func (r *Router) AddDirectCIDR(cidr string) {
+	_, ipnet, err := net.ParseCIDR(cidr)
+	if err != nil || ipnet == nil {
+		return
+	}
+	r.customMu.Lock()
+	defer r.customMu.Unlock()
+	// Avoid duplicates
+	for _, existing := range r.customDirectCIDRIPs {
+		if existing.String() == ipnet.String() {
+			return
+		}
+	}
+	r.customDirectCIDRIPs = append(r.customDirectCIDRIPs, ipnet)
+}
+
+
 // AddProxyIP adds an IP to the custom proxy IP set (thread-safe).
 func (r *Router) AddProxyIP(ip string) {
 	r.customMu.Lock()

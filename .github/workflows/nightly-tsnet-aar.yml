@@ -1,0 +1,65 @@
+name: Nightly TSNet AAR
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feat/tsnet
+
+jobs:
+  build-aar:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        run: |
+          sdkmanager --install "platforms;android-29" "build-tools;29.0.3" "platform-tools"
+
+      - name: Install gomobile
+        run: |
+          go install golang.org/x/mobile/cmd/gomobile@latest
+          export PATH="$(go env GOPATH)/bin:$PATH"
+          gomobile init
+
+      - name: Build TSNet AAR
+        run: |
+          export PATH="$(go env GOPATH)/bin:$PATH"
+          mkdir -p bin
+          make easyss-android-tsnet-aar
+
+      - name: Set outputs
+        id: vars
+        run: |
+          echo "sha_short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "timestamp=$(date -u +'%Y%m%d%H%M')" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update nightly-tsnet release
+        uses: softprops/action-gh-release@v3
+        with:
+          name: nightly-tsnet-${{ steps.vars.outputs.timestamp }}-${{ steps.vars.outputs.sha_short }}
+          tag_name: nightly-tsnet
+          prerelease: true
+          body: |
+            Automated TSNet Android AAR build.
+          files: |
+            bin/*.aar

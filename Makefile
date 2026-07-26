@@ -10,7 +10,7 @@ GO_BUILD_WIN := GOOS=windows GOARCH=amd64 CGO_ENABLED=1 go build -ldflags '-H wi
 GOMOBILE := $(shell go env GOPATH)/bin/gomobile
 GOMOBILE_BIND := $(GOMOBILE) bind -target=android/arm64,android/amd64 -androidapi 29 -ldflags '$(LDFLAGS)'
 
-.PHONY: easyss easyss-without-tray easyss-windows easyss-server easyss-server-windows easyss-android-aar format test lint
+.PHONY: easyss easyss-without-tray easyss-windows easyss-server easyss-server-windows easyss-android-aar easyss-android-tsnet-aar format test lint
 
 echo:
 	@echo "${PROJECT}"
@@ -45,7 +45,16 @@ easyss-android-aar:
 		echo "Error: javac not found in PATH, please add JDK bin directory to PATH"; \
 		exit 1; \
 	fi
+	mkdir -p bin
 	$(GOMOBILE_BIND) -javapkg io.github.nange.easyss -o bin/libeasyss.aar ./mobile/ ./config/
+
+easyss-android-tsnet-aar:
+	@if ! command -v javac >/dev/null 2>&1; then \
+		echo "Error: javac not found in PATH, please add JDK bin directory to PATH"; \
+		exit 1; \
+	fi
+	mkdir -p bin
+	$(GOMOBILE_BIND) -tags tsnet -javapkg io.github.nange.easyss -o bin/libeasyss.aar ./mobile/ ./config/
 
 format:
 	$(GO) fmt ./...

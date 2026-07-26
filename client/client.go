@@ -92,7 +92,7 @@ func New(cfg *config.ClientConfig) (*Client, error) {
 
 	if cfg.Tsnet.Enable {
 		tsnet.Configure(cfg.Tsnet)
-		if err := tsnet.Start(); err != nil {
+		if err := tsnet.Start(rt); err != nil {
 			log.Error("[CLIENT] start tsnet failed", "err", err)
 		}
 	}

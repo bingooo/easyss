@@ -42,3 +42,8 @@ func IsTailscaleTarget(host string) bool {
 func DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	return nil, ErrTsnetDisabled
 }
+
+func Status() string {
+	return ""
+}
+
