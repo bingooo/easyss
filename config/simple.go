@@ -27,6 +27,13 @@ type SimpleConfig struct {
 
 	TunConfig     string `json:"tun_config,omitempty"`
 	OutboundProto string `json:"outbound_proto"`
+
+	TsnetEnable       bool   `json:"tsnet_enable"`
+	TsnetAuthKey      string `json:"tsnet_auth_key"`
+	TsnetControlURL   string `json:"tsnet_control_url"`
+	TsnetStateDir     string `json:"tsnet_state_dir"`
+	TsnetHostname     string `json:"tsnet_hostname"`
+	TsnetExtraSubnets string `json:"tsnet_extra_subnets"`
 }
 
 func NewSimpleConfig() *SimpleConfig {

@@ -9,6 +9,7 @@ import (
 	"github.com/nange/easyss/v3/client/config"
 	"github.com/nange/easyss/v3/client/dns"
 	"github.com/nange/easyss/v3/client/router"
+	"github.com/nange/easyss/v3/client/tsnet"
 	"github.com/nange/easyss/v3/crypto"
 	"github.com/nange/easyss/v3/log"
 	"github.com/nange/easyss/v3/shaper"
@@ -89,6 +90,13 @@ func New(cfg *config.ClientConfig) (*Client, error) {
 		},
 	}
 
+	if cfg.Tsnet.Enable {
+		tsnet.Configure(cfg.Tsnet)
+		if err := tsnet.Start(); err != nil {
+			log.Error("[CLIENT] start tsnet failed", "err", err)
+		}
+	}
+
 	client := &Client{
 		cfg:           cfg,
 		router:        rt,
@@ -121,6 +129,10 @@ func newDirectDialer() (*dialer.Dialer, string) {
 }
 
 func dialWithConfig(ctx context.Context, cfg *config.ClientConfig, d *dialer.Dialer, rt *router.Router, network, addr string) (net.Conn, error) {
+	if tsnet.IsEnabled() && tsnet.IsTailscaleTarget(addr) {
+		return tsnet.DialContext(ctx, network, addr)
+	}
+
 	if rt.ShouldIPV6Disable() {
 		switch network {
 		case "tcp":
@@ -220,6 +232,7 @@ func (c *Client) Close() error {
 	defer c.mu.Unlock()
 
 	close(c.closeIdleDone)
+	_ = tsnet.Close()
 	return c.transport.Close()
 }
 

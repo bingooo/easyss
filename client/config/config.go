@@ -10,6 +10,7 @@ import (
 
 	utls "github.com/refraction-networking/utls"
 
+	"github.com/nange/easyss/v3/client/tsnet"
 	"github.com/nange/easyss/v3/config"
 )
 
@@ -77,6 +78,7 @@ type ClientConfig struct {
 	Transport     TransportConfig  `json:"transport"`
 	Shaper        ShaperConfig     `json:"shaper"`
 	Log           LogConfig        `json:"log"`
+	Tsnet         tsnet.Config     `json:"tsnet"`
 	Timeout       int              `json:"timeout"`
 	AuthUsername  string           `json:"auth_username"`
 	AuthPassword  string           `json:"auth_password"`
