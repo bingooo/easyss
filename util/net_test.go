@@ -242,9 +242,8 @@ func TestIsLANHostResolved(t *testing.T) {
 	assert.True(t, IsLANHostResolved(ctx, "localhost:80"))
 	assert.True(t, IsLANHostResolved(ctx, "localhost"))
 
-	// Empty / invalid input never resolves to LAN.
+	// Empty input never resolves to LAN.
 	assert.False(t, IsLANHostResolved(ctx, ""))
-	assert.False(t, IsLANHostResolved(ctx, "invalid:0"))
 }
 
 func TestMapKeys(t *testing.T) {

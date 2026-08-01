@@ -432,7 +432,6 @@ func (r *Router) AddDirectCIDR(cidr string) {
 	r.customDirectCIDRIPs = append(r.customDirectCIDRIPs, ipnet)
 }
 
-
 // AddProxyIP adds an IP to the custom proxy IP set (thread-safe).
 func (r *Router) AddProxyIP(ip string) {
 	r.customMu.Lock()

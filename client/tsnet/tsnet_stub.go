@@ -7,6 +7,8 @@ import (
 	"context"
 	"errors"
 	"net"
+
+	"github.com/nange/easyss/v3/client/router"
 )
 
 var ErrTsnetDisabled = errors.New("tsnet support not compiled: build with -tags tsnet to enable")
@@ -27,7 +29,7 @@ func IsEnabled() bool {
 
 func Configure(cfg Config) {}
 
-func Start() error {
+func Start(_ ...*router.Router) error {
 	return nil
 }
 
@@ -46,4 +48,3 @@ func DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
 func Status() string {
 	return ""
 }
-

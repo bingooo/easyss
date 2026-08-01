@@ -18,7 +18,6 @@ require (
 	golang.org/x/crypto v0.54.0
 	golang.org/x/net v0.57.0
 	golang.org/x/sys v0.47.0
-	golang.zx2c4.com/wireguard v0.0.0-20260522210424-ecfc5a8d5446
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 	gvisor.dev/gvisor v0.0.0-20260701204157-69c2d17aea96
 	tailscale.com v1.102.0
@@ -280,6 +279,7 @@ require (
 	golang.org/x/time v0.15.0 // indirect
 	golang.org/x/tools v0.48.0 // indirect
 	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2 // indirect
+	golang.zx2c4.com/wireguard v0.0.0-20260522210424-ecfc5a8d5446 // indirect
 	golang.zx2c4.com/wireguard/windows v0.5.3 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 	gopkg.in/ini.v1 v1.67.0 // indirect
@@ -293,3 +293,5 @@ tool (
 	github.com/golangci/golangci-lint/v2/cmd/golangci-lint
 	golang.org/x/mobile/cmd/gobind
 )
+
+replace github.com/xjasonlyu/tun2socks/v2 => github.com/nange/tun2socks/v2 v2.0.0-20260729130352-d1698910c4f0

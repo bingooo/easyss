@@ -100,7 +100,7 @@ func getIfNamesFromProc() []string {
 
 var (
 	ErrTsnetNotInitialized = errors.New("tsnet: server not initialized or not running")
-	
+
 	// CGNAT range: 100.64.0.0/10
 	_, cgnatNet, _ = net.ParseCIDR("100.64.0.0/10")
 	// Tailscale IPv6 ULA: fd7a:115c:a1e0::/48
@@ -402,7 +402,6 @@ func (m *Manager) updateSubnetRoutes() {
 		log.Info("[TSNET] updated active primary subnet routes", "count", len(newNets), "routes", strings.Join(routeStrs, ", "))
 	}
 }
-
 
 func prefixToIPNet(p netip.Prefix) *net.IPNet {
 	if !p.IsValid() || p.Bits() == 0 {
