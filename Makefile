@@ -63,5 +63,8 @@ format:
 test:
 	$(GO) test -v ./...
 
+test-race:
+	$(GO) test -race -v ./...
+
 lint:
 	go tool golangci-lint run --timeout 10m --verbose

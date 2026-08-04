@@ -2,7 +2,9 @@ package runner
 
 import (
 	"errors"
+	"fmt"
 	"net"
+	"net/http"
 	"strconv"
 
 	"github.com/nange/easyss/v3/client"
@@ -47,6 +49,7 @@ func Run(cfg *config.ClientConfig) (*Core, error) {
 	timeout := cfg.TimeoutDuration()
 	streamIdleTimeout := 10 * timeout
 	udpIdleTimeout := 2 * timeout
+	dialTimeout := timeout / 2
 
 	streamHandler := proxy.NewStreamHandler(cli.Transport(), cli.MasterKey(), shaperCfg, streamIdleTimeout)
 
@@ -56,39 +59,64 @@ func Run(cfg *config.ClientConfig) (*Core, error) {
 		StreamHandler: streamHandler,
 	}
 
+	// Pre-bind all local listen addresses before starting any server
+	// goroutine, so a listen failure (e.g. port already in use) aborts
+	// startup with an error instead of being logged and silently ignored.
+	var socksAddr, httpAddr, dnsAddr string
 	if cfg.Local.SocksPort > 0 {
-		socksAddr := "127.0.0.1:" + strconv.Itoa(cfg.Local.SocksPort)
+		socksAddr = "127.0.0.1:" + strconv.Itoa(cfg.Local.SocksPort)
 		if cfg.Local.BindAll {
 			socksAddr = "[::]:" + strconv.Itoa(cfg.Local.SocksPort)
 		}
+		if err := prebindTCP(socksAddr); err != nil {
+			c.cleanup()
+			return nil, fmt.Errorf("socks5 server listen %s: %w", socksAddr, err)
+		}
+	}
+	if cfg.Local.HTTPPort > 0 {
+		if cfg.Local.SocksPort <= 0 {
+			_ = cli.Close()
+			return nil, errSocksRequired
+		}
+		httpAddr = "127.0.0.1:" + strconv.Itoa(cfg.Local.HTTPPort)
+		if cfg.Local.BindAll {
+			httpAddr = "[::]:" + strconv.Itoa(cfg.Local.HTTPPort)
+		}
+		if err := prebindTCP(httpAddr); err != nil {
+			c.cleanup()
+			return nil, fmt.Errorf("http proxy server listen %s: %w", httpAddr, err)
+		}
+	}
+	if cfg.Local.EnableForwardDNS {
+		dnsAddr = "127.0.0.1:53"
+		if err := prebindUDP(dnsAddr); err != nil {
+			c.cleanup()
+			return nil, fmt.Errorf("dns forward server listen %s: %w", dnsAddr, err)
+		}
+	}
+
+	if socksAddr != "" {
 		serverDomain := ""
 		if svr := cfg.DefaultServer(); svr != nil && net.ParseIP(svr.Address) == nil {
 			serverDomain = svr.Address
 		}
 		socksServer, err := proxy.NewSocks5Server(socksAddr, cfg.AuthUsername, cfg.AuthPassword,
-			streamHandler, cli.Router(), serverDomain, method, !cfg.Local.EnableQUIC, udpIdleTimeout, cli.DialContext)
+			streamHandler, cli.Router(), serverDomain, method, !cfg.Local.EnableQUIC, dialTimeout, udpIdleTimeout, cli.DialContext)
 		if err != nil {
 			_ = cli.Close()
 			return nil, err
 		}
 		c.SocksServer = socksServer
 		log.Info("[EASYSS] starting socks5 server", "addr", socksAddr)
+		c.SocksServer.MarkStarted()
 		go func() {
-			if err := c.SocksServer.Start(); err != nil {
+			if err := c.SocksServer.Start(); err != nil && !errors.Is(err, net.ErrClosed) {
 				log.Error("[EASYSS] socks5 server", "err", err)
 			}
 		}()
 	}
 
-	if cfg.Local.HTTPPort > 0 {
-		if cfg.Local.SocksPort <= 0 {
-			_ = cli.Close()
-			return nil, errSocksRequired
-		}
-		httpAddr := "127.0.0.1:" + strconv.Itoa(cfg.Local.HTTPPort)
-		if cfg.Local.BindAll {
-			httpAddr = "[::]:" + strconv.Itoa(cfg.Local.HTTPPort)
-		}
+	if httpAddr != "" {
 		socksAddr := "127.0.0.1:" + strconv.Itoa(cfg.Local.SocksPort)
 		httpServer, err := proxy.NewHTTPProxyServer(httpAddr, socksAddr, cfg.AuthUsername, cfg.AuthPassword,
 			timeout, streamHandler, cli.Router(), method, cli.DialContext)
@@ -99,14 +127,13 @@ func Run(cfg *config.ClientConfig) (*Core, error) {
 		c.HTTPServer = httpServer
 		log.Info("[EASYSS] starting http proxy server", "addr", httpAddr)
 		go func() {
-			if err := c.HTTPServer.Start(); err != nil {
+			if err := c.HTTPServer.Start(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				log.Error("[EASYSS] http proxy server", "err", err)
 			}
 		}()
 	}
 
-	if cfg.Local.EnableForwardDNS {
-		dnsAddr := "127.0.0.1:53"
+	if dnsAddr != "" {
 		c.DNSServer = dns.NewForwardServer(dnsAddr, cli.Router().ShouldIPV6Disable())
 		log.Info("[EASYSS] starting dns forward server", "addr", dnsAddr)
 		go func() {
@@ -123,6 +150,27 @@ func Run(cfg *config.ClientConfig) (*Core, error) {
 func (c *Core) Stop() {
 	c.cleanup()
 	log.Info("[EASYSS] stopped")
+}
+
+// prebindTCP verifies the given TCP address is bindable before server
+// goroutines start, so listen failures (e.g. port already in use) fail
+// fast with an error instead of being logged and silently ignored.
+func prebindTCP(addr string) error {
+	l, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	return l.Close()
+}
+
+// prebindUDP is the UDP counterpart of prebindTCP, used by the DNS
+// forward server which listens on UDP.
+func prebindUDP(addr string) error {
+	pc, err := net.ListenPacket("udp", addr)
+	if err != nil {
+		return err
+	}
+	return pc.Close()
 }
 
 func (c *Core) cleanup() {
