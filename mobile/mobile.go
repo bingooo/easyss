@@ -8,7 +8,6 @@ import (
 	"github.com/nange/easyss/v3/client/tsnet"
 	sharedconfig "github.com/nange/easyss/v3/config"
 	"github.com/nange/easyss/v3/runner"
-	"github.com/nange/easyss/v3/stats"
 	"github.com/nange/easyss/v3/version"
 )
 
@@ -35,7 +34,6 @@ func Start(cfg *sharedconfig.SimpleConfig) error {
 		return err
 	}
 	mCore = core
-	stats.StartSpeedMonitor()
 	return nil
 }
 
@@ -47,11 +45,9 @@ func Stop() {
 		return
 	}
 
-	stats.StopSpeedMonitor()
 	mCore.Stop()
 	mCore = nil
 }
-
 func Version() string {
 	return version.Tag()
 }

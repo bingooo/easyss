@@ -3,9 +3,9 @@ module github.com/nange/easyss/v3
 go 1.26.5
 
 require (
-	fyne.io/systray v1.12.2
 	github.com/caddyserver/certmagic v0.25.2
 	github.com/coocood/freecache v1.2.7
+	github.com/gogpu/systray v0.2.8
 	github.com/libp2p/go-netroute v0.4.0
 	github.com/miekg/dns v1.1.72
 	github.com/oschwald/geoip2-golang v1.13.0
@@ -14,7 +14,7 @@ require (
 	github.com/stretchr/testify v1.11.1
 	github.com/txthinking/socks5 v0.0.0-20260601051520-339b044ab0eb
 	github.com/wzshiming/sysproxy v0.2.2
-	github.com/xjasonlyu/tun2socks/v2 v2.6.1-0.20260702150440-dda1b1058db8
+	github.com/xjasonlyu/tun2socks/v2 v2.6.1-0.20260808015004-d24a73449e3a
 	golang.org/x/crypto v0.54.0
 	golang.org/x/net v0.57.0
 	golang.org/x/sys v0.47.0
@@ -110,6 +110,7 @@ require (
 	github.com/go-toolsmith/strparse v1.1.0 // indirect
 	github.com/go-toolsmith/typep v1.1.0 // indirect
 	github.com/go-viper/mapstructure/v2 v2.4.0 // indirect
+	github.com/go-webgpu/goffi v0.6.3 // indirect
 	github.com/go-xmlfmt/xmlfmt v1.1.3 // indirect
 	github.com/gobwas/glob v0.2.3 // indirect
 	github.com/godbus/dbus/v5 v5.2.2 // indirect
@@ -293,5 +294,3 @@ tool (
 	github.com/golangci/golangci-lint/v2/cmd/golangci-lint
 	golang.org/x/mobile/cmd/gobind
 )
-
-replace github.com/xjasonlyu/tun2socks/v2 => github.com/nange/tun2socks/v2 v2.0.0-20260729130352-d1698910c4f0

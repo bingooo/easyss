@@ -1,7 +1,9 @@
-//go:build !windows && !without_tray
+//go:build !windows && !headless
 
 package main
 
-func (a *TrayApp) addUWPLoopbackMenu() {
+import "github.com/gogpu/systray"
+
+func (a *TrayApp) addUWPLoopbackMenu(root *systray.Menu) {
 	// No-op on non-Windows
 }

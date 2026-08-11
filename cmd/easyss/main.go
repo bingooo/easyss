@@ -251,7 +251,6 @@ func (a *App) Start() error {
 
 	a.statsCloser = make(chan struct{})
 	go a.statsLoop()
-	stats.StartSpeedMonitor()
 
 	if a.cfg.PprofEnabled {
 		a.pprofSrv = pprof.StartPprof()
@@ -264,7 +263,6 @@ func (a *App) Stop() {
 	a.statsOnce.Do(func() {
 		close(a.statsCloser)
 	})
-	stats.StopSpeedMonitor()
 
 	if a.tunMgr != nil {
 		a.tunMgr.Stop()

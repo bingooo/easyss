@@ -24,6 +24,14 @@ Easyss是一款兼容socks5的安全代理上网工具，目标是使访问国�
 
 [去下载](https://github.com/nange/easyss/releases)
 
+**MacOS 用户注意：** `Easyss.app` 未经 Apple 公证，从网上下载解压后首次双击会被 Gatekeeper 拦截（提示无法验证开发者/应用已损坏）。请先在终端执行以下命令解除隔离属性，然后即可正常双击运行：
+
+```bash
+xattr -cr ./Easyss.app
+```
+
+进入 `Easyss.app` 所在目录执行，将 `./Easyss.app` 替换为实际路径即可（配置文件需与程序同目录，建议将 app 保留在自选目录而非 `/Applications`）。
+
 如果想通过源码编译，可查看`Makefile`中的内容。
 
 ## 用法
@@ -41,7 +49,7 @@ Easyss v3 支持两种配置模式，自动识别：
 
 #### 简化模式（推荐, 兼容v2）
 
-只包含最常用的配置项，适合简单使用，仅支持配置单一服务器：
+只包含最常用的配置项，适合简单使用，仅支持配置单一服务器（最简配置示例）：
 
 ```json
 {
@@ -49,19 +57,11 @@ Easyss v3 支持两种配置模式，自动识别：
   "server_port": 443,
   "password": "your-password",
   "local_port": 2080,
-  "method": "aes-256-gcm",
-  "proxy_rule": "auto",
-  "timeout": 30,
-  "bind_all": false,
-  "outbound_proto": "native",
-  "direct_file": "",
-  "proxy_file": "",
-  "log_level": "info",
   "log_file_path": "easyss.log",
 }
 ```
 
-**简化模式参数说明：**
+**简化模式参数说明（完整参数说明）：**
 
 | 参数 | 必填 | 默认值 | 说明 |
 | --- | --- | --- | --- |

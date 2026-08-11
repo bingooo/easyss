@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -21,10 +23,11 @@ type NextProxy struct {
 	// dialer allows pluggable dialing backends (e.g. tsnet). If nil, use SOCKS5.
 	dialer func(ctx context.Context, network, addr string) (net.Conn, error)
 
-	mu      sync.RWMutex
-	ips     map[string]struct{}
-	cidrIPs []*net.IPNet
-	domains map[string]struct{}
+	mu             sync.RWMutex
+	ips            map[string]struct{}
+	cidrIPs        []*net.IPNet
+	domains        map[string]struct{}
+	domainPatterns []*regexp.Regexp
 }
 
 var (
@@ -116,6 +119,20 @@ func (np *NextProxy) LoadProxyFile(proxyFile string) error {
 	defer np.mu.Unlock()
 
 	for k := range entries {
+		if strings.HasPrefix(k, "regexp:") {
+			re, err := regexp.Compile(k[7:])
+			if err == nil {
+				np.domainPatterns = append(np.domainPatterns, re)
+			}
+			continue
+		}
+		if strings.Contains(k, "*") {
+			re, err := util.GlobToRegexp(k)
+			if err == nil {
+				np.domainPatterns = append(np.domainPatterns, re)
+			}
+			continue
+		}
 		_, ipnet, err2 := net.ParseCIDR(k)
 		if err2 == nil && ipnet != nil {
 			np.cidrIPs = append(np.cidrIPs, ipnet)
@@ -127,7 +144,7 @@ func (np *NextProxy) LoadProxyFile(proxyFile string) error {
 		}
 		np.domains[k] = struct{}{}
 	}
-	log.Info("[NEXTPROXY] loaded proxy file", "file", proxyFile, "ips", len(np.ips), "cidrs", len(np.cidrIPs), "domains", len(np.domains))
+	log.Info("[NEXTPROXY] loaded proxy file", "file", proxyFile, "ips", len(np.ips), "cidrs", len(np.cidrIPs), "domains", len(np.domains), "patterns", len(np.domainPatterns))
 
 	return nil
 }
@@ -164,12 +181,17 @@ func (np *NextProxy) ShouldProxy(host string) bool {
 				return true
 			}
 		}
+		for _, re := range np.domainPatterns {
+			if re.MatchString(host) {
+				return true
+			}
+		}
 	}
 	return false
 }
 
 // IsCustomDomain checks whether a domain is in the custom domain list,
-// including subdomain matching.
+// including subdomain matching and glob/regexp patterns.
 func (np *NextProxy) IsCustomDomain(domain string) bool {
 	if np == nil {
 		return false
@@ -183,6 +205,11 @@ func (np *NextProxy) IsCustomDomain(domain string) bool {
 	}
 	for _, sub := range util.SubDomains(domain) {
 		if _, ok := np.domains[sub]; ok {
+			return true
+		}
+	}
+	for _, re := range np.domainPatterns {
+		if re.MatchString(domain) {
 			return true
 		}
 	}

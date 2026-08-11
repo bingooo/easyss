@@ -14,6 +14,7 @@ import (
 	"github.com/nange/easyss/v3/log"
 	"github.com/nange/easyss/v3/protocol"
 	"github.com/nange/easyss/v3/shaper"
+	"github.com/nange/easyss/v3/stats"
 )
 
 var errSocksRequired = errors.New("http proxy requires socks_port to be enabled")
@@ -144,6 +145,12 @@ func Run(cfg *config.ClientConfig) (*Core, error) {
 	}
 
 	log.Info("[EASYSS] started successfully")
+	// Start a fresh stats session: the process may host multiple
+	// start/stop cycles (e.g. Android), so reset both the session
+	// start time and all counters.
+	stats.ResetStartTime()
+	stats.ResetCounters()
+	stats.StartSpeedMonitor()
 	return c, nil
 }
 
@@ -186,4 +193,7 @@ func (c *Core) cleanup() {
 	if c.Client != nil {
 		_ = c.Client.Close()
 	}
+	// No active session anymore, so no session start time either.
+	stats.ClearStartTime()
+	stats.StopSpeedMonitor()
 }

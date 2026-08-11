@@ -5,13 +5,13 @@ LDFLAGS += -X "github.com/nange/easyss/v3/version.BuildDate=$(shell date '+%Y-%m
 LDFLAGS += -X "github.com/nange/easyss/v3/version.GitTag=$(shell git describe --tags)"
 
 GO := go
-GO_BUILD := go build -ldflags '$(LDFLAGS)'
+GO_BUILD := CGO_ENABLED=0 go build -ldflags '$(LDFLAGS)'
 WIN_ARCH ?= amd64
-GO_BUILD_WIN := GOOS=windows GOARCH=$(WIN_ARCH) CGO_ENABLED=1 go build -ldflags '-H windowsgui $(LDFLAGS)'
+GO_BUILD_WIN := GOOS=windows GOARCH=$(WIN_ARCH) CGO_ENABLED=0 go build -ldflags '-H windowsgui $(LDFLAGS)'
 GOMOBILE := $(shell go env GOPATH)/bin/gomobile
 GOMOBILE_BIND := $(GOMOBILE) bind -target=android/arm64 -androidapi 29 -ldflags '$(LDFLAGS)'
 
-.PHONY: easyss easyss-without-tray easyss-windows easyss-server easyss-server-windows easyss-android-aar easyss-android-tsnet-aar format test lint
+.PHONY: easyss easyss-without-tray easyss-headless easyss-windows easyss-server easyss-server-windows easyss-android-aar easyss-android-tsnet-aar format test lint
 
 echo:
 	@echo "${PROJECT}"
@@ -26,20 +26,20 @@ easyss-windows:
 
 easyss-mac-app:
 	cd cmd/easyss; \
-	MACOSX_DEPLOYMENT_TARGET=14.0 CGO_LDFLAGS="-mmacosx-version-min=14.0" $(GO_BUILD) -o ../../bin/easyss
-	bash scripts/app-bundle.sh bin/easyss icon/icon_1024_1024.png cmd/easyss/Info.plist
+	GOOS=darwin $(GO_BUILD) -o ../../bin/easyss
+	bash scripts/app-bundle.sh bin/easyss icon/Easyss.icns cmd/easyss/Info.plist
 
-easyss-without-tray:
+easyss-headless:
 		cd cmd/easyss; \
-	    $(GO_BUILD) -tags "without_tray " -o ../../bin/easyss-without-tray
+    $(GO_BUILD) -tags "headless" -o ../../bin/easyss-headless
 
 easyss-server:
 	cd cmd/easyss-server; \
-	CGO_ENABLED=0 $(GO_BUILD) -o ../../bin/easyss-server
+	$(GO_BUILD) -o ../../bin/easyss-server
 
 easyss-server-windows:
 	cd cmd/easyss-server; \
-	CGO_ENABLED=0 GOOS=windows GOARCH=$(WIN_ARCH) go build -ldflags '$(LDFLAGS)' -o ../../bin/easyss-server.exe
+	GOOS=windows GOARCH=$(WIN_ARCH) $(GO_BUILD) -o ../../bin/easyss-server.exe
 
 easyss-android-aar:
 	@if ! command -v javac >/dev/null 2>&1; then \
