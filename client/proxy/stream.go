@@ -9,6 +9,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/nange/easyss/v3/config"
@@ -395,12 +396,13 @@ func encodedLen(frames []protocol.Frame) int {
 }
 
 type UDPExchange struct {
-	stream   transport.Stream
-	tx       shaper.Shaper
-	reader   *crypto.DecryptedReader
-	target   string
-	lastSeen time.Time
-	mu       sync.Mutex
+	stream    transport.Stream
+	tx        shaper.Shaper
+	reader    *crypto.DecryptedReader
+	target    string
+	lastSeen  atomic.Int64 // UnixNano, written by Send/Receive, read by LastSeen
+	mu        sync.Mutex
+	closeOnce sync.Once
 }
 
 func (h *StreamHandler) OpenUDPExchange(ctx context.Context, target string, method protocol.Method, firstPayload []byte) (*UDPExchange, error) {
@@ -438,57 +440,75 @@ func (h *StreamHandler) OpenUDPExchange(ctx context.Context, target string, meth
 	dr := crypto.NewDecryptedReader(stream, aadS2C, s2cEnc, s2cCounter)
 
 	log.Debug("[UDP_EXCHANGE] opened", "target", target)
-	return &UDPExchange{
-		stream:   stream,
-		tx:       shaper.New(c2sWriter, h.shaperCfg),
-		reader:   dr,
-		target:   target,
-		lastSeen: time.Now(),
-	}, nil
+	// UDP uses a short 1ms batch window instead of per-datagram forced
+	// flushes: bursts of datagrams are merged into a single encrypted
+	// record, while the idle-triggered timer keeps interaction latency
+	// bounded at ~1ms for sparse traffic (DNS, games).
+	udpShaperCfg := h.shaperCfg
+	udpShaperCfg.BatchWindowMS = 1
+	ue := &UDPExchange{
+		stream: stream,
+		tx:     shaper.New(c2sWriter, udpShaperCfg),
+		reader: dr,
+		target: target,
+	}
+	ue.lastSeen.Store(time.Now().UnixNano())
+	return ue, nil
 }
 
 func (ue *UDPExchange) Send(data []byte) error {
 	ue.mu.Lock()
 	defer ue.mu.Unlock()
-	ue.lastSeen = time.Now()
+	ue.lastSeen.Store(time.Now().UnixNano())
 	frame := protocol.NewFrameDATAGRAM(data)
-	if err := ue.tx.PushFrame(frame); err != nil {
-		return err
-	}
-	return ue.tx.Flush()
+	return ue.tx.PushFrame(frame)
 }
 
 func (ue *UDPExchange) Receive() ([]byte, error) {
-	frame, err := ue.reader.ReadFrame()
-	if err != nil {
-		return nil, err
-	}
-	ue.lastSeen = time.Now()
-	switch frame.Type {
-	case protocol.FrameDATAGRAM:
-		return frame.Payload, nil
-	case protocol.FrameFIN:
-		return nil, io.EOF
-	case protocol.FrameRST:
-		return nil, fmt.Errorf("udp stream reset")
-	case protocol.FramePADDING, protocol.FrameCOVER:
-		return ue.Receive()
-	default:
-		return nil, fmt.Errorf("unexpected frame type: %d", frame.Type)
+	for {
+		frame, err := ue.reader.ReadFrame()
+		if err != nil {
+			return nil, err
+		}
+		ue.lastSeen.Store(time.Now().UnixNano())
+		switch frame.Type {
+		case protocol.FrameDATAGRAM:
+			return frame.Payload, nil
+		case protocol.FrameFIN:
+			return nil, io.EOF
+		case protocol.FrameRST:
+			return nil, fmt.Errorf("udp stream reset")
+		case protocol.FramePADDING, protocol.FrameCOVER:
+			continue
+		default:
+			return nil, fmt.Errorf("unexpected frame type: %d", frame.Type)
+		}
 	}
 }
 
+// Close terminates the exchange. It sends a FIN frame before closing the
+// shaper and stream so the server can reclaim its UDP association
+// immediately instead of waiting for the idle timeout. The FIN must be
+// pushed before tx.Close: once the shaper is closing, PushFrame drops
+// frames. Concurrent Close callers (idle cleanup, receiveLoop exit, send
+// failure) are serialized via closeOnce and mu. FIN delivery is best
+// effort; if it fails the server falls back to its idle timeout.
 func (ue *UDPExchange) Close() error {
-	if ue.tx != nil {
-		_ = ue.tx.Close()
-	}
-	return ue.stream.Close()
+	ue.closeOnce.Do(func() {
+		ue.mu.Lock()
+		defer ue.mu.Unlock()
+		if ue.tx != nil {
+			_ = ue.tx.PushFrame(protocol.NewFrameFIN())
+			_ = ue.tx.Flush()
+			_ = ue.tx.Close()
+		}
+		_ = ue.stream.Close()
+	})
+	return nil
 }
 
 func (ue *UDPExchange) LastSeen() time.Time {
-	ue.mu.Lock()
-	defer ue.mu.Unlock()
-	return ue.lastSeen
+	return time.Unix(0, ue.lastSeen.Load())
 }
 
 func isInteractivePort(target string) bool {

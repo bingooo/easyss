@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/nange/easyss/v3/client/router"
+	"github.com/nange/easyss/v3/client/tsnet"
 	"github.com/nange/easyss/v3/config"
 	"github.com/nange/easyss/v3/log"
 	"github.com/nange/easyss/v3/protocol"
@@ -47,6 +48,26 @@ type HTTPProxyServer struct {
 	rp         *httputil.ReverseProxy
 	server     *http.Server
 	mu         sync.Mutex
+
+	// TUN helper support (macOS): config served at GET /tun.
+	tunCfg *TunConfig
+	tunMu  sync.RWMutex
+}
+
+// TunConfig is the configuration served to the TUN helper via GET /tun.
+type TunConfig struct {
+	Socks5Addr     string `json:"socks5_addr"`
+	DNSAddr        string `json:"dns_addr"`
+	Device         string `json:"device"`
+	TunIP          string `json:"tun_ip"`
+	TunGW          string `json:"tun_gw"`
+	TunMask        string `json:"tun_mask"`
+	TunIPV6Sub     string `json:"tun_ipv6_sub,omitempty"`
+	TunGWV6        string `json:"tun_gwv6,omitempty"`
+	ServerIPV6     string `json:"server_ipv6,omitempty"`
+	LocalGateway   string `json:"local_gateway"`
+	LocalGatewayV6 string `json:"local_gateway_v6,omitempty"`
+	MTU            int    `json:"mtu"`
 }
 
 func NewHTTPProxyServer(listenAddr, socksAddr, username, password string, timeout time.Duration, handler *StreamHandler, rt *router.Router, method protocol.Method, dial func(context.Context, string, string) (net.Conn, error)) (*HTTPProxyServer, error) {
@@ -137,6 +158,22 @@ func (s *HTTPProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Serve /tsnet for direct requests to the proxy (Tailscale status).
+	if r.URL.Host == "" && r.URL.Path == "/tsnet" {
+		s.serveTsnetStatus(w)
+		return
+	}
+
+	// Serve /tun for TUN configuration (macOS helper).
+	if r.URL.Host == "" && r.URL.Path == "/tun" {
+		if r.Method == http.MethodGet {
+			s.handleTunGET(w)
+		} else {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
+		return
+	}
+
 	// Prevent forwarding loops: reject requests that would be forwarded
 	// back to the proxy itself (both relative and absolute URLs).
 	if s.isSelfTarget(r) {
@@ -163,6 +200,46 @@ func (s *HTTPProxyServer) serveStats(w http.ResponseWriter) {
 	}
 }
 
+func (s *HTTPProxyServer) serveTsnetStatus(w http.ResponseWriter) {
+	status := tsnet.Status()
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	if _, err := w.Write([]byte(status)); err != nil {
+		log.Warn("[HTTP-PROXY] write tsnet status", "err", err)
+	}
+}
+
+// SetTunConfig stores the TUN configuration served at GET /tun.
+// Called before spawning the TUN helper on macOS.
+func (s *HTTPProxyServer) SetTunConfig(cfg *TunConfig) {
+	s.tunMu.Lock()
+	defer s.tunMu.Unlock()
+	s.tunCfg = cfg
+}
+
+// ClearTunConfig removes the TUN configuration. Called after the TUN helper exits.
+func (s *HTTPProxyServer) ClearTunConfig() {
+	s.tunMu.Lock()
+	defer s.tunMu.Unlock()
+	s.tunCfg = nil
+}
+
+// handleTunGET serves the TUN configuration as JSON.
+func (s *HTTPProxyServer) handleTunGET(w http.ResponseWriter) {
+	s.tunMu.RLock()
+	cfg := s.tunCfg
+	s.tunMu.RUnlock()
+
+	if cfg == nil {
+		http.Error(w, "TUN not configured", http.StatusServiceUnavailable)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(cfg); err != nil {
+		log.Warn("[HTTP-PROXY] encode tun config", "err", err)
+	}
+}
+
 // isSelfTarget reports whether r would be forwarded back to the proxy itself,
 // which would cause an infinite forwarding loop.
 func (s *HTTPProxyServer) isSelfTarget(r *http.Request) bool {
@@ -173,7 +250,6 @@ func (s *HTTPProxyServer) isSelfTarget(r *http.Request) bool {
 	if target == s.listenAddr {
 		return true
 	}
-	// Handle localhost aliases (e.g. 127.0.0.1 vs localhost vs ::1).
 	th, tp, err := net.SplitHostPort(target)
 	if err != nil {
 		return false
@@ -185,7 +261,63 @@ func (s *HTTPProxyServer) isSelfTarget(r *http.Request) bool {
 	if tp != lp {
 		return false
 	}
-	return th == "127.0.0.1" || th == "localhost" || th == "::1"
+	if th == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(th)
+	if ip == nil {
+		// Never resolve domain names here: the lookup would go through the
+		// proxied DNS path and could deadlock or recurse.
+		return false
+	}
+	_, local := localIPSet()[ip.String()]
+	return ip.IsLoopback() || local
+}
+
+const localIPsCacheTTL = 60 * time.Second
+
+var localIPsCache = struct {
+	sync.Mutex
+	updated time.Time
+	set     map[string]struct{}
+}{}
+
+// localIPSet returns the set of IP addresses currently assigned to local
+// interfaces, cached for localIPsCacheTTL. It detects requests targeting the
+// proxy host itself: when listening on [::]:port, a request to a LAN address
+// of this host (e.g. 192.168.1.5:port) would otherwise be tunneled to the
+// server and potentially loop back into this proxy, creating an infinite
+// forwarding loop.
+func localIPSet() map[string]struct{} {
+	localIPsCache.Lock()
+	defer localIPsCache.Unlock()
+	if time.Since(localIPsCache.updated) < localIPsCacheTTL && localIPsCache.set != nil {
+		return localIPsCache.set
+	}
+	set := make(map[string]struct{})
+	if ifaces, err := net.Interfaces(); err == nil {
+		for _, ifc := range ifaces {
+			addrs, err := ifc.Addrs()
+			if err != nil {
+				continue
+			}
+			for _, a := range addrs {
+				var ip net.IP
+				switch v := a.(type) {
+				case *net.IPNet:
+					ip = v.IP
+				case *net.IPAddr:
+					ip = v.IP
+				}
+				if ip != nil {
+					set[ip.String()] = struct{}{}
+				}
+			}
+		}
+	}
+	localIPsCache.set = set
+	localIPsCache.updated = time.Now()
+	return set
 }
 
 func (s *HTTPProxyServer) authOK(r *http.Request) bool {

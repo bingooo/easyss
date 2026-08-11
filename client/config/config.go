@@ -1,7 +1,6 @@
 package config
 
 import (
-	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
@@ -10,6 +9,7 @@ import (
 
 	utls "github.com/refraction-networking/utls"
 
+	"github.com/nange/easyss/v3/client/tsnet"
 	"github.com/nange/easyss/v3/config"
 )
 
@@ -77,6 +77,7 @@ type ClientConfig struct {
 	Transport     TransportConfig  `json:"transport"`
 	Shaper        ShaperConfig     `json:"shaper"`
 	Log           LogConfig        `json:"log"`
+	Tsnet         tsnet.Config     `json:"tsnet"`
 	Timeout       int              `json:"timeout"`
 	AuthUsername  string           `json:"auth_username"`
 	AuthPassword  string           `json:"auth_password"`
@@ -110,37 +111,6 @@ func (c *ClientConfig) TimeoutDuration() time.Duration {
 	return time.Duration(c.Timeout) * time.Second
 }
 
-func (c *ClientConfig) TLSConfig() *tls.Config {
-	srv := c.DefaultServer()
-	if srv == nil {
-		return nil
-	}
-
-	sni := srv.SNI
-	if sni == "" {
-		sni = srv.Address
-	}
-
-	tlsCfg := &tls.Config{
-		ServerName: sni,
-		MinVersion: tls.VersionTLS12,
-		NextProtos: []string{"h2"},
-	}
-
-	if srv.CAPath != "" {
-		pool, err := x509.SystemCertPool()
-		if err != nil || pool == nil {
-			pool = x509.NewCertPool()
-		}
-		pem, err := os.ReadFile(srv.CAPath)
-		if err == nil && pool.AppendCertsFromPEM(pem) {
-			tlsCfg.RootCAs = pool
-		}
-	}
-
-	return tlsCfg
-}
-
 func (c *ClientConfig) UTLSConfig() *utls.Config {
 	srv := c.DefaultServer()
 	if srv == nil {
@@ -154,7 +124,7 @@ func (c *ClientConfig) UTLSConfig() *utls.Config {
 
 	utlsCfg := &utls.Config{
 		ServerName: sni,
-		NextProtos: []string{"h2"},
+		NextProtos: config.NextProtos,
 	}
 
 	if srv.CAPath != "" {

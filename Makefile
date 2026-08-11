@@ -6,11 +6,12 @@ LDFLAGS += -X "github.com/nange/easyss/v3/version.GitTag=$(shell git describe --
 
 GO := go
 GO_BUILD := go build -ldflags '$(LDFLAGS)'
-GO_BUILD_WIN := GOOS=windows GOARCH=amd64 CGO_ENABLED=1 go build -ldflags '-H windowsgui $(LDFLAGS)'
+WIN_ARCH ?= amd64
+GO_BUILD_WIN := GOOS=windows GOARCH=$(WIN_ARCH) CGO_ENABLED=1 go build -ldflags '-H windowsgui $(LDFLAGS)'
 GOMOBILE := $(shell go env GOPATH)/bin/gomobile
-GOMOBILE_BIND := $(GOMOBILE) bind -target=android/arm64,android/amd64 -androidapi 29 -ldflags '$(LDFLAGS)'
+GOMOBILE_BIND := $(GOMOBILE) bind -target=android/arm64 -androidapi 29 -ldflags '$(LDFLAGS)'
 
-.PHONY: easyss easyss-without-tray easyss-windows easyss-server easyss-server-windows easyss-android-aar format test lint
+.PHONY: easyss easyss-without-tray easyss-windows easyss-server easyss-server-windows easyss-android-aar easyss-android-tsnet-aar format test lint
 
 echo:
 	@echo "${PROJECT}"
@@ -38,20 +39,32 @@ easyss-server:
 
 easyss-server-windows:
 	cd cmd/easyss-server; \
-	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags '$(LDFLAGS)' -o ../../bin/easyss-server.exe
+	CGO_ENABLED=0 GOOS=windows GOARCH=$(WIN_ARCH) go build -ldflags '$(LDFLAGS)' -o ../../bin/easyss-server.exe
 
 easyss-android-aar:
 	@if ! command -v javac >/dev/null 2>&1; then \
 		echo "Error: javac not found in PATH, please add JDK bin directory to PATH"; \
 		exit 1; \
 	fi
+	mkdir -p bin
 	$(GOMOBILE_BIND) -javapkg io.github.nange.easyss -o bin/libeasyss.aar ./mobile/ ./config/
+
+easyss-android-tsnet-aar:
+	@if ! command -v javac >/dev/null 2>&1; then \
+		echo "Error: javac not found in PATH, please add JDK bin directory to PATH"; \
+		exit 1; \
+	fi
+	mkdir -p bin
+	$(GOMOBILE) bind -target=android/arm64 -androidapi 29 -ldflags '$(LDFLAGS) -X "github.com/nange/easyss/v3/version.GitTag=nightly-tsnet-$(shell date +%Y%m%d)"' -tags tsnet -javapkg io.github.nange.easyss -o bin/libeasyss.aar ./mobile/ ./config/
 
 format:
 	$(GO) fmt ./...
 
 test:
 	$(GO) test -v ./...
+
+test-race:
+	$(GO) test -race -v ./...
 
 lint:
 	go tool golangci-lint run --timeout 10m --verbose

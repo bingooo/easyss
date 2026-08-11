@@ -72,6 +72,27 @@ func initTSNET(u *url.URL, enableUDP bool) (func(ctx context.Context, network, a
 	}, nil
 }
 
+// applyDiscoveredRoute will add the discovered route string to all
+// registered tsnet NextProxy instances. The route can be an IP, CIDR or domain.
+func applyDiscoveredRoute(route string) {
+	if route == "" {
+		return
+	}
+	tsnetRegistryMu.Lock()
+	proxies := append([]*NextProxy(nil), tsnetRegistry...)
+	tsnetRegistryMu.Unlock()
+
+	for _, np := range proxies {
+		if strings.Contains(route, "/") {
+			np.AddCIDR(route)
+		} else if util.IsIP(route) {
+			np.AddIP(route)
+		} else {
+			np.AddDomain(route)
+		}
+	}
+}
+
 // updateAdvertisedRoutes attempts to run `tailscale status --json` and parse
 // advertised routes; for each route found we call AddIP to make NextProxy
 // route selection include it. This is best-effort and errors are logged.

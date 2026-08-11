@@ -9,7 +9,10 @@ import (
 	"github.com/nange/easyss/v3/util/bytespool"
 )
 
-var coverRNG = newSeededChaCha8()
+var (
+	coverRNG   = newSeededChaCha8()
+	coverRNGMu sync.Mutex
+)
 
 type coverInjector struct {
 	cfg              CoverConfig
@@ -22,7 +25,6 @@ type coverInjector struct {
 	lastRealData     atomic.Int64
 	minResetInterval time.Duration
 	totalSent        atomic.Int64
-	coverThreshold   int64
 	stopped          atomic.Bool
 }
 
@@ -54,7 +56,6 @@ func newCoverInjector(cfg CoverConfig, inject func(protocol.Frame) error, isClos
 		inject:           inject,
 		isClosing:        isClosing,
 		minResetInterval: time.Duration(cfg.IdleTimeout) * time.Millisecond / 2,
-		coverThreshold:   int64(2*1024*1024) + int64(randomInt(1<<20)),
 	}
 	ci.timer = time.AfterFunc(time.Duration(cfg.IdleTimeout)*time.Millisecond, ci.onIdle)
 	ci.timer.Stop()
@@ -66,12 +67,7 @@ func (ci *coverInjector) addBudget(realBytes int) {
 		return
 	}
 
-	total := ci.totalSent.Add(int64(realBytes))
-	if total >= ci.coverThreshold {
-		ci.stopped.Store(true)
-		return
-	}
-
+	ci.totalSent.Add(int64(realBytes))
 	ci.lastRealData.Store(time.Now().UnixNano())
 
 	ci.mu.Lock()
@@ -107,13 +103,6 @@ func (ci *coverInjector) onIdle() {
 		return
 	}
 
-	if ci.totalSent.Load() >= ci.coverThreshold {
-		ci.budget = 0
-		ci.stopped.Store(true)
-		ci.mu.Unlock()
-		return
-	}
-
 	lastRealNs := ci.lastRealData.Load()
 	if lastRealNs > 0 {
 		lastReal := time.Unix(0, lastRealNs)
@@ -143,7 +132,11 @@ func (ci *coverInjector) onIdle() {
 	ci.mu.Unlock()
 
 	payload := bytespool.Get(frameSize)[:frameSize]
+	// The package-level RNG is shared across streams; math/rand/v2 sources
+	// are not safe for concurrent use, so guard the fill with a mutex.
+	coverRNGMu.Lock()
 	_, _ = coverRNG.Read(payload)
+	coverRNGMu.Unlock()
 	frame := protocol.Frame{
 		Type:    protocol.FrameCOVER,
 		Length:  uint16(frameSize),

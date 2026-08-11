@@ -5,6 +5,7 @@ import (
 	"sync"
 
 	"github.com/nange/easyss/v3/client/config"
+	"github.com/nange/easyss/v3/client/tsnet"
 	sharedconfig "github.com/nange/easyss/v3/config"
 	"github.com/nange/easyss/v3/runner"
 	"github.com/nange/easyss/v3/stats"
@@ -53,4 +54,10 @@ func Stop() {
 
 func Version() string {
 	return version.Tag()
+}
+
+// TsnetStatus returns the current Tailscale node status (IP, hostname, subnet routes).
+// Reads entirely from in-memory state — no network calls, no goroutines.
+func TsnetStatus() string {
+	return tsnet.Status()
 }

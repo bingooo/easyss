@@ -9,6 +9,7 @@ import (
 	"github.com/nange/easyss/v3/client/config"
 	"github.com/nange/easyss/v3/client/dns"
 	"github.com/nange/easyss/v3/client/router"
+	"github.com/nange/easyss/v3/client/tsnet"
 	"github.com/nange/easyss/v3/crypto"
 	"github.com/nange/easyss/v3/log"
 	"github.com/nange/easyss/v3/shaper"
@@ -64,23 +65,6 @@ func New(cfg *config.ClientConfig) (*Client, error) {
 	tlsCfg := cfg.UTLSConfig()
 	directDialer, directIface := newDirectDialer()
 
-	tr, err := http2.New(http2.Config{
-		ServerURL:         cfg.ServerURL(),
-		TLSConfig:         tlsCfg,
-		MaxSlotCount:      cfg.Transport.ConnCountMax,
-		StreamThreshold:   cfg.Transport.StreamThreshold,
-		PrioritySlotRatio: cfg.Transport.PrioritySlotRatio,
-		Timeout:           cfg.TimeoutDuration(),
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return dialWithConfig(ctx, cfg, directDialer, rt, network, addr)
-		},
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	log.Info("[CLIENT] transport initialized", "server_url", cfg.ServerURL(), "max_slots", cfg.Transport.ConnCountMax, "stream_threshold", cfg.Transport.StreamThreshold, "server_addr", cfg.DefaultServerAddr(), "direct_iface", directIface)
-
 	shaperCfg := shaper.Config{
 		BatchWindowMS: cfg.Shaper.BatchWindowMS,
 		Cover: shaper.CoverConfig{
@@ -89,15 +73,40 @@ func New(cfg *config.ClientConfig) (*Client, error) {
 		},
 	}
 
+	if cfg.Tsnet.Enable {
+		tsnet.Configure(cfg.Tsnet)
+		if err := tsnet.Start(rt); err != nil {
+			log.Error("[CLIENT] start tsnet failed", "err", err)
+		}
+	}
+
 	client := &Client{
 		cfg:           cfg,
 		router:        rt,
-		transport:     tr,
 		shaperCfg:     shaperCfg,
 		masterKey:     masterKey,
 		dialer:        directDialer,
 		closeIdleDone: make(chan struct{}),
 	}
+
+	tr, err := http2.New(http2.Config{
+		ServerURL:         cfg.ServerURL(),
+		TLSConfig:         tlsCfg,
+		MaxSlotCount:      cfg.Transport.ConnCountMax,
+		StreamThreshold:   cfg.Transport.StreamThreshold,
+		PrioritySlotRatio: cfg.Transport.PrioritySlotRatio,
+		Timeout:           cfg.TimeoutDuration(),
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return dialWithConfig(ctx, cfg, client.dialer, rt, network, addr)
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	client.transport = tr
+
+	log.Info("[CLIENT] transport initialized", "server_url", cfg.ServerURL(), "max_slots", cfg.Transport.ConnCountMax, "stream_threshold", cfg.Transport.StreamThreshold, "server_addr", cfg.DefaultServerAddr(), "direct_iface", directIface)
 
 	go client.closeIdleLoop()
 
@@ -121,6 +130,10 @@ func newDirectDialer() (*dialer.Dialer, string) {
 }
 
 func dialWithConfig(ctx context.Context, cfg *config.ClientConfig, d *dialer.Dialer, rt *router.Router, network, addr string) (net.Conn, error) {
+	if tsnet.IsEnabled() && tsnet.IsTailscaleTarget(addr) {
+		return tsnet.DialContext(ctx, network, addr)
+	}
+
 	if rt.ShouldIPV6Disable() {
 		switch network {
 		case "tcp":
@@ -220,6 +233,7 @@ func (c *Client) Close() error {
 	defer c.mu.Unlock()
 
 	close(c.closeIdleDone)
+	_ = tsnet.Close()
 	return c.transport.Close()
 }
 
@@ -240,4 +254,19 @@ func (c *Client) SetProxyRule(rule string) {
 	pr := router.ParseProxyRule(rule)
 	c.cfg.Routing.ProxyRule = rule
 	c.router.SetProxyRule(pr)
+}
+
+// DirectDialer returns the dialer that binds to the physical network
+// interface, used to bypass TUN when TUN mode is active.
+func (c *Client) DirectDialer() *dialer.Dialer {
+	return c.dialer
+}
+
+// SetDirectDialer replaces the transport's direct dialer. Used after
+// a server switch to preserve the original dialer that was created
+// before TUN routes were installed.
+func (c *Client) SetDirectDialer(d *dialer.Dialer) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.dialer = d
 }

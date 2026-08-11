@@ -2,6 +2,9 @@ name: Nightly TSNet AAR
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - feat/tsnet
 
 jobs:
   build-aar:
@@ -42,7 +45,7 @@ jobs:
         run: |
           export PATH="$(go env GOPATH)/bin:$PATH"
           mkdir -p bin
-          GOFLAGS='-tags=tsnet' make easyss-android-aar
+          make easyss-android-tsnet-aar
 
       - name: Set outputs
         id: vars
@@ -58,6 +61,5 @@ jobs:
           prerelease: true
           body: |
             Automated TSNet Android AAR build.
-            Triggered manually from GitHub Actions.
           files: |
             bin/*.aar

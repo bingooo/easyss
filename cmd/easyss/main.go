@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -31,6 +32,10 @@ func main() {
 	var printVer, showConfigExample, showConfigExampleSimple, daemon, disableTray, enableTun2socks, tunHelper bool
 	var configFile, cmdOutboundProto string
 	var pprofEnabled bool
+	var logFile string
+
+	// TUN helper flags (used when --tun-helper is set).
+	var tunHTTPAddr, tunFDSocket string
 
 	sc := &sharedconfig.SimpleConfig{}
 
@@ -46,13 +51,16 @@ func main() {
 	flag.IntVar(&sc.LocalPort, "l", 0, "local socks5 port")
 	flag.IntVar(&sc.Timeout, "t", 0, "timeout in seconds")
 	flag.StringVar(&sc.LogLevel, "log-level", "", "log level (debug, info, warn, error)")
+	flag.StringVar(&logFile, "log-file", "", "log file path")
 	flag.BoolVar(&sc.EnableQUIC, "enable-quic", false, "enable QUIC protocol")
 	flag.StringVar(&sc.SN, "sn", "", "TLS SNI override")
 	flag.StringVar(&configFile, "c", "config.json", "specify config file")
 	flag.BoolVar(&daemon, "daemon", runtime.GOOS != "windows", "run app as daemon")
 	flag.BoolVar(&disableTray, "disable-tray", false, "disable system tray (windows/mac only)")
 	flag.BoolVar(&enableTun2socks, "enable-tun2socks", false, "enable tun2socks model")
-	flag.BoolVar(&tunHelper, "tun-helper", false, "run one-shot TUN helper (macOS privilege separation)")
+	flag.BoolVar(&tunHelper, "tun-helper", false, "run TUN helper (macOS privilege separation, internal)")
+	flag.StringVar(&tunHTTPAddr, "tun-http-addr", "", "HTTP address for helper to fetch config")
+	flag.StringVar(&tunFDSocket, "tun-fd-socket", "", "Unix socket path for fd passing to parent")
 	flag.StringVar(&sc.IPV6Rule, "ipv6-rule", "", "set the ipv6 rule(auto, enable, disable), default: auto")
 	flag.StringVar(&sc.DirectFile, "direct-file", "", "custom direct file (IPs/CIDRs/domains/regexps mixed, one per line; supports regexp: prefix and * glob)")
 	flag.StringVar(&sc.ProxyFile, "proxy-file", "", "custom proxy file (IPs/CIDRs/domains/regexps mixed, one per line; supports regexp: prefix and * glob)")
@@ -71,6 +79,13 @@ func main() {
 	if showConfigExampleSimple {
 		fmt.Println(exampleSimpleConfig())
 		os.Exit(0)
+	}
+
+	// TUN helper is a long-running elevated process that opens the TUN device,
+	// sets up routing/DNS, passes the fd back to the parent, and stays alive
+	// monitoring stdin for the parent's lifecycle signal.
+	if tunHelper {
+		os.Exit(runTunHelper(tunHTTPAddr, tunFDSocket, logFile, sc.LogLevel))
 	}
 
 	if !filepath.IsAbs(configFile) {
@@ -110,6 +125,13 @@ func main() {
 	log.Init(cfg.Log.FilePath, cfg.Log.Level)
 	log.Info("[EASYSS-V3] " + version.String())
 
+	// Make config file path absolute so that any elevated helper
+	// process can find it regardless of working directory.
+	if !filepath.IsAbs(configFile) {
+		if abs, err := filepath.Abs(configFile); err == nil {
+			configFile = abs
+		}
+	}
 	if enableTun2socks {
 		cfg.Local.EnableTun2socks = true
 	}
@@ -135,12 +157,7 @@ func main() {
 		"timeout", cfg.Timeout,
 	)
 
-	app := &App{cfg: cfg}
-	if tunHelper {
-		connFD, tunIP, tunGW, localGW, tunIPV6Sub, tunGWV6, serverIPV6, localGWV6, dnsServer := parseTunHelperArgs()
-		runTunHelper(connFD, tunIP, tunGW, localGW, tunIPV6Sub, tunGWV6, serverIPV6, localGWV6, dnsServer)
-		return
-	}
+	app := &App{cfg: cfg, configFile: configFile}
 	runApp(disableTray, daemon, app)
 }
 
@@ -151,10 +168,11 @@ func sigWait() {
 }
 
 type App struct {
-	cfg      *config.ClientConfig
-	core     *runner.Core
-	tunMgr   *tun.Manager
-	pprofSrv *http.Server
+	cfg        *config.ClientConfig
+	configFile string
+	core       *runner.Core
+	tunMgr     *tun.Manager
+	pprofSrv   *http.Server
 
 	statsCloser chan struct{}
 	statsOnce   sync.Once
@@ -168,28 +186,67 @@ func (a *App) Start() error {
 	a.core = core
 
 	if a.cfg.Local.EnableTun2socks {
-		socksProxyAddr := "socks5://127.0.0.1:" + strconv.Itoa(a.cfg.Local.SocksPort)
-		tunCfg := tun.Config{
-			Socks5Addr: socksProxyAddr,
-			DNSServer:  config.DefaultSystemDNS,
-		}
-		if ipv6 := a.core.Client.Router().ServerIPV6(); ipv6 != "" {
-			tunCfg.ServerIPV6 = ipv6
-		}
-		a.tunMgr = tun.New(tunCfg)
-
-		method := protocol.MethodFromString(a.cfg.DefaultServer().Method)
-		if method == 0 {
-			method = protocol.MethodAES256GCM
-		}
-		icmpHandler := tun.NewICMPHandler(a.core.Client.Router())
-		icmpHandler.SetProxy(a.core.StreamHandler, method)
-
-		go func() {
-			if err := a.tunMgr.Start(icmpHandler); err != nil {
-				log.Error("[EASYSS-V3] tun2socks", "err", err)
+		// On macOS and Linux non-root, TUN is started via privilege
+		// elevation (helper process or restart as root). Skip direct
+		// creation here to avoid "operation not permitted".
+		if (runtime.GOOS == "darwin" || runtime.GOOS == "linux") && !IsRoot() {
+			log.Warn("[EASYSS-V3] tun2socks requires root; skipped (use sudo, or run with system tray for automatic elevation)")
+		} else {
+			// Pre-resolve the proxy server hostname and populate the
+			// DNS cache so that TUN-mode DNS queries for the server
+			// domain never require a network round-trip (avoids a
+			// circular dependency: DNS → TUN → proxy → DNS).
+			prepopulated := true
+			if serverAddr := a.cfg.DefaultServer().Address; net.ParseIP(serverAddr) == nil {
+				var err error
+				for i := 0; i < 3; i++ {
+					if a.core.SocksServer == nil || len(config.DirectDNSServers) == 0 {
+						prepopulated = false
+						break
+					}
+					err = a.core.SocksServer.PrePopulateDNS(serverAddr, config.DirectDNSServers[0],
+						a.cfg.Routing.IPV6Rule != "enable")
+					if err == nil {
+						log.Info("[EASYSS-V3] pre-populated dns cache for server", "host", serverAddr)
+						break
+					}
+					if i < 2 {
+						time.Sleep(time.Second)
+					}
+				}
+				if err != nil {
+					log.Error("[EASYSS-V3] failed to pre-resolve server hostname, skipping TUN",
+						"host", serverAddr, "err", err)
+					prepopulated = false
+				}
 			}
-		}()
+
+			if prepopulated {
+				socksProxyAddr := "socks5://127.0.0.1:" + strconv.Itoa(a.cfg.Local.SocksPort)
+				tunCfg := tun.Config{
+					Socks5Addr: socksProxyAddr,
+					DNSServer:  tunDNS(a.cfg),
+				}
+				if ipv6 := a.core.Client.Router().ServerIPV6(); ipv6 != "" {
+					tunCfg.ServerIPV6 = ipv6
+				}
+				a.tunMgr = tun.New(tunCfg)
+
+				method := protocol.MethodFromString(a.cfg.DefaultServer().Method)
+				if method == 0 {
+					method = protocol.MethodAES256GCM
+				}
+				icmpHandler := tun.NewICMPHandler(a.core.Client.Router())
+				icmpHandler.SetProxy(a.core.StreamHandler, method)
+				a.tunMgr.SetICMPHandler(icmpHandler)
+
+				go func() {
+					if err := a.tunMgr.Start(); err != nil {
+						log.Error("[EASYSS-V3] tun2socks", "err", err)
+					}
+				}()
+			}
+		}
 	}
 
 	a.statsCloser = make(chan struct{})
@@ -265,6 +322,17 @@ func (a *App) statsLoop() {
 			return
 		}
 	}
+}
+
+// tunDNS returns the DNS server to set on the system during TUN mode.
+// When the built-in DNS forward server is enabled, queries should go to
+// 127.0.0.1 so they are handled and logged by EasySS. Otherwise a public
+// DNS server is used and queries go through the TUN device as raw UDP.
+func tunDNS(cfg *config.ClientConfig) string {
+	if cfg.Local.EnableForwardDNS {
+		return "127.0.0.1"
+	}
+	return config.DefaultSystemDNS
 }
 
 func exampleV3Config() string {

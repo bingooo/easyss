@@ -3,7 +3,9 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 
+	"github.com/nange/easyss/v3/client/tsnet"
 	sharedconfig "github.com/nange/easyss/v3/config"
 )
 
@@ -57,6 +59,14 @@ func BuildSimpleConfig(s *sharedconfig.SimpleConfig) (*ClientConfig, error) {
 		Log: LogConfig{
 			Level:    s.LogLevel,
 			FilePath: s.LogFilePath,
+		},
+		Tsnet: tsnet.Config{
+			Enable:       s.TsnetEnable,
+			AuthKey:      s.TsnetAuthKey,
+			ControlURL:   s.TsnetControlURL,
+			StateDir:     s.TsnetStateDir,
+			Hostname:     s.TsnetHostname,
+			ExtraSubnets: splitSubnets(s.TsnetExtraSubnets),
 		},
 		Timeout: s.Timeout,
 	}
@@ -160,6 +170,38 @@ func ApplySimpleOverrides(cfg *ClientConfig, s *sharedconfig.SimpleConfig) {
 	if s.TunConfig != "" {
 		cfg.Local.TunConfig = jsonTunConfig(s.TunConfig)
 	}
+	if s.TsnetEnable {
+		cfg.Tsnet.Enable = true
+	}
+	if s.TsnetAuthKey != "" {
+		cfg.Tsnet.AuthKey = s.TsnetAuthKey
+	}
+	if s.TsnetControlURL != "" {
+		cfg.Tsnet.ControlURL = s.TsnetControlURL
+	}
+	if s.TsnetStateDir != "" {
+		cfg.Tsnet.StateDir = s.TsnetStateDir
+	}
+	if s.TsnetHostname != "" {
+		cfg.Tsnet.Hostname = s.TsnetHostname
+	}
+	if s.TsnetExtraSubnets != "" {
+		cfg.Tsnet.ExtraSubnets = splitSubnets(s.TsnetExtraSubnets)
+	}
+}
+
+func splitSubnets(s string) []string {
+	if s == "" {
+		return nil
+	}
+	var res []string
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			res = append(res, part)
+		}
+	}
+	return res
 }
 
 func jsonTunConfig(s string) json.RawMessage {

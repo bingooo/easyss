@@ -52,6 +52,11 @@ jobs:
       - name: Build
         run: make .PHONY
 
+      - name: Build Linux Arm64
+        run: |
+          GOOS=linux GOARCH=arm64 make easyss
+          GOOS=linux GOARCH=arm64 make easyss-server
+
   lint-test-build-macos:
     name: Lint-Test-Build-MacOS
     runs-on: macOS-latest
@@ -114,6 +119,26 @@ jobs:
           key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
           restore-keys: |
             ${{ runner.os }}-go-
+
+      - name: golangci-lint
+        run: make lint
+
+      - name: Test
+        run: go test -v ./...
+
+      - name: Build
+        run: cd cmd/easyss && go build -o easyss.exe -ldflags '-H=windowsgui'
+
+  lint-test-build-windows-arm64:
+    name: Lint-Test-Build-Windows-Arm64
+    runs-on: windows-11-arm
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: 'go.mod'
 
       - name: Test
         run: go test -v ./...
