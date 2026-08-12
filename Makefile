@@ -47,7 +47,7 @@ easyss-android-aar:
 		exit 1; \
 	fi
 	mkdir -p bin
-	$(GOMOBILE_BIND) -javapkg io.github.nange.easyss -o bin/libeasyss.aar ./mobile/ ./config/
+	$(GOMOBILE_BIND) -javapkg io.github.nange.easyss -o bin/libeasyss.aar github.com/nange/easyss/v3/mobile github.com/nange/easyss/v3/config
 
 easyss-android-tsnet-aar:
 	@if ! command -v javac >/dev/null 2>&1; then \
@@ -55,7 +55,7 @@ easyss-android-tsnet-aar:
 		exit 1; \
 	fi
 	mkdir -p bin
-	$(GOMOBILE) bind -target=android/arm64 -androidapi 29 -ldflags '$(LDFLAGS) -X "github.com/nange/easyss/v3/version.GitTag=nightly-tsnet-$(shell date +%Y%m%d)"' -tags tsnet -javapkg io.github.nange.easyss -o bin/libeasyss.aar ./mobile/ ./config/
+	$(GOMOBILE) bind -target=android/arm64 -androidapi 29 -ldflags '$(LDFLAGS) -X "github.com/nange/easyss/v3/version.GitTag=nightly-tsnet-$(shell date +%Y%m%d)"' -tags tsnet -javapkg io.github.nange.easyss -o bin/libeasyss.aar github.com/nange/easyss/v3/mobile github.com/nange/easyss/v3/config
 
 format:
 	$(GO) fmt ./...

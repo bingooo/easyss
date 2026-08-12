@@ -32,16 +32,22 @@ jobs:
         uses: android-actions/setup-android@v3
 
       - name: Install Android SDK packages
+        env:
+          ANDROID_HOME: ${{ env.ANDROID_SDK_ROOT }}
         run: |
           sdkmanager --install "platforms;android-29" "build-tools;29.0.3" "platform-tools"
 
       - name: Install gomobile
+        env:
+          ANDROID_HOME: ${{ env.ANDROID_SDK_ROOT }}
         run: |
           go install golang.org/x/mobile/cmd/gomobile@latest
           export PATH="$(go env GOPATH)/bin:$PATH"
           gomobile init
 
       - name: Build TSNet AAR
+        env:
+          ANDROID_HOME: ${{ env.ANDROID_SDK_ROOT }}
         run: |
           export PATH="$(go env GOPATH)/bin:$PATH"
           mkdir -p bin
