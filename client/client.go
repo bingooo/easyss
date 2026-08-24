@@ -2,8 +2,10 @@ package client
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/nange/easyss/v3/client/config"
@@ -25,8 +27,9 @@ type Client struct {
 	transport     *http2.HTTP2Transport
 	shaperCfg     shaper.Config
 	masterKey     []byte
-	dialer        *dialer.Dialer
+	dialer        atomic.Pointer[dialer.Dialer]
 	closeIdleDone chan struct{}
+	closeOnce     sync.Once
 
 	mu sync.RWMutex
 }
@@ -85,8 +88,13 @@ func New(cfg *config.ClientConfig) (*Client, error) {
 		router:        rt,
 		shaperCfg:     shaperCfg,
 		masterKey:     masterKey,
-		dialer:        directDialer,
 		closeIdleDone: make(chan struct{}),
+	}
+	client.dialer.Store(directDialer)
+
+	probeToken, err := crypto.ProbeToken(masterKey)
+	if err != nil {
+		return nil, fmt.Errorf("probe token: %w", err)
 	}
 
 	tr, err := http2.New(http2.Config{
@@ -95,9 +103,12 @@ func New(cfg *config.ClientConfig) (*Client, error) {
 		MaxSlotCount:      cfg.Transport.ConnCountMax,
 		StreamThreshold:   cfg.Transport.StreamThreshold,
 		PrioritySlotRatio: cfg.Transport.PrioritySlotRatio,
+		ConnLifetime:      time.Duration(cfg.Transport.ConnLifetimeSec) * time.Second,
+		ConnMaxBytes:      cfg.Transport.ConnMaxBytes,
 		Timeout:           cfg.TimeoutDuration(),
+		ProbeToken:        probeToken,
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return dialWithConfig(ctx, cfg, client.dialer, rt, network, addr)
+			return dialWithConfig(ctx, cfg, client.dialer.Load(), rt, network, addr)
 		},
 	})
 	if err != nil {
@@ -188,14 +199,38 @@ func resolveServerIPV6(cfg *config.ClientConfig) string {
 		return ""
 	}
 
-	for _, dnsServer := range config.DirectDNSServers {
+	if dns.BuiltinDNSAvailable() {
+		reachable := false
+		for _, dnsServer := range config.DirectDNSServers {
+			ips, err := dns.LookupIPV6From(dnsServer, svr.Address)
+			if err != nil {
+				continue
+			}
+			// the server answered (possibly NODATA), so the builtin dns
+			// servers are reachable
+			reachable = true
+			if len(ips) == 0 {
+				continue
+			}
+			dns.MarkBuiltinDNSAvailable()
+			return ips[0].String()
+		}
+		if !reachable {
+			dns.MarkBuiltinDNSUnavailable()
+			log.Warn("[CLIENT] all builtin direct dns servers failed to resolve server ipv6, fallback to system dns", "server", svr.Address)
+		}
+	}
+
+	// fallback to the system dns servers when all builtin direct dns servers
+	// are unavailable
+	for _, dnsServer := range dns.SystemDNSServers() {
 		ips, err := dns.LookupIPV6From(dnsServer, svr.Address)
 		if err != nil || len(ips) == 0 {
 			continue
 		}
 		return ips[0].String()
 	}
-	log.Warn("[CLIENT] failed to resolve server ipv6 via all direct dns servers", "server", svr.Address)
+	log.Warn("[CLIENT] failed to resolve server ipv6 via all direct and system dns servers", "server", svr.Address)
 	return ""
 }
 
@@ -213,7 +248,7 @@ func (c *Client) Transport() transport.Transport {
 }
 
 func (c *Client) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
-	return dialWithConfig(ctx, c.cfg, c.dialer, c.router, network, addr)
+	return dialWithConfig(ctx, c.cfg, c.dialer.Load(), c.router, network, addr)
 }
 
 func (c *Client) MasterKey() []byte {
@@ -232,7 +267,10 @@ func (c *Client) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	close(c.closeIdleDone)
+	// Close is not idempotent by contract (the transport cannot be
+	// reopened), but a second call must not panic by closing the channel
+	// twice.
+	c.closeOnce.Do(func() { close(c.closeIdleDone) })
 	_ = tsnet.Close()
 	return c.transport.Close()
 }
@@ -259,14 +297,12 @@ func (c *Client) SetProxyRule(rule string) {
 // DirectDialer returns the dialer that binds to the physical network
 // interface, used to bypass TUN when TUN mode is active.
 func (c *Client) DirectDialer() *dialer.Dialer {
-	return c.dialer
+	return c.dialer.Load()
 }
 
 // SetDirectDialer replaces the transport's direct dialer. Used after
 // a server switch to preserve the original dialer that was created
 // before TUN routes were installed.
 func (c *Client) SetDirectDialer(d *dialer.Dialer) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.dialer = d
+	c.dialer.Store(d)
 }

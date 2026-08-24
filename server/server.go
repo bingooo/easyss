@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"encoding/hex"
 	"fmt"
+	"io"
 	stdlog "log"
 	"net/http"
 	"os"
@@ -145,6 +146,7 @@ func (s *Server) statsLoop() {
 				"icmp", snap.ServerICMPStreams,
 				"hserr", snap.ServerHandshakeErrors,
 				"fallback", snap.ServerFallbackPages,
+				"probe", snap.ServerProbes,
 				"padding", stats.HumanBytes(snap.PaddingBytes),
 				"records", snap.RecordsWritten,
 			)
@@ -254,7 +256,7 @@ func (s *Server) Start() error {
 
 	timeout := time.Duration(s.cfg.Timeout) * time.Second
 	if timeout <= 0 {
-		timeout = 30 * time.Second
+		timeout = time.Duration(sharedconfig.DefaultTimeout) * time.Second
 	}
 
 	if s.cfg.FallbackTarget != "" {
@@ -298,6 +300,15 @@ func (s *Server) Start() error {
 		NextProxy:         np,
 	})
 
+	probePayload := make([]byte, sharedconfig.ProbePayloadSize)
+	if _, err := io.ReadFull(rand.Reader, probePayload); err != nil {
+		return fmt.Errorf("generate probe payload: %w", err)
+	}
+	probeHandler, err := handler.NewProbeHandler(masterKey, probePayload)
+	if err != nil {
+		return fmt.Errorf("probe handler: %w", err)
+	}
+
 	s.mux = http.NewServeMux()
 	s.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		handler.ServeFallback(w, r)
@@ -305,11 +316,25 @@ func (s *Server) Start() error {
 	s.mux.Handle(sharedconfig.EndpointTCP, proxyHandler)
 	s.mux.Handle(sharedconfig.EndpointUDP, proxyHandler)
 	s.mux.Handle(sharedconfig.EndpointICMP, proxyHandler)
+	s.mux.Handle(sharedconfig.EndpointProbe, probeHandler)
 
-	s.httpServer = &http.Server{
-		Addr:      s.cfg.Listen,
+	s.httpServer = buildHTTPServer(cfg, tlsConfig, s.mux, timeout)
+
+	log.Info("[SERVER] listening", "addr", s.cfg.Listen, "routes", []string{"/", sharedconfig.EndpointTCP, sharedconfig.EndpointUDP, sharedconfig.EndpointICMP, sharedconfig.EndpointProbe})
+	s.statsDone = make(chan struct{})
+	go s.statsLoop()
+	return s.httpServer.ListenAndServeTLS("", "")
+}
+
+// buildHTTPServer assembles the HTTP server with HTTP/2 flow-control windows
+// sized for upload throughput: the per-stream receive window bounds a single
+// upload stream's in-flight data (throughput ≈ window/RTT), so both windows
+// must be generous enough for high-RTT links.
+func buildHTTPServer(cfg *config.ServerConfig, tlsConfig *tls.Config, mux *http.ServeMux, timeout time.Duration) *http.Server {
+	srv := &http.Server{
+		Addr:      cfg.Listen,
 		TLSConfig: tlsConfig,
-		Handler:   s.mux,
+		Handler:   mux,
 		ErrorLog:  stdErrorLog(),
 		Protocols: &http.Protocols{},
 		HTTP2: &http.HTTP2Config{
@@ -320,13 +345,9 @@ func (s *Server) Start() error {
 		IdleTimeout:       8 * timeout,
 		ReadHeaderTimeout: min(timeout/2, 10*time.Second),
 	}
-	s.httpServer.Protocols.SetHTTP1(true)
-	s.httpServer.Protocols.SetHTTP2(true)
-
-	log.Info("[SERVER] listening", "addr", s.cfg.Listen, "routes", []string{"/", sharedconfig.EndpointTCP, sharedconfig.EndpointUDP, sharedconfig.EndpointICMP})
-	s.statsDone = make(chan struct{})
-	go s.statsLoop()
-	return s.httpServer.ListenAndServeTLS("", "")
+	srv.Protocols.SetHTTP1(true)
+	srv.Protocols.SetHTTP2(true)
+	return srv
 }
 
 func (s *Server) Shutdown(ctx context.Context) error {

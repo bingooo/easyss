@@ -88,16 +88,10 @@ func main() {
 		os.Exit(runTunHelper(tunHTTPAddr, tunFDSocket, logFile, sc.LogLevel))
 	}
 
-	if !filepath.IsAbs(configFile) {
-		if _, err := os.Stat(configFile); os.IsNotExist(err) {
-			if dir := util.CurrentDir(); dir != "" {
-				altPath := filepath.Join(dir, configFile)
-				if _, err := os.Stat(altPath); err == nil {
-					configFile = altPath
-				}
-			}
-		}
-	}
+	// On macOS the app is often launched by Finder/launchd with cwd=/,
+	// so a relative config path is first looked up in the cwd and then
+	// falls back to the executable directory.
+	configFile = util.ResolvePath(configFile)
 
 	cfg, err := config.LoadConfig(configFile)
 	if err != nil {
@@ -114,6 +108,11 @@ func main() {
 	} else {
 		config.ApplySimpleOverrides(cfg, sc)
 	}
+
+	// Resolve relative file paths (direct_file/proxy_file/ca_path) against
+	// the executable directory so that macOS Finder/launchd launches (cwd=/)
+	// can still find the files placed next to the binary/.app bundle.
+	cfg.ResolveFilePaths()
 
 	if cfg.Log.FilePath != "" && !filepath.IsAbs(cfg.Log.FilePath) {
 		if dir := util.CurrentDir(); dir != "" {
@@ -149,12 +148,15 @@ func main() {
 	}
 
 	log.Info("[EASYSS-V3] config loaded",
+		"config_file", configFile,
 		"server", cfg.DefaultServerAddr(),
 		"socks_port", cfg.Local.SocksPort,
 		"http_port", cfg.Local.HTTPPort,
 		"proxy_rule", cfg.Routing.ProxyRule,
 		"ipv6_rule", cfg.Routing.IPV6Rule,
 		"timeout", cfg.Timeout,
+		"direct_file", cfg.Routing.DirectFile,
+		"proxy_file", cfg.Routing.ProxyFile,
 	)
 
 	app := &App{cfg: cfg, configFile: configFile}
@@ -204,7 +206,7 @@ func (a *App) Start() error {
 						prepopulated = false
 						break
 					}
-					err = a.core.SocksServer.PrePopulateDNS(serverAddr, config.DirectDNSServers[0],
+					err = a.core.SocksServer.PrePopulateDNS(serverAddr, config.DirectDNSServers,
 						a.cfg.Routing.IPV6Rule != "enable")
 					if err == nil {
 						log.Info("[EASYSS-V3] pre-populated dns cache for server", "host", serverAddr)
@@ -291,6 +293,8 @@ func (a *App) statsLoop() {
 				"conns", snap.Conns,
 				"priority_conns", snap.PriorityConns,
 				"bulk_conns", snap.BulkConns,
+				"priority_conns_status", snap.PriorityConnsStatus,
+				"bulk_conns_status", snap.BulkConnsStatus,
 				"active_streams", snap.ActiveStreams,
 				"priority_active", snap.PriorityActiveStreams,
 				"bulk_active", snap.BulkActiveStreams,
@@ -315,6 +319,11 @@ func (a *App) statsLoop() {
 				"padding", stats.HumanBytes(snap.PaddingBytes),
 				"records", snap.RecordsWritten,
 				"avg_rtt", snap.AvgRTT().Round(time.Millisecond),
+				"slot_degraded", snap.SlotDegraded,
+				"slot_retired_degraded", snap.SlotRetiredDegraded,
+				"slot_probes", snap.SlotProbes,
+				"slot_probe_slow", snap.SlotProbeSlow,
+				"conn_rotated", snap.ConnRotated,
 			)
 		case <-a.statsCloser:
 			return
@@ -338,16 +347,16 @@ func exampleV3Config() string {
 		ConfigVersion: 3,
 		Servers: []*config.ServerProfile{{
 			Address:  "your-domain.com",
-			Port:     443,
+			Port:     sharedconfig.DefaultServerPort,
 			Password: "your-password",
-			Method:   "aes-256-gcm",
+			Method:   sharedconfig.DefaultMethod,
 			SNI:      "",
 			CAPath:   "",
 			Default:  true,
 		}},
 		Local: config.LocalConfig{
-			SocksPort:        2080,
-			HTTPPort:         3080,
+			SocksPort:        sharedconfig.DefaultSocksPort,
+			HTTPPort:         sharedconfig.DefaultHTTPPort,
 			BindAll:          false,
 			DisableSysProxy:  false,
 			EnableForwardDNS: false,
@@ -355,27 +364,29 @@ func exampleV3Config() string {
 			EnableQUIC:       false,
 		},
 		Routing: config.RoutingConfig{
-			ProxyRule:  "auto",
-			IPV6Rule:   "auto",
+			ProxyRule:  sharedconfig.DefaultProxyRule,
+			IPV6Rule:   sharedconfig.DefaultIPV6Rule,
 			DirectFile: "",
 			ProxyFile:  "",
 		},
 		Transport: config.TransportConfig{
-			Protocol:          "h2",
-			ConnCountMax:      12,
-			StreamThreshold:   8,
-			PrioritySlotRatio: 0.5,
+			Protocol:          sharedconfig.DefaultProtocol,
+			ConnCountMax:      sharedconfig.DefaultConnCountMax,
+			StreamThreshold:   sharedconfig.DefaultStreamThreshold,
+			PrioritySlotRatio: sharedconfig.DefaultPrioritySlotRatio,
+			ConnLifetimeSec:   sharedconfig.DefaultConnLifetimeSec,
+			ConnMaxBytes:      sharedconfig.DefaultConnMaxBytes,
 		},
 		Shaper: config.ShaperConfig{
-			BatchWindowMS:    3,
-			CoverBudgetRatio: 0.03,
-			CoverBudgetCap:   128 * 1024,
+			BatchWindowMS:    sharedconfig.DefaultBatchWindowMS,
+			CoverBudgetRatio: sharedconfig.DefaultCoverBudgetRatio,
+			CoverBudgetCap:   sharedconfig.DefaultCoverBudgetCap,
 		},
 		Log: config.LogConfig{
-			Level:    "info",
+			Level:    sharedconfig.DefaultLogLevel,
 			FilePath: "easyss.log",
 		},
-		Timeout:      30,
+		Timeout:      sharedconfig.DefaultTimeout,
 		AuthUsername: "",
 		AuthPassword: "",
 		PprofEnabled: false,
@@ -390,7 +401,7 @@ func exampleSimpleConfig() string {
 		ServerPort:    443,
 		Password:      "your-password",
 		Method:        "aes-256-gcm",
-		LocalPort:     2080,
+		LocalPort:     sharedconfig.DefaultSocksPort,
 		ProxyRule:     "auto",
 		Timeout:       30,
 		BindAll:       false,

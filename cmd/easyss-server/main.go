@@ -43,6 +43,11 @@ func main() {
 		os.Exit(0)
 	}
 
+	// On macOS the server is often launched by launchd with cwd=/,
+	// so a relative config path is first looked up in the cwd and then
+	// falls back to the executable directory.
+	configFile = util.ResolvePath(configFile)
+
 	data, err := os.ReadFile(configFile)
 	if err != nil {
 		log.Error("[EASYSS-SERVER-V3] read config", "err", err)
@@ -55,6 +60,11 @@ func main() {
 		log.Error("[EASYSS-SERVER-V3] parse config", "err", err)
 		os.Exit(1)
 	}
+	// Resolve relative file paths (cert_path/key_path/next_proxy_file)
+	// against the executable directory so that macOS launchd launches
+	// (cwd=/) can still find the files placed next to the binary.
+	// Must run before EffectiveServerConfig, which copies by value.
+	fileCfg.ResolveFilePaths()
 	cfg = fileCfg.EffectiveServerConfig()
 	if pprofEnabled {
 		cfg.PprofEnabled = true
@@ -73,6 +83,14 @@ func main() {
 	log.Init(fileCfg.Log.FilePath, fileCfg.Log.Level)
 
 	log.Info("[EASYSS-SERVER-V3] " + version.String())
+	log.Info("[EASYSS-SERVER-V3] config loaded",
+		"config_file", configFile,
+		"listen", cfg.Listen,
+		"domain", cfg.Domain,
+		"next_proxy_file", cfg.NextProxy.NextProxyFile,
+		"cert", cfg.CertPath,
+		"key", cfg.KeyPath,
+	)
 
 	var pprofSrv *http.Server
 	if cfg.PprofEnabled {
@@ -127,10 +145,10 @@ func exampleV3ServerConfig() string {
 			Email:                "your-email@example.com",
 			FallbackTarget:       "",
 			FallbackPreserveHost: false,
-			FallbackCDNDomains:   nil,
+			FallbackCDNDomains:   []string{},
 			BatchWindowMS:        3,
 			CoverBudgetRatio:     0.03,
-			CoverBudgetCap:       128 * 1024,
+			CoverBudgetCap:       16 * 1024,
 			PprofEnabled:         false,
 		},
 		Transport: config.TransportConfig{

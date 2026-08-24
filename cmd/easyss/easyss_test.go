@@ -319,7 +319,7 @@ func newTestHarness(t *testing.T) *testHarness {
 
 	// Start SOCKS5 proxy
 	socksAddr := testServerAddr + ":" + strconv.Itoa(testSocks5Port)
-	socksServer, err := proxy.NewSocks5Server(socksAddr, "", "", handler, cli.Router(), "", method, true, dialTimeout, udpIdleTimeout, cli.DialContext)
+	socksServer, err := proxy.NewSocks5Server(socksAddr, "", "", handler, cli.Router(), "", method, true, dialTimeout, udpIdleTimeout, timeout/3, cli.DialContext)
 	require.NoError(t, err)
 	h.socksServer = socksServer
 
@@ -533,8 +533,8 @@ func TestV3Integration_ConfigDefaults(t *testing.T) {
 	cfg := clientconfig.DefaultConfig()
 
 	assert.Equal(t, 3, cfg.ConfigVersion)
-	assert.Equal(t, 2080, cfg.Local.SocksPort)
-	assert.Equal(t, 3080, cfg.Local.HTTPPort)
+	assert.Equal(t, 4080, cfg.Local.SocksPort)
+	assert.Equal(t, 5080, cfg.Local.HTTPPort)
 	assert.Equal(t, "auto", cfg.Routing.ProxyRule)
 	assert.Equal(t, "auto", cfg.Routing.IPV6Rule)
 	assert.Equal(t, 30, cfg.Timeout)

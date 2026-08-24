@@ -11,6 +11,8 @@ import (
 
 	"github.com/nange/easyss/v3/client/tsnet"
 	"github.com/nange/easyss/v3/config"
+	"github.com/nange/easyss/v3/log"
+	"github.com/nange/easyss/v3/util"
 )
 
 // DirectDNSServers are the public DNS servers used for direct (non-proxied) DNS lookups.
@@ -56,6 +58,8 @@ type TransportConfig struct {
 	ConnCountMax      int     `json:"conn_count_max"`
 	StreamThreshold   int     `json:"stream_threshold"`
 	PrioritySlotRatio float64 `json:"priority_slot_ratio"`
+	ConnLifetimeSec   int     `json:"conn_lifetime_sec"` // max connection lifetime in seconds, 0 uses default
+	ConnMaxBytes      int64   `json:"conn_max_bytes"`    // max bytes carried by a connection in either direction, 0 uses default
 }
 
 type ShaperConfig struct {
@@ -133,8 +137,13 @@ func (c *ClientConfig) UTLSConfig() *utls.Config {
 			pool = x509.NewCertPool()
 		}
 		pem, err := os.ReadFile(srv.CAPath)
-		if err == nil && pool.AppendCertsFromPEM(pem) {
+		if err != nil {
+			log.Warn("[CONFIG] load custom CA", "file", srv.CAPath, "err", err)
+		} else if !pool.AppendCertsFromPEM(pem) {
+			log.Warn("[CONFIG] load custom CA: no valid PEM certs", "file", srv.CAPath)
+		} else {
 			utlsCfg.RootCAs = pool
+			log.Info("[CONFIG] loaded custom CA", "file", srv.CAPath)
 		}
 	}
 
@@ -177,13 +186,28 @@ func applyDefaults(c *ClientConfig) {
 		c.Timeout = config.DefaultTimeout
 	}
 	if c.Transport.Protocol == "" {
-		c.Transport.Protocol = "h2"
+		c.Transport.Protocol = config.DefaultProtocol
 	}
 	if c.Transport.ConnCountMax <= 0 {
 		c.Transport.ConnCountMax = config.DefaultConnCountMax
 	}
+	if c.Transport.ConnCountMax < config.MinConnCountMax {
+		c.Transport.ConnCountMax = config.MinConnCountMax
+	}
+	if c.Transport.ConnCountMax > config.MaxConnCountMax {
+		c.Transport.ConnCountMax = config.MaxConnCountMax
+	}
 	if c.Transport.StreamThreshold <= 0 {
 		c.Transport.StreamThreshold = config.DefaultStreamThreshold
+	}
+	if c.Transport.StreamThreshold > config.MaxStreamThreshold {
+		c.Transport.StreamThreshold = config.MaxStreamThreshold
+	}
+	if c.Transport.ConnLifetimeSec <= 0 {
+		c.Transport.ConnLifetimeSec = config.DefaultConnLifetimeSec
+	}
+	if c.Transport.ConnMaxBytes <= 0 {
+		c.Transport.ConnMaxBytes = config.DefaultConnMaxBytes
 	}
 	if c.Shaper.BatchWindowMS <= 0 {
 		c.Shaper.BatchWindowMS = config.DefaultBatchWindowMS
@@ -192,27 +216,40 @@ func applyDefaults(c *ClientConfig) {
 		c.Shaper.BatchWindowMS = 10
 	}
 	if c.Shaper.CoverBudgetRatio <= 0 || c.Shaper.CoverBudgetRatio > 1 {
-		c.Shaper.CoverBudgetRatio = 0.03
+		c.Shaper.CoverBudgetRatio = config.DefaultCoverBudgetRatio
 	}
 	if c.Shaper.CoverBudgetCap <= 0 {
 		c.Shaper.CoverBudgetCap = config.DefaultCoverBudgetCap
 	}
 	if c.Routing.ProxyRule == "" {
-		c.Routing.ProxyRule = "auto"
+		c.Routing.ProxyRule = config.DefaultProxyRule
 	}
 	if c.Routing.IPV6Rule == "" {
-		c.Routing.IPV6Rule = "auto"
+		c.Routing.IPV6Rule = config.DefaultIPV6Rule
 	}
 	if c.Log.Level == "" {
-		c.Log.Level = "info"
+		c.Log.Level = config.DefaultLogLevel
 	}
 	for _, srv := range c.Servers {
 		if srv.Port == 0 {
-			srv.Port = 443
+			srv.Port = config.DefaultServerPort
 		}
 		if srv.Method == "" {
-			srv.Method = "aes-256-gcm"
+			srv.Method = config.DefaultMethod
 		}
+	}
+}
+
+// ResolveFilePaths resolves relative file paths in the config against the
+// executable directory when they cannot be found in the current working
+// directory. On macOS the app is often launched by Finder/launchd with cwd=/,
+// so relative paths like direct.txt, proxy.txt or ca_path would otherwise not
+// be found even though the files sit next to the binary/.app bundle.
+func (c *ClientConfig) ResolveFilePaths() {
+	c.Routing.DirectFile = util.ResolvePath(c.Routing.DirectFile)
+	c.Routing.ProxyFile = util.ResolvePath(c.Routing.ProxyFile)
+	for _, srv := range c.Servers {
+		srv.CAPath = util.ResolvePath(srv.CAPath)
 	}
 }
 
@@ -272,8 +309,8 @@ func DefaultConfig() *ClientConfig {
 	cfg := &ClientConfig{
 		ConfigVersion: 3,
 		Local: LocalConfig{
-			SocksPort: 2080,
-			HTTPPort:  3080,
+			SocksPort: config.DefaultSocksPort,
+			HTTPPort:  config.DefaultHTTPPort,
 		},
 	}
 	applyDefaults(cfg)

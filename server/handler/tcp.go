@@ -43,10 +43,10 @@ func DialTimeout(timeout time.Duration) time.Duration {
 
 func NewTCPHandler(idleTimeout, timeout time.Duration, np *nextproxy.NextProxy) *TCPHandler {
 	if idleTimeout <= 0 {
-		idleTimeout = 300 * time.Second
+		idleTimeout = config.DefaultStreamIdleTimeout
 	}
 	if timeout <= 0 {
-		timeout = 30 * time.Second
+		timeout = time.Duration(config.DefaultTimeout) * time.Second
 	}
 	dialTimeout := DialTimeout(timeout)
 	return &TCPHandler{
@@ -59,6 +59,15 @@ func NewTCPHandler(idleTimeout, timeout time.Duration, np *nextproxy.NextProxy) 
 
 func (h *TCPHandler) dialTarget(ctx context.Context, network, addr string) (net.Conn, error) {
 	if h.nextProxy != nil && h.nextProxy.ShouldProxy(addr) {
+		// Re-run the SSRF check at dial time: the handshake-time check may
+		// be long past, and a DNS-rebinding name can resolve differently
+		// now. The post-dial check below cannot run here — the SOCKS5
+		// connection reports the proxy's address, not the target's — so the
+		// proxy's own resolver remains a (trusted, admin-configured)
+		// residual risk.
+		if util.IsLANHostResolved(ctx, addr) {
+			return nil, fmt.Errorf("ssrf: rejected lan destination %s", addr)
+		}
 		log.Info("[TCP_HANDLE] dialing via next proxy", "target", addr, "proxy", h.nextProxy.URL().String())
 		return h.nextProxy.DialContext(ctx, network, addr)
 	}
@@ -179,7 +188,13 @@ func (h *TCPHandler) copyFromClient(dr *crypto.DecryptedReader, dst net.Conn, si
 			if cw, ok := dst.(interface{ CloseWrite() error }); ok {
 				_ = cw.CloseWrite()
 			}
-			continue
+			// FIN is a terminal frame: the client sends no further frames
+			// after it (its copyLocalToRemote returns right after flushing
+			// FIN), so stop reading instead of blocking on ReadFrame until
+			// the relay idle timeout. The relay keeps waiting for the
+			// target->client direction and its idle timer still bounds the
+			// stream's lifetime.
+			return nil
 		case protocol.FrameRST:
 			return io.EOF
 		case protocol.FramePADDING, protocol.FrameCOVER:

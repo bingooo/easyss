@@ -5,12 +5,13 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
-	"math"
 	"net"
 	"net/http"
 	"runtime"
+	"slices"
+	"strconv"
+	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	utls "github.com/refraction-networking/utls"
@@ -20,19 +21,13 @@ import (
 	"github.com/nange/easyss/v3/transport"
 )
 
-type transportSlot struct {
-	t      *http.Transport
-	active atomic.Int32
-}
-
+// HTTP2Transport is a facade over the HTTP/2 client machinery: streams are
+// mapped onto connections by slotScheduler, and the per-connection state
+// (degradation, rotation) is driven by slotLifecycle. This type only wires
+// the two together and speaks HTTP.
 type HTTP2Transport struct {
-	slots         []*transportSlot // pre-allocated and initialized to maxSlots
-	liveCount     atomic.Int32     // number of currently active slots (0..maxSlots)
-	maxSlots      int
-	threshold     int32
-	prioritySlots int // number of priority slots (0..prioritySlots-1)
-	bulkThreshold int32
-	mu            sync.RWMutex // protects slot retire (shrink) and grow; RLock protects stream assignment
+	sched     *slotScheduler
+	lifecycle *slotLifecycle
 
 	serverURL string
 
@@ -40,14 +35,25 @@ type HTTP2Transport struct {
 	cancel context.CancelFunc
 }
 
+// The slot-count and stream-threshold bounds live in the shared config
+// package (MaxConnCountMax, MaxStreamThreshold) so the client config
+// clamping and the transport guard always agree; see config/types.go for
+// the rationale.
+
 type Config struct {
 	ServerURL         string
 	TLSConfig         *utls.Config
 	MaxSlotCount      int
 	StreamThreshold   int
 	PrioritySlotRatio float64
+	ConnLifetime      time.Duration // max age of a connection before rotation (0: default)
+	ConnMaxBytes      int64         // max bytes carried by a connection in either direction before rotation (0: default)
 	Timeout           time.Duration
 	DialContext       func(ctx context.Context, network, addr string) (net.Conn, error)
+	// ProbeToken is the capability token for the server's /v3/probe
+	// endpoint (derived from the master key). Empty disables active
+	// probing, leaving passive-only degraded detection.
+	ProbeToken string
 }
 
 func New(cfg Config) (*HTTP2Transport, error) {
@@ -55,14 +61,20 @@ func New(cfg Config) (*HTTP2Transport, error) {
 	if maxSlots < 1 {
 		maxSlots = 6
 	}
+	if maxSlots > sharedconfig.MaxConnCountMax {
+		maxSlots = sharedconfig.MaxConnCountMax
+	}
 	threshold := int32(cfg.StreamThreshold)
 	if threshold < 1 {
 		threshold = 8
 	}
+	if threshold > sharedconfig.MaxStreamThreshold {
+		threshold = sharedconfig.MaxStreamThreshold
+	}
 
 	ratio := cfg.PrioritySlotRatio
 	if ratio <= 0 || ratio > 1 {
-		ratio = 0.5
+		ratio = sharedconfig.DefaultPrioritySlotRatio
 	}
 	prioritySlots := int(float64(maxSlots) * ratio)
 	if prioritySlots < 1 {
@@ -71,8 +83,6 @@ func New(cfg Config) (*HTTP2Transport, error) {
 	if prioritySlots > maxSlots {
 		prioritySlots = maxSlots
 	}
-
-	bulkThreshold := threshold * 2
 
 	timeout := cfg.Timeout
 	if timeout <= 0 {
@@ -84,31 +94,58 @@ func New(cfg Config) (*HTTP2Transport, error) {
 		dialCtx = defaultDialContext
 	}
 
+	connLifetime := cfg.ConnLifetime
+	if connLifetime <= 0 {
+		connLifetime = time.Duration(sharedconfig.DefaultConnLifetimeSec) * time.Second
+	}
+	connMaxBytes := cfg.ConnMaxBytes
+	if connMaxBytes <= 0 {
+		connMaxBytes = sharedconfig.DefaultConnMaxBytes
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 
 	// Pre-allocate and initialize all slots. Transports are cheap structs;
 	// actual TCP connections are established lazily by Go's http.Transport.
+	// Per-pool stable indices are assigned by newScheduler.
 	slots := make([]*transportSlot, maxSlots)
 	for i := range slots {
-		slots[i] = newSlot(cfg.TLSConfig, timeout, dialCtx)
+		slots[i] = newSlot(cfg.TLSConfig, timeout, dialCtx, connLifetime)
 	}
 
-	return &HTTP2Transport{
-		slots:         slots,
-		maxSlots:      maxSlots,
-		threshold:     threshold,
-		prioritySlots: prioritySlots,
-		bulkThreshold: bulkThreshold,
-		serverURL:     cfg.ServerURL,
-		ctx:           ctx,
-		cancel:        cancel,
-	}, nil
+	sched := newScheduler(maxSlots, slots, threshold, prioritySlots)
+
+	lc := &slotLifecycle{
+		sched:        sched,
+		connLifetime: connLifetime,
+		connMaxBytes: connMaxBytes,
+	}
+	if cfg.ProbeToken != "" {
+		prober := &slotProber{
+			serverURL:   cfg.ServerURL,
+			token:       cfg.ProbeToken,
+			payloadSize: int64(sharedconfig.ProbePayloadSize),
+		}
+		lc.probeFunc = prober.probe
+	}
+
+	tr := &HTTP2Transport{
+		sched:     sched,
+		lifecycle: lc,
+		serverURL: cfg.ServerURL,
+		ctx:       ctx,
+		cancel:    cancel,
+	}
+	go tr.lifecycle.run(ctx)
+	return tr, nil
 }
 
-func newSlot(utlsCfg *utls.Config, timeout time.Duration, dialContext func(context.Context, string, string) (net.Conn, error)) *transportSlot {
+func newSlot(utlsCfg *utls.Config, timeout time.Duration, dialContext func(context.Context, string, string) (net.Conn, error), connLifetime time.Duration) *transportSlot {
 	if dialContext == nil {
 		dialContext = defaultDialContext
 	}
+
+	slot := &transportSlot{}
 
 	protos := &http.Protocols{}
 	protos.SetHTTP2(true)
@@ -157,10 +194,15 @@ func newSlot(utlsCfg *utls.Config, timeout time.Duration, dialContext func(conte
 				_ = uconn.Close()
 				return nil, fmt.Errorf("server negotiated %q, want h2", proto)
 			}
+			// A new connection resets the rotation state: the lifetime
+			// deadline (with per-connection jitter), bytes carried and the
+			// expiring mark all start fresh.
+			slot.resetConn(connLifetime)
 			return uconn, nil
 		},
 	}
-	return &transportSlot{t: tr}
+	slot.t = tr
+	return slot
 }
 
 func defaultDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -177,17 +219,17 @@ func (t *HTTP2Transport) Open(ctx context.Context, req transport.OpenRequest) (t
 
 	stats.RecordStreamOpened()
 
-	t.maybeGrowSlots(req.HighPriority)
+	t.sched.grow(req.HighPriority)
 
-	t.mu.RLock()
-	slot := t.selectSlot(req.HighPriority)
+	t.sched.mu.RLock()
+	slot := t.sched.pick(req.HighPriority)
 	slot.active.Add(1)
 	if req.HighPriority {
 		stats.RecordStreamOpenedPriority()
 	} else {
 		stats.RecordStreamOpenedBulk()
 	}
-	t.mu.RUnlock()
+	t.sched.mu.RUnlock()
 
 	parentCtx := ctx
 	ctx, cancel := context.WithCancel(parentCtx)
@@ -209,6 +251,7 @@ func (t *HTTP2Transport) Open(ctx context.Context, req transport.OpenRequest) (t
 		pw.Close() //nolint:errcheck
 		cancel()
 		slot.active.Add(-1)
+		stats.RecordStreamClosed()
 		return nil, err
 	}
 	httpReq.Header.Set("User-Agent", chromeUserAgent())
@@ -220,17 +263,23 @@ func (t *HTTP2Transport) Open(ctx context.Context, req transport.OpenRequest) (t
 
 	respCh := make(chan roundTripResult, 1)
 
+	var stream *HTTP2Stream
 	doneOnce := sync.OnceFunc(func() {
+		// Release the slot's heavy mark exactly once (doneOnce runs at most
+		// a single time), so the slot becomes eligible for new streams again.
+		stream.releaseHeavy()
 		slot.active.Add(-1)
 		stats.RecordStreamClosed()
 		cancel()
 	})
 
-	stream := &HTTP2Stream{
-		w:      pw,
-		respCh: respCh,
-		cancel: cancel,
-		done:   doneOnce,
+	stream = &HTTP2Stream{
+		w:         pw,
+		respCh:    respCh,
+		cancel:    cancel,
+		done:      doneOnce,
+		slot:      slot,
+		startTime: time.Now(),
 	}
 
 	go func() {
@@ -258,183 +307,140 @@ func (t *HTTP2Transport) Open(ctx context.Context, req transport.OpenRequest) (t
 	return stream, nil
 }
 
-func (t *HTTP2Transport) selectSlot(highPriority bool) *transportSlot {
-	if highPriority && t.prioritySlots > 0 {
-		slot := t.leastActiveSlotRange(0, t.prioritySlots)
-		if slot == nil || slot.active.Load() >= t.threshold {
-			stats.RecordPriorityFallback()
-			slot = t.leastActiveSlotRange(t.prioritySlots, int(t.liveCount.Load()))
-		}
-		return slot
-	}
-
-	slot := t.leastActiveSlotRange(t.prioritySlots, int(t.liveCount.Load()))
-	if slot == nil || slot.active.Load() >= t.bulkThreshold {
-		stats.RecordBulkFallback()
-		slot = t.leastActiveSlotRange(0, t.prioritySlots)
-	}
-	return slot
-}
-
-func (t *HTTP2Transport) leastActiveSlotRange(start, end int) *transportSlot {
-	live := int(t.liveCount.Load())
-	if live == 0 {
-		return t.slots[0]
-	}
-	if end > live {
-		end = live
-	}
-	if start >= end {
-		start = 0
-		end = live
-	}
-	var best *transportSlot
-	var min int32 = math.MaxInt32
-	for i := start; i < end; i++ {
-		if a := t.slots[i].active.Load(); a < min {
-			best, min = t.slots[i], a
-		}
-	}
-	if best == nil {
-		return t.slots[0]
-	}
-	return best
-}
-
-// maybeGrowSlots checks whether all live slots are at or above the threshold,
-// and if so, activates one more slot (up to maxSlots). Uses double-checked locking.
-func (t *HTTP2Transport) maybeGrowSlots(highPriority bool) {
-	live := t.liveCount.Load()
-	if int(live) >= t.maxSlots {
-		return
-	}
-
-	thresh := t.threshold
-	start, end := int32(0), live
-	if highPriority && t.prioritySlots > 0 {
-		end = int32(t.prioritySlots)
-		if end > live {
-			end = live
-		}
-	} else if t.prioritySlots > 0 {
-		start = int32(t.prioritySlots)
-		thresh = t.bulkThreshold
-	}
-
-	if live > 0 {
-		if start >= end {
-			return
-		}
-		for i := start; i < end; i++ {
-			if t.slots[i].active.Load() < thresh {
-				return
-			}
-		}
-	}
-
-	// All slots in range are at or above threshold — try to grow under lock.
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	// Double-check after acquiring the lock.
-	live = t.liveCount.Load()
-	if int(live) >= t.maxSlots {
-		return
-	}
-	start2, end2 := int32(0), live
-	if highPriority && t.prioritySlots > 0 {
-		end2 = int32(t.prioritySlots)
-		if end2 > live {
-			end2 = live
-		}
-	} else if t.prioritySlots > 0 {
-		start2 = int32(t.prioritySlots)
-	}
-	if live > 0 {
-		if start2 >= end2 {
-			return
-		}
-		for i := start2; i < end2; i++ {
-			if t.slots[i].active.Load() < thresh {
-				return
-			}
-		}
-	}
-
-	// On first activation, start with 2 connections for better initial throughput,
-	// since typical web browsing generates >8 concurrent streams.
-	// Falls back to 1 when maxSlots is 1.
-	if live == 0 && t.maxSlots >= 2 {
-		t.liveCount.Add(2)
-	} else {
-		t.liveCount.Add(1)
-	}
-}
-
 func (t *HTTP2Transport) CloseIdle() {
-	// Close idle TCP connections on all slots (no lock needed).
-	for _, s := range t.slots {
-		s.t.CloseIdleConnections()
+	// Close idle TCP connections on all slots of both pools. The slot array
+	// elements are swap-mutated by shrink/retire under the scheduler write
+	// lock, so read the arrays under the read lock.
+	t.sched.mu.RLock()
+	for _, pool := range []*slotPool{t.sched.priority, t.sched.bulk} {
+		for _, s := range pool.slots {
+			s.t.CloseIdleConnections()
+		}
 	}
+	t.sched.mu.RUnlock()
 
 	// Shrink liveCount by retiring idle slots (any position, swap-remove).
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	for {
-		live := int(t.liveCount.Load())
-		if live == 0 {
-			break
-		}
-		// Find first idle slot.
-		retired := -1
-		for i := 0; i < live; i++ {
-			if t.slots[i].active.Load() == 0 {
-				retired = i
-				break
-			}
-		}
-		if retired < 0 {
-			break // no idle slots left
-		}
-		// Swap-remove: move idle slot to the end, then shrink.
-		last := live - 1
-		if retired != last {
-			t.slots[retired], t.slots[last] = t.slots[last], t.slots[retired]
-		}
-		t.liveCount.Add(-1)
-	}
+	t.sched.mu.Lock()
+	defer t.sched.mu.Unlock()
+	t.sched.shrinkIdleLocked()
 }
 
 func (t *HTTP2Transport) Stats() transport.TransportStats {
-	live := int(t.liveCount.Load())
-	ts := transport.TransportStats{
-		Conns: live,
-	}
-	pConns := t.prioritySlots
-	if live < pConns {
-		pConns = live
-	}
-	ts.PriorityConns = pConns
-	ts.BulkConns = live - pConns
+	// Hold the scheduler read lock so the snapshot is consistent: shrink
+	// (swap-remove) and grow mutate pool liveCounts and the live slot
+	// ranges under the write lock, so an unlocked render could read a
+	// stale liveCount and report more conns_status entries than Conns.
+	t.sched.mu.RLock()
+	defer t.sched.mu.RUnlock()
 
-	for i := int32(0); i < int32(live); i++ {
-		a := int(t.slots[i].active.Load())
-		ts.ActiveStreams += a
-		if i < int32(t.prioritySlots) {
-			ts.PriorityActiveStreams += a
-		} else {
-			ts.BulkActiveStreams += a
+	pLive := int(t.sched.priority.liveCount.Load())
+	bLive := int(t.sched.bulk.liveCount.Load())
+	ts := transport.TransportStats{
+		Conns:         pLive + bLive,
+		PriorityConns: pLive,
+		BulkConns:     bLive,
+	}
+
+	for _, pool := range []*slotPool{t.sched.priority, t.sched.bulk} {
+		live := int(pool.liveCount.Load())
+		for i := 0; i < live; i++ {
+			a := int(pool.slots[i].active.Load())
+			ts.ActiveStreams += a
+			if pool == t.sched.priority {
+				ts.PriorityActiveStreams += a
+			} else {
+				ts.BulkActiveStreams += a
+			}
 		}
 	}
+	ts.PriorityConnsStatus = slotStatusString(t.sched.priority, pLive)
+	ts.BulkConnsStatus = slotStatusString(t.sched.bulk, bLive)
 	return ts
+}
+
+// slotStatus derives a live slot's connection status from its health flags.
+// Multiple flags are joined with "+" so no state is hidden (a heavy download
+// crossing the connection lifetime is both heavy and expiring); a slot with
+// no flags is "active".
+func slotStatus(s *transportSlot) string {
+	var parts []string
+	if s.heavy.Load() > 0 {
+		parts = append(parts, "heavy")
+	}
+	if s.degraded.Load() {
+		parts = append(parts, "degraded")
+	}
+	if s.expiring.Load() {
+		parts = append(parts, "expiring")
+	}
+	if len(parts) == 0 {
+		return "active"
+	}
+	return strings.Join(parts, "+")
+}
+
+// slotStatusString renders the live slots of one pool as
+// "<index>:<active streams>:<status>", wrapped in brackets, e.g.
+// "[0:3:degraded, 1:2:expiring, 2:1:active, 3:1:heavy]". Entries are
+// ordered by the stable slot identity (retire swap-removes scramble the
+// live order) and then renumbered from 0, so the rendered indices are
+// always consecutive with no jumps. An empty live set renders as "[]".
+// live must be the pool's liveCount value the caller snapshot under the
+// scheduler lock, so the rendered entry count always matches Conns.
+func slotStatusString(pool *slotPool, live int) string {
+	if live > pool.maxSlots {
+		live = pool.maxSlots
+	}
+	type entry struct {
+		idx    int
+		active int
+		status string
+	}
+	entries := make([]entry, 0, live)
+	for i := 0; i < live; i++ {
+		s := pool.slots[i]
+		entries = append(entries, entry{
+			idx:    s.idx,
+			active: int(s.active.Load()),
+			status: slotStatus(s),
+		})
+	}
+	if len(entries) == 0 {
+		return "[]"
+	}
+	// Order by stable slot index regardless of the scrambled live order,
+	// then number entries 0..n-1 so the output indices never jump.
+	slices.SortFunc(entries, func(a, b entry) int { return a.idx - b.idx })
+
+	var b strings.Builder
+	b.WriteByte('[')
+	for i, e := range entries {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString(strconv.Itoa(i))
+		b.WriteByte(':')
+		b.WriteString(strconv.Itoa(e.active))
+		b.WriteByte(':')
+		b.WriteString(e.status)
+	}
+	b.WriteByte(']')
+	return b.String()
 }
 
 func (t *HTTP2Transport) Close() error {
 	t.cancel()
-	live := t.liveCount.Load()
-	for _, s := range t.slots[:live] {
-		s.t.CloseIdleConnections()
+	// Read the live slot ranges under the scheduler read lock: shrink/retire
+	// swap-remove slots under the write lock, so an unlocked iteration over
+	// the live range would race with those swaps.
+	t.sched.mu.RLock()
+	for _, pool := range []*slotPool{t.sched.priority, t.sched.bulk} {
+		live := int(pool.liveCount.Load())
+		for _, s := range pool.slots[:live] {
+			s.t.CloseIdleConnections()
+		}
 	}
+	t.sched.mu.RUnlock()
 	return nil
 }
 

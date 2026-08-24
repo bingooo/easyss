@@ -1,7 +1,9 @@
 package dns
 
 import (
+	"errors"
 	"fmt"
+	"math/rand/v2"
 	"strings"
 
 	"github.com/coocood/freecache"
@@ -43,7 +45,9 @@ func (c *Cache) Get(name, qtype string, isDirect bool) *dns.Msg {
 	if isDirect {
 		cache = c.direct
 	}
-	v, err := cache.Get([]byte(name + qtype))
+	// DNS names are case-insensitive; normalize so differently-cased
+	// queries hit the same entry.
+	v, err := cache.Get([]byte(strings.ToLower(name) + qtype))
 	if err != nil || len(v) == 0 {
 		stats.RecordDNSCacheMiss()
 		return nil
@@ -59,6 +63,9 @@ func (c *Cache) Get(name, qtype string, isDirect bool) *dns.Msg {
 
 // Set stores a DNS message in the appropriate cache using DNS TTL.
 // Only A and AAAA records are cached. If isDirect is true, the direct cache is used.
+// The effective cache lifetime is the base TTL plus a random jitter in
+// [0, baseTTL) so that entries with the same base TTL do not expire at the
+// same moment, avoiding bursts of concurrent DNS queries.
 func (c *Cache) Set(msg *dns.Msg, isDirect bool) error {
 	if msg == nil || len(msg.Question) == 0 {
 		return nil
@@ -69,8 +76,8 @@ func (c *Cache) Set(msg *dns.Msg, isDirect bool) error {
 		if err != nil {
 			return err
 		}
-		key := []byte(q.Name + dns.TypeToString[q.Qtype])
-		ttl := dnsCacheTTL(msg, c.serverDomain)
+		key := []byte(strings.ToLower(q.Name) + dns.TypeToString[q.Qtype])
+		ttl := jitterTTL(dnsCacheTTL(msg, c.serverDomain))
 		if isDirect {
 			return c.direct.Set(key, v, ttl)
 		}
@@ -100,13 +107,32 @@ func dnsCacheTTL(msg *dns.Msg, serverDomain string) int {
 			ttl = rr.Header().Ttl
 		}
 	}
-	if ttl == 0 || ttl > maxCacheTTL {
+	if ttl == 0 {
+		// A TTL of 0 conventionally means "re-resolve immediately" (CDN
+		// failover, dynamic DNS). Clamp it to the *minimum* cache lifetime
+		// rather than the maximum so freshness-demanding records do not
+		// stick around for 2 hours.
+		ttl = minCacheTTL
+	}
+	if ttl > maxCacheTTL {
 		ttl = maxCacheTTL
 	}
 	if ttl < minCacheTTL {
 		ttl = minCacheTTL
 	}
 	return int(ttl)
+}
+
+// jitterTTL returns the effective cache lifetime in seconds for a base TTL:
+// the base TTL plus a random jitter in [0, ttl). Entries sharing the same
+// base TTL therefore expire at scattered moments instead of all at once,
+// avoiding a burst of concurrent DNS queries. A TTL of 0 (never expire,
+// e.g. the proxy server's own domain) is returned unchanged.
+func jitterTTL(ttl int) int {
+	if ttl <= 0 {
+		return ttl
+	}
+	return ttl + rand.IntN(ttl)
 }
 
 // PrePopulate resolves the domain via the given DNS server and stores the
@@ -154,4 +180,43 @@ func (c *Cache) PrePopulate(domain, dnsServer string, requireIPv4 bool) error {
 		return fmt.Errorf("failed to resolve %s via %s", domain, dnsServer)
 	}
 	return nil
+}
+
+// PrePopulateWithFallback resolves the domain via each of the given dns
+// servers in order, then falls back to the system dns servers when all of
+// them are unavailable, storing the results in both the direct and proxied
+// caches. See PrePopulate for the requireIPv4 semantics.
+func (c *Cache) PrePopulateWithFallback(domain string, dnsServers []string, requireIPv4 bool) error {
+	var lastErr error
+	try := func(server string) bool {
+		err := c.PrePopulate(domain, server, requireIPv4)
+		if err == nil {
+			return true
+		}
+		lastErr = errors.Join(lastErr, err)
+		log.Warn("[DNS] PrePopulate via dns server failed", "domain", domain, "server", server, "err", err)
+		return false
+	}
+
+	if BuiltinDNSAvailable() {
+		for _, s := range dnsServers {
+			if try(s) {
+				MarkBuiltinDNSAvailable()
+				return nil
+			}
+		}
+		MarkBuiltinDNSUnavailable()
+		log.Warn("[DNS] all builtin dns servers failed, fallback to system dns", "domain", domain, "err", lastErr)
+	}
+
+	for _, s := range systemDNSServersFunc() {
+		if try(s) {
+			return nil
+		}
+	}
+
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no dns server available for %s", domain)
+	}
+	return lastErr
 }

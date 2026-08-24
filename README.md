@@ -10,7 +10,7 @@ Easyss是一款兼容socks5的安全代理上网工具，目标是使访问国�
 ## 特性
 
 * 简单稳定易用, 没有复杂的配置项；支持 IPv4/IPv6 双栈网络
-* 无流量特征，不易被嗅探；底层基于真实http2(tls)传输协议，并对请求进行流量整形，真实网页fallback等手段，保证网络的稳定运行
+* 无流量特征，不易被嗅探；底层基于真实http2(tls)传输协议，并对请求进行流量整形、真实网页fallback、智能请求连接调度等手段，保证网络的稳定运行
 * 全平台支持(Linux, MacOS, Windows, Android等)
 * 支持SOCKS5(TCP/UDP, thanks [socks5](https://github.com/txthinking/socks5))、HTTP 代理协议
 * 支持浏览器级别代理(设置系统代理), 和系统全局代理(thanks [tun2socks](https://github.com/xjasonlyu/tun2socks)); 全局代理支持`ping`命令(ICMP Echo协议)
@@ -56,8 +56,8 @@ Easyss v3 支持两种配置模式，自动识别：
   "server": "your-domain.com",
   "server_port": 443,
   "password": "your-password",
-  "local_port": 2080,
-  "log_file_path": "easyss.log",
+  "local_port": 4080,
+  "log_file_path": "easyss.log"
 }
 ```
 
@@ -68,7 +68,7 @@ Easyss v3 支持两种配置模式，自动识别：
 | `server` | 是 | - | 服务器地址（域名或IP） |
 | `server_port` | 是 | - | 服务器端口 |
 | `password` | 是 | - | 通信加密密钥 |
-| `local_port` | 否 | 2080 | 本地 SOCKS5 监听端口。`http_port` 自动设为 `local_port + 1000` |
+| `local_port` | 否 | 4080 | 本地 SOCKS5 监听端口。`http_port` 自动设为 `local_port + 1000` |
 | `method` | 否 | aes-256-gcm | 加密方式，可选: `aes-256-gcm`, `chacha20-poly1305` |
 | `proxy_rule` | 否 | auto | 代理规则，可选: `auto`, `reverse_auto`, `proxy`, `direct`, `auto_block` |
 | `timeout` | 否 | 30 | 超时时间，单位秒 |
@@ -133,14 +133,13 @@ Easyss v3 支持两种配置模式，自动识别：
     "default": true
   }],
   "local": {
-    "socks_port": 2080,
-    "http_port": 3080,
+    "socks_port": 4080,
+    "http_port": 5080,
     "bind_all": false,
     "disable_sys_proxy": false,
     "enable_forward_dns": false,
     "enable_tun2socks": false,
-    "enable_quic": false,
-    "tun_config": {}
+    "enable_quic": false
   },
   "routing": {
     "proxy_rule": "auto",
@@ -150,14 +149,16 @@ Easyss v3 支持两种配置模式，自动识别：
   },
   "transport": {
     "protocol": "h2",
-    "conn_count_max": 12,
-    "stream_threshold": 8,
-    "priority_slot_ratio": 0.5
+    "conn_count_max": 15,
+    "stream_threshold": 4,
+    "priority_slot_ratio": 0.4,
+    "conn_lifetime_sec": 420,
+    "conn_max_bytes": 268435456
   },
   "shaper": {
     "batch_window_ms": 3,
     "cover_budget_ratio": 0.03,
-    "cover_budget_cap": 131072
+    "cover_budget_cap": 16384
   },
   "log": {
     "level": "info",
@@ -175,6 +176,25 @@ Easyss v3 支持两种配置模式，自动识别：
 ```bash
 ./easyss -show-config-example
 ```
+
+**transport 参数说明（默认值以代码为准，0 表示使用默认值）：**
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `transport.protocol` | h2 | 传输协议（目前仅支持 h2） |
+| `transport.conn_count_max` | 15 | 最大连接数，懒加载扩容的上限 |
+| `transport.stream_threshold` | 4 | 活跃流达到该阈值且连接数未达上限时，新建连接 |
+| `transport.priority_slot_ratio` | 0.4 | 优先（交互式）槽位占连接数的比例，其余为批量槽位 |
+| `transport.conn_lifetime_sec` | 420 | 单连接最大存活时间（秒），0 使用默认值；到期后停止接收新流并轮换连接 |
+| `transport.conn_max_bytes` | 268435456 | 单连接双向累计最大字节数（256MB），0 使用默认值；超限后轮换连接 |
+
+**shaper 参数说明：**
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `shaper.batch_window_ms` | 3 | 流量整形批处理窗口，单位毫秒，范围 1-10 |
+| `shaper.cover_budget_ratio` | 0.03 | cover traffic 占真实流量的预算比例，范围 (0, 1] |
+| `shaper.cover_budget_cap` | 16384 | cover traffic 最大累积预算，单位字节，默认 16KB |
 
 #### 配置模式自动识别
 
@@ -202,6 +222,8 @@ Easyss 通过检测配置文件自动区分模式：
 对于部分国内/国外的 IP 或域名，可能 `Easyss` 没有正确识别路由规则。可通过 `direct_file` 和 `proxy_file` 自定义。
 
 在 `easyss` 所在目录下新建文本文件（如 `direct.txt`、`proxy.txt`），IP/CIDR/域名可混写，每行一条记录。然后在配置中指定路径：
+
+> 配置中的相对路径（`direct_file`、`proxy_file`、`ca_path` 等）会先按当前工作目录查找，找不到时自动回退到 `easyss` 可执行文件所在目录（macOS 下为 `.app` 旁）。这样从 Finder 双击、开机自启（launchd）等方式启动时也能正常读取，不受启动目录影响。
 
 **简化模式：**
 
@@ -283,21 +305,31 @@ regexp:^.*\.youtube\..*$ # 正则表达式：匹配包含 .youtube. 的域名
   "server": {
     "listen": ":443",
     "domain": "your-domain.com",
-    "password": "your-pass",
+    "password": "your-password",
     "allowed_methods": ["aes-256-gcm", "chacha20-poly1305"],
     "cert_path": "",
     "key_path": "",
-    "email": "your-email",
+    "email": "your-email@example.com",
     "fallback_target": "",
     "fallback_preserve_host": false,
     "fallback_cdn_domains": [],
     "batch_window_ms": 3,
     "cover_budget_ratio": 0.03,
-    "cover_budget_cap": 131072
+    "cover_budget_cap": 16384,
+    "pprof_enabled": false
   },
   "log": {
       "level": "info",
       "file_path": "easyss.log"
+  },
+  "transport": {
+      "protocol": "h2"
+  },
+  "next_proxy": {
+      "url": "",
+      "next_proxy_file": "",
+      "enable_udp": false,
+      "all_host": false
   },
   "timeout": 30
 }
@@ -319,7 +351,9 @@ regexp:^.*\.youtube\..*$ # 正则表达式：匹配包含 .youtube. 的域名
 | `server.fallback_cdn_domains` | 否 | [] | 仅对 `fallback_target` 为 URL 生效。<br>配置需要通过代理中转的 CDN 域名列表（如 `["github.githubassets.com"]`）。HTML 和 CSP 中引用这些域名的绝对 URL 会被重写为 `/__cdn__/<host>/...` 路径前缀形式，浏览器请求时走代理转发到对应 CDN，避免直连 CDN 暴露真实 IP 或被 CSP 拦截 |
 | `server.batch_window_ms` | 否 | 3 | 流量整形批处理窗口，单位毫秒，范围 1-10 |
 | `server.cover_budget_ratio` | 否 | 0.03 | cover traffic 占真实流量的预算比例，设为 0 或负数使用默认值，范围 (0, 1] |
-| `server.cover_budget_cap` | 否 | 131072 | cover traffic 最大累积预算，单位字节，默认 128KB |
+| `server.cover_budget_cap` | 否 | 16384 | cover traffic 最大累积预算，单位字节，默认 16KB |
+| `server.pprof_enabled` | 否 | false | 是否启用 pprof 调试服务（127.0.0.1:6060） |
+| `transport.protocol` | 否 | h2 | 传输协议（目前仅支持 h2） |
 | `timeout` | 否 | 30 | 超时时间，单位秒 |
 
 > **fallback_target 使用示例**：

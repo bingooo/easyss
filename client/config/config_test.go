@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/nange/easyss/v3/config"
+	"github.com/nange/easyss/v3/util"
 )
 
 func TestDefaultConfig(t *testing.T) {
@@ -17,11 +18,11 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.ConfigVersion != 3 {
 		t.Errorf("ConfigVersion = %d, want 3", cfg.ConfigVersion)
 	}
-	if cfg.Local.SocksPort != 2080 {
-		t.Errorf("SocksPort = %d, want 2080", cfg.Local.SocksPort)
+	if cfg.Local.SocksPort != 4080 {
+		t.Errorf("SocksPort = %d, want 4080", cfg.Local.SocksPort)
 	}
-	if cfg.Local.HTTPPort != 3080 {
-		t.Errorf("HTTPPort = %d, want 3080", cfg.Local.HTTPPort)
+	if cfg.Local.HTTPPort != 5080 {
+		t.Errorf("HTTPPort = %d, want 5080", cfg.Local.HTTPPort)
 	}
 	if cfg.Timeout != config.DefaultTimeout {
 		t.Errorf("Timeout = %d, want %d", cfg.Timeout, config.DefaultTimeout)
@@ -573,6 +574,12 @@ func TestApplyDefaults(t *testing.T) {
 		if cfg.Transport.StreamThreshold != config.DefaultStreamThreshold {
 			t.Errorf("StreamThreshold = %d", cfg.Transport.StreamThreshold)
 		}
+		if cfg.Transport.ConnLifetimeSec != config.DefaultConnLifetimeSec {
+			t.Errorf("ConnLifetimeSec = %d", cfg.Transport.ConnLifetimeSec)
+		}
+		if cfg.Transport.ConnMaxBytes != config.DefaultConnMaxBytes {
+			t.Errorf("ConnMaxBytes = %d", cfg.Transport.ConnMaxBytes)
+		}
 		if cfg.Shaper.BatchWindowMS != config.DefaultBatchWindowMS {
 			t.Errorf("BatchWindowMS = %d", cfg.Shaper.BatchWindowMS)
 		}
@@ -633,4 +640,76 @@ func TestApplyDefaults(t *testing.T) {
 			t.Errorf("LogLevel = %q, want error (not overwritten)", cfg.Log.Level)
 		}
 	})
+
+	t.Run("钳制退化配置到合法范围", func(t *testing.T) {
+		cfg := &ClientConfig{
+			Servers: []*ServerProfile{
+				{Address: "example.com"},
+			},
+			Transport: TransportConfig{
+				// conn_count_max=1 would panic the scheduler (empty bulk pool);
+				// oversized values must not trigger huge upfront allocations.
+				ConnCountMax:    1,
+				StreamThreshold: 1 << 30,
+			},
+		}
+		applyDefaults(cfg)
+
+		if cfg.Transport.ConnCountMax != config.MinConnCountMax {
+			t.Errorf("ConnCountMax = %d, want clamped to %d", cfg.Transport.ConnCountMax, config.MinConnCountMax)
+		}
+
+		cfg2 := &ClientConfig{
+			Servers: []*ServerProfile{
+				{Address: "example.com"},
+			},
+			Transport: TransportConfig{
+				ConnCountMax:    1 << 20,
+				StreamThreshold: 1 << 20,
+			},
+		}
+		applyDefaults(cfg2)
+
+		if cfg2.Transport.ConnCountMax != config.MaxConnCountMax {
+			t.Errorf("ConnCountMax = %d, want clamped to %d", cfg2.Transport.ConnCountMax, config.MaxConnCountMax)
+		}
+		if cfg2.Transport.StreamThreshold != config.MaxStreamThreshold {
+			t.Errorf("StreamThreshold = %d, want clamped to %d", cfg2.Transport.StreamThreshold, config.MaxStreamThreshold)
+		}
+	})
+}
+
+func TestResolveFilePaths(t *testing.T) {
+	relDirect := "direct.txt"
+	relCA := "ca.pem"
+	abs, err := filepath.Abs("proxy.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &ClientConfig{
+		Routing: RoutingConfig{
+			DirectFile: relDirect,
+			ProxyFile:  abs,
+		},
+		Servers: []*ServerProfile{
+			{CAPath: relCA},
+			{CAPath: ""},
+		},
+	}
+
+	cfg.ResolveFilePaths()
+
+	if want := filepath.Join(util.CurrentDir(), relDirect); cfg.Routing.DirectFile != want {
+		t.Errorf("DirectFile = %q, want %q", cfg.Routing.DirectFile, want)
+	}
+	if cfg.Routing.ProxyFile != abs {
+		t.Errorf("ProxyFile = %q, want %q (absolute unchanged)", cfg.Routing.ProxyFile, abs)
+	}
+	if want := filepath.Join(util.CurrentDir(), relCA); cfg.Servers[0].CAPath != want {
+		t.Errorf("Servers[0].CAPath = %q, want %q", cfg.Servers[0].CAPath, want)
+	}
+	if cfg.Servers[1].CAPath != "" {
+		t.Errorf("Servers[1].CAPath = %q, want empty (unchanged)", cfg.Servers[1].CAPath)
+	}
 }

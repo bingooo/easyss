@@ -252,3 +252,71 @@ func TestCache_ServerDomain_NeverExpires(t *testing.T) {
 		t.Fatal("regular domain entry expired before minCacheTTL")
 	}
 }
+
+func TestJitterTTL_NeverExpire(t *testing.T) {
+	// TTL 0（服务器域名永不过期）必须原样返回，不受抖动影响
+	if ttl := jitterTTL(0); ttl != 0 {
+		t.Errorf("jitterTTL(0) expected 0, got %d", ttl)
+	}
+	// 负数属于防御性边界，不应 panic 也不应被改动
+	if ttl := jitterTTL(-1); ttl != -1 {
+		t.Errorf("jitterTTL(-1) expected -1, got %d", ttl)
+	}
+}
+
+func TestJitterTTL_Range(t *testing.T) {
+	const base = 1800
+	seen := make(map[int]bool)
+	for i := 0; i < 1000; i++ {
+		ttl := jitterTTL(base)
+		// 结果必须在 [base, 2*base) 区间内
+		if ttl < base || ttl >= 2*base {
+			t.Fatalf("jitterTTL(%d) = %d, want in [%d, %d)", base, ttl, base, 2*base)
+		}
+		seen[ttl] = true
+	}
+	// 1000 次采样下结果应分散，而非固定同一个值
+	if len(seen) < 2 {
+		t.Errorf("jitterTTL(%d) always returned %d, expected random jitter", base, base)
+	}
+}
+
+func TestCachePrePopulateWithFallback(t *testing.T) {
+	failAddr := startTestDNSServer(t, true) // replies SERVFAIL, fails fast
+	okAddr := startTestDNSServer(t, false)  // answers A/AAAA records
+	old := systemDNSServersFunc
+	systemDNSServersFunc = func() []string {
+		return []string{okAddr}
+	}
+	t.Cleanup(func() {
+		systemDNSServersFunc = old
+		resetSystemDNSCache()
+		resetBuiltinDNSCircuit()
+	})
+
+	c := NewCache("example.com")
+	if err := c.PrePopulateWithFallback("example.com", []string{failAddr}, true); err != nil {
+		t.Fatalf("PrePopulateWithFallback error: %v", err)
+	}
+	if got := c.Get("example.com.", "A", true); got == nil {
+		t.Fatal("direct cache should have the A record after fallback")
+	}
+}
+
+func TestCachePrePopulateWithFallbackAllFail(t *testing.T) {
+	failAddr := startTestDNSServer(t, true)
+	old := systemDNSServersFunc
+	systemDNSServersFunc = func() []string {
+		return nil
+	}
+	t.Cleanup(func() {
+		systemDNSServersFunc = old
+		resetSystemDNSCache()
+		resetBuiltinDNSCircuit()
+	})
+
+	c := NewCache("example.com")
+	if err := c.PrePopulateWithFallback("example.com", []string{failAddr}, true); err == nil {
+		t.Fatal("expected error")
+	}
+}

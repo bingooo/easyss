@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
+	"github.com/nange/easyss/v3/config"
 	"github.com/nange/easyss/v3/crypto"
 	"github.com/nange/easyss/v3/log"
 	"github.com/nange/easyss/v3/protocol"
@@ -21,7 +22,7 @@ import (
 	"github.com/nange/easyss/v3/util/bytespool"
 )
 
-const udpBufSize = protocol.MaxPlainRecordSize - protocol.FrameHeaderSize
+const udpBufSize = protocol.MaxUDPDataSize
 
 type UDPHandler struct {
 	idleTimeout time.Duration
@@ -30,7 +31,7 @@ type UDPHandler struct {
 
 func NewUDPHandler(idleTimeout time.Duration, np *nextproxy.NextProxy) *UDPHandler {
 	if idleTimeout <= 0 {
-		idleTimeout = 30 * time.Second
+		idleTimeout = config.DefaultUDPIdleTimeout
 	}
 	h := &UDPHandler{
 		idleTimeout: idleTimeout,
@@ -39,7 +40,11 @@ func NewUDPHandler(idleTimeout time.Duration, np *nextproxy.NextProxy) *UDPHandl
 	return h
 }
 
-func (h *UDPHandler) Handle(ctx context.Context, dr *crypto.DecryptedReader, s2c shaper.Shaper, target string) error {
+// Handle relays UDP datagrams between the client stream and the target.
+// cancelRead is invoked when the handler terminates (idle timeout/error/
+// FIN): it unblocks the frame-reader goroutine that may be stuck reading the
+// client's request body, so no goroutine lingers after ServeHTTP returns.
+func (h *UDPHandler) Handle(ctx context.Context, dr *crypto.DecryptedReader, s2c shaper.Shaper, target string, cancelRead func()) error {
 	log.Debug("[UDP] handler starting", "target", target)
 
 	conn, err := h.dialTarget(ctx, target)
@@ -53,7 +58,12 @@ func (h *UDPHandler) Handle(ctx context.Context, dr *crypto.DecryptedReader, s2c
 	var dnsChecked atomic.Bool
 
 	done := make(chan struct{})
-	closeDone := sync.OnceFunc(func() { close(done) })
+	closeDone := sync.OnceFunc(func() {
+		close(done)
+		if cancelRead != nil {
+			cancelRead()
+		}
+	})
 	defer closeDone()
 	defer conn.Close() //nolint:errcheck
 	errCh := make(chan error, 1)
@@ -159,6 +169,12 @@ func (h *UDPHandler) dialTarget(ctx context.Context, target string) (net.Conn, e
 		host = h
 	}
 	if h.nextProxy != nil && h.nextProxy.EnableUDP() && h.nextProxy.ShouldProxy(host) {
+		// Re-run the SSRF check at dial time (see TCPHandler.dialTarget for
+		// the residual-risk note: the SOCKS5 connection reports the proxy's
+		// address, so the post-dial guard below cannot run on this path).
+		if util.IsLANHostResolved(ctx, target) {
+			return nil, fmt.Errorf("ssrf: rejected lan destination %s", target)
+		}
 		log.Info("[UDP] dialing via next proxy", "target", target, "proxy", h.nextProxy.URL().String())
 		return h.nextProxy.DialContext(ctx, "udp", target)
 	}
