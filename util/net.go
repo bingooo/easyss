@@ -2,8 +2,10 @@ package util
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"time"
 )
 
@@ -11,14 +13,15 @@ func IsIP(ip string) bool {
 	return net.ParseIP(ip) != nil
 }
 
-// IsLANIP reports whether ip is a LAN/private/loopback/link-local/multicast/
-// unspecified address, or falls inside any other non-public range that a
-// proxy server must never dial: carrier-grade NAT (100.64.0.0/10), the
-// "this network" range (0.0.0.0/8), IETF protocol assignments (192.0.0.0/24),
-// benchmarking and documentation ranges (198.18.0.0/15, 192.0.2.0/24,
-// 198.51.100.0/24, 203.0.113.0/24), reserved 240.0.0.0/4 and broadcast.
-// The IPv4 checks are inlined so IPv4-mapped IPv6 forms (::ffff:a.b.c.d) are
-// covered via To4.
+// IsLANIP 报告 ip 是否为 LAN/私有/环回/链路本地/多播/未指定地址，
+// 或是否落在代理服务器绝不应拨号的任何其他非公网范围内：
+// 运营商级 NAT（100.64.0.0/10）、"本网络" 范围（0.0.0.0/8）、
+// IETF 协议分配与文档网段（192.0.0.0/16，含 192.0.0.0/24 协议分配段
+// 及 192.0.1.0/24–192.0.3.0/24 文档网段）、基准测试网段（198.18.0.0/15）、
+// 文档网段（192.0.2.0/24、198.51.100.0/24、203.0.113.0/24）、
+// 保留的 240.0.0.0/4 和广播地址。
+// IPv4 检查为内联实现，因此 IPv4 映射的 IPv6 形式（::ffff:a.b.c.d）
+// 通过 To4 一并覆盖。
 func IsLANIP(ip string) bool {
 	_ip := net.ParseIP(ip)
 	if _ip == nil {
@@ -33,7 +36,7 @@ func IsLANIP(ip string) bool {
 			(ip4[0] == 169 && ip4[1] == 254) || // 169.254.0.0/16 link-local
 			(ip4[0] == 172 && ip4[1]&0xf0 == 16) || // 172.16.0.0/12
 			(ip4[0] == 192 && ip4[1] == 168) || // 192.168.0.0/16
-			(ip4[0] == 192 && ip4[1] == 0) || // 192.0.0.0/24 incl. TEST-NET-1 192.0.2.0/24
+			(ip4[0] == 192 && ip4[1] == 0) || // 192.0.0.0/16，含协议分配段 192.0.0.0/24 与文档网段 192.0.1.0/24–192.0.3.0/24
 			(ip4[0] == 198 && (ip4[1] == 18 || ip4[1] == 19)) || // 198.18.0.0/15 benchmarking
 			(ip4[0] == 198 && ip4[1] == 51 && ip4[2] == 100) || // 198.51.100.0/24 TEST-NET-2
 			(ip4[0] == 203 && ip4[1] == 0 && ip4[2] == 113) || // 203.0.113.0/24 TEST-NET-3
@@ -54,12 +57,11 @@ func IsLoopbackIP(ip string) bool {
 	return _ip.IsLoopback()
 }
 
-// IsLANHost checks whether a host address (with or without port) is a LAN/private address.
-// It is used to prevent SSRF attacks by rejecting targets that point to internal networks.
+// IsLANHost 检查主机地址（带或不带端口）是否为 LAN/私有地址。
+// 它用于通过拒绝指向内部网络的目标来防止 SSRF 攻击。
 //
-// NOTE: This is a fast, IP-only check. Domain names are NOT resolved here, so a domain
-// that resolves to a LAN address will return false. For SSRF protection against
-// domain-based bypasses, use IsLANHostResolved instead.
+// 注意：这是一个快速的纯 IP 检查。这里不会解析域名，因此解析到 LAN 地址的
+// 域名会返回 false。如需防止基于域名的绕过，请改用 IsLANHostResolved。
 func IsLANHost(addr string) bool {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -68,32 +70,29 @@ func IsLANHost(addr string) bool {
 	return IsLANIP(host)
 }
 
-// IsLANHostResolved is the SSRF-safe variant of IsLANHost: when the host is a domain
-// name rather than a literal IP, it resolves the name and rejects the request if any
-// resolved address is a LAN/private address. The fast IP-only path is used when the
-// host is already a literal IP, so the common case incurs no DNS lookup.
+// ResolveHostIPs 解析 addr（"host:port" 或裸 host）中的主机名，返回其全部地址，
+// IPv4-mapped 的 IPv6 形式折叠为 IPv4。字面 IP 直接返回该地址（保留 zone），
+// 不产生 DNS 查询。
 //
-// The provided ctx bounds the DNS resolution so a hung resolver cannot stall the
-// handshake.
-func IsLANHostResolved(ctx context.Context, addr string) bool {
+// 与旧的 IsLANHostResolved 不同，解析失败返回错误而不是「视为安全」：调用方
+// 需要自行决定放行还是失败。调用方应当校验返回的全部地址，并**只拨这些字面
+// 地址**，这样 SSRF 检查与实际连接用的是同一次解析的结果，DNS-rebinding
+// （检查时解析到公网、拨号时解析到内网）就没有可利用的窗口。
+//
+// ctx 用于约束解析；没有截止时间时套一个较短的兜底超时，这样缓慢的 DNS
+// 服务器无法无限期拖住握手或拨号。
+func ResolveHostIPs(ctx context.Context, addr string) ([]netip.Addr, error) {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
 		host = addr
 	}
-	if IsLANIP(host) {
-		return true
-	}
-	// Literal IP that is not LAN: safe.
-	if IsIP(host) {
-		return false
-	}
 	if host == "" {
-		return false
+		return nil, errors.New("empty host")
+	}
+	if ip, err := netip.ParseAddr(host); err == nil {
+		return []netip.Addr{ip.Unmap()}, nil
 	}
 
-	// Domain name: resolve and check every resulting address. A short fallback
-	// timeout is applied when the caller's ctx has no deadline, so a slow DNS
-	// server cannot hold the handshake open indefinitely.
 	resolveCtx := ctx
 	if _, ok := ctx.Deadline(); !ok {
 		var cancel context.CancelFunc
@@ -101,19 +100,30 @@ func IsLANHostResolved(ctx context.Context, addr string) bool {
 		defer cancel()
 	}
 
-	ips, err := net.DefaultResolver.LookupIPAddr(resolveCtx, host)
+	ips, err := net.DefaultResolver.LookupNetIP(resolveCtx, "ip", host)
 	if err != nil {
-		// On resolution failure, fail open (return false) so the dial layer can
-		// produce the actual error. SSRF protection relies on the next check
-		// succeeding; an unresolvable name cannot reach a LAN host anyway.
-		return false
+		return nil, err
 	}
+	addrs := make([]netip.Addr, 0, len(ips))
 	for _, ip := range ips {
-		if IsLANIP(ip.IP.String()) {
-			return true
+		addrs = append(addrs, ip.Unmap())
+	}
+	if len(addrs) == 0 {
+		return nil, fmt.Errorf("no addresses for %s", host)
+	}
+	return addrs, nil
+}
+
+// FirstLANAddr 返回 addrs 中第一个 LAN/私有/保留地址，全部为公网地址时返回
+// 零值。zone（如 fe80::1%eth0）在这里被剥掉再判定，否则 net.ParseIP 无法解析
+// 带 zone 的地址，链路本地目标会被漏判。
+func FirstLANAddr(addrs []netip.Addr) netip.Addr {
+	for _, addr := range addrs {
+		if IsLANIP(addr.WithZone("").String()) {
+			return addr
 		}
 	}
-	return false
+	return netip.Addr{}
 }
 
 func IsIPV6(ip string) bool {
@@ -134,23 +144,4 @@ func IsIPV6(ip string) bool {
 func IsIPV6Addr(addr string) bool {
 	host, _, _ := net.SplitHostPort(addr)
 	return IsIPV6(host)
-}
-
-func GetInterfaceIP(name string) (string, error) {
-	iface, err := net.InterfaceByName(name)
-	if err != nil {
-		return "", err
-	}
-	addrs, err := iface.Addrs()
-	if err != nil {
-		return "", err
-	}
-	for _, addr := range addrs {
-		if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
-			if ip4 := ipnet.IP.To4(); ip4 != nil {
-				return ip4.String(), nil
-			}
-		}
-	}
-	return "", fmt.Errorf("no ipv4 address found for interface %s", name)
 }

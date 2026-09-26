@@ -24,7 +24,10 @@ func TestIsLocalConnClosedError(t *testing.T) {
 		{"io.ErrClosedPipe", io.ErrClosedPipe, true},
 		{"use of closed network connection", errors.New("use of closed network connection"), true},
 		{"Use Of Closed Network Connection", errors.New("Use Of Closed Network Connection"), true}, // 大小写不敏感
-		{"connection reset by peer", errors.New("connection reset by peer"), true},
+		// "connection reset by peer" 属于 isTransientStreamError：它是流级别的失败，
+		// 而不是本地连接关闭。把它同时归类到两处，正是同一个错误会因先执行哪个检查
+		// 而被报告成两种不同结果的原因。
+		{"connection reset by peer", errors.New("connection reset by peer"), false},
 		{"forcibly closed by the remote host", errors.New("forcibly closed by the remote host"), true},
 		{"software caused connection abort", errors.New("software caused connection abort"), true},
 		{"connection was aborted", errors.New("connection was aborted"), true},
@@ -40,6 +43,11 @@ func TestIsLocalConnClosedError(t *testing.T) {
 				t.Errorf("isLocalConnClosedError(%v) = %v, want %v", tt.err, got, tt.want)
 			}
 		})
+	}
+
+	// reset 情形是瞬态的，且仅此而已。
+	if !isTransientStreamError(errors.New("connection reset by peer")) {
+		t.Error("isTransientStreamError(connection reset by peer) = false, want true")
 	}
 }
 
@@ -152,7 +160,7 @@ func TestIsDNSResponse(t *testing.T) {
 	}{
 		{"Response=true", makeMsg(true), true},
 		{"Response=false", makeMsg(false), false},
-		{"无 Question", &dns.Msg{MsgHdr: dns.MsgHdr{Response: true}}, false},
+		{"无 Question", &dns.Msg{Response: true}, false},
 	}
 
 	for _, tt := range tests {
@@ -165,14 +173,8 @@ func TestIsDNSResponse(t *testing.T) {
 	}
 }
 
-// ParseAddress 委托给 socks5.ParseAddress，此处仅验证代理不 panic
-func TestParseAddress(t *testing.T) {
-	_, _, _, _ = ParseAddress("example.com:80")
-	// 纯 delegate 调用，只验证不 panic
-}
-
 func TestIsServerDomain(t *testing.T) {
-	s := &Socks5Server{serverDomain: "mysite.net"}
+	s := &dnsInterceptor{serverDomain: "mysite.net"}
 	tests := []struct {
 		name   string
 		domain string
@@ -192,7 +194,7 @@ func TestIsServerDomain(t *testing.T) {
 		})
 	}
 
-	empty := &Socks5Server{serverDomain: ""}
+	empty := &dnsInterceptor{serverDomain: ""}
 	if empty.isServerDomain("mysite.net") {
 		t.Error("isServerDomain should be false when serverDomain is empty")
 	}

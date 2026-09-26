@@ -17,7 +17,7 @@ func BuildSimpleConfig(s *sharedconfig.SimpleConfig) (*ClientConfig, error) {
 		return nil, fmt.Errorf("password is required")
 	}
 
-	proto, err := outboundProtoToProtocol(s.OutboundProto)
+	proto, err := OutboundProtoToProtocol(s.OutboundProto)
 	if err != nil {
 		return nil, err
 	}
@@ -50,8 +50,9 @@ func BuildSimpleConfig(s *sharedconfig.SimpleConfig) (*ClientConfig, error) {
 			ProxyFile:  s.ProxyFile,
 		},
 		Transport: TransportConfig{
-			Protocol:     proto,
-			ConnCountMax: sharedconfig.DefaultConnCountMax,
+			Protocol:      proto,
+			ConnCountMax:  sharedconfig.DefaultConnCountMax,
+			DisableWarmUp: s.DisableWarmUp,
 		},
 		Shaper: ShaperConfig{
 			BatchWindowMS: sharedconfig.DefaultBatchWindowMS,
@@ -152,6 +153,9 @@ func ApplySimpleOverrides(cfg *ClientConfig, s *sharedconfig.SimpleConfig) {
 	if s.DisableSysProxy {
 		cfg.Local.DisableSysProxy = true
 	}
+	if s.DisableWarmUp {
+		cfg.Transport.DisableWarmUp = true
+	}
 	if s.EnableForwardDNS {
 		cfg.Local.EnableForwardDNS = true
 	}
@@ -163,9 +167,6 @@ func ApplySimpleOverrides(cfg *ClientConfig, s *sharedconfig.SimpleConfig) {
 	}
 	if s.BindAll {
 		cfg.Local.BindAll = true
-	}
-	if s.OutboundProto != "" {
-		cfg.Transport.Protocol = sharedconfig.DefaultProtocol
 	}
 	if s.TunConfig != "" {
 		cfg.Local.TunConfig = jsonTunConfig(s.TunConfig)
@@ -211,10 +212,13 @@ func jsonTunConfig(s string) json.RawMessage {
 	return json.RawMessage(s)
 }
 
-func outboundProtoToProtocol(proto string) (string, error) {
+// OutboundProtoToProtocol 将面向用户的 outbound_proto 值映射为传输协议。
+// 目前只实现了 h2，因此 "native"（历史上的空值）和 "h2" 都选中它——该映射
+// 由配置文件与 --outbound-proto 标志共用，两者不会发生偏离。
+func OutboundProtoToProtocol(proto string) (string, error) {
 	switch proto {
 	case "", "native":
-		return "", nil
+		return sharedconfig.DefaultProtocol, nil
 	case sharedconfig.DefaultProtocol:
 		return sharedconfig.DefaultProtocol, nil
 	default:

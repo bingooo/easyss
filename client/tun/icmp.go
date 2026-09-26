@@ -45,20 +45,66 @@ func (h *ICMPHandler) HandlePacket(pkt adapter.Packet) bool {
 	id := pkt.ID()
 	dstAddr := id.LocalAddress.String()
 
-	rule := h.router.MatchHostRule(dstAddr)
+	// 只有 echo 请求才值得用 INFO 级别记录路由决策：其他 ICMP 类型（echo 回复、
+	// 错误、邻居发现）永远不会被代理，tun2socks 的默认 forwarder 反正也会丢弃
+	// 它们，所以把它们的分类结果记成 INFO 日志既无解释意义，又会刷屏日志。局域网
+	// 网关每秒探测一次本机就足以产生每秒数条这样的日志，因为内核对这些探测的回复
+	// 会被路由进 TUN 设备（参见 create_tun_dev.sh 中的路由说明）。
+	icmpType, echoRequest := icmpEchoRequest(pkt)
+	if !echoRequest {
+		log.Debug("[ICMP_DROP]", "dst", dstAddr, "type", icmpType, "reason", "non-echo")
+		return false
+	}
 
-	switch rule {
+	// IPv6 策略门禁属于共享分类的一部分：当 ipv6_rule 禁用 IPv6 时，发往
+	// 字面 IPv6 地址的 ICMP echo 必须以与 SOCKS5/HTTP 路径相同的条件被拒绝。
+	cls := h.router.ClassifyHost(dstAddr)
+	if cls.IPV6Rejected {
+		log.Info("[ICMP_BLOCK] ipv6 target rejected, ipv6 disabled", "dst", dstAddr, "type", icmpType)
+		return true
+	}
+
+	switch cls.Rule {
 	case router.HostRuleDirect:
-		log.Info("[ICMP_DIRECT]", "dst", dstAddr)
+		log.Info("[ICMP_DIRECT]", "dst", dstAddr, "type", icmpType)
 		return false
 	case router.HostRuleBlock:
-		log.Info("[ICMP_BLOCK] blocked", "dst", dstAddr)
+		log.Info("[ICMP_BLOCK] blocked", "dst", dstAddr, "type", icmpType)
 		return true
 	case router.HostRuleProxy:
-		log.Info("[ICMP_PROXY]", "dst", dstAddr)
+		log.Info("[ICMP_PROXY]", "dst", dstAddr, "type", icmpType)
 		return h.handleProxyICMP(pkt)
 	default:
+		log.Debug("[ICMP_DROP]", "dst", dstAddr, "type", icmpType, "reason", "no-rule")
 		return false
+	}
+}
+
+// icmpEchoRequest 报告 pkt 是否为 ICMPv4/ICMPv6 echo 请求——这是本 handler
+// 唯一能路由或代理的 ICMP 报文——并返回其 ICMP 类型用于日志记录。短到装不下
+// ICMP 头的报文一律视为非 echo，与 handleProxyICMP 中的头部检查保持一致。
+func icmpEchoRequest(pkt adapter.Packet) (icmpType uint8, ok bool) {
+	buf := pkt.Buffer()
+	if buf == nil {
+		return 0, false
+	}
+
+	transHdr := buf.TransportHeader().Slice()
+	switch buf.NetworkProtocolNumber {
+	case ipv4.ProtocolNumber:
+		if len(transHdr) < header.ICMPv4MinimumSize {
+			return 0, false
+		}
+		t := header.ICMPv4(transHdr).Type()
+		return uint8(t), t == header.ICMPv4Echo
+	case header.IPv6ProtocolNumber:
+		if len(transHdr) < header.ICMPv6HeaderSize {
+			return 0, false
+		}
+		t := header.ICMPv6(transHdr).Type()
+		return uint8(t), t == header.ICMPv6EchoRequest
+	default:
+		return 0, false
 	}
 }
 
@@ -110,9 +156,8 @@ func (h *ICMPHandler) processProxyICMP(s *stack.Stack, id stack.TransportEndpoin
 
 	netProto := pkt.NetworkProtocolNumber
 
-	// PayloadSince returns the full ICMP message including the header
-	// (type+code+checksum+id+seq+data). The server expects just the echo body
-	// (id+seq+data), so strip the leading 4 bytes (type+code+checksum).
+	// PayloadSince 返回完整的 ICMP 报文，包含头部（type+code+checksum+id+seq+data）。
+	// 服务端只需要 echo 体（id+seq+data），因此去掉开头的 4 字节（type+code+checksum）。
 	payloadView := stack.PayloadSince(pkt.TransportHeader())
 	fullICMP := payloadView.AsSlice()
 

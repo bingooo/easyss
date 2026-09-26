@@ -28,42 +28,12 @@ type coverInjector struct {
 	stopped          atomic.Bool
 }
 
+// newCoverInjector 为已规范化的配置构建 cover 流量注入器
+// （参见 Config.Normalize，它是 cover 默认值的唯一出处）。
+// BudgetRatio 为零时禁用 cover 流量。
 func newCoverInjector(cfg CoverConfig, inject func(protocol.Frame) error, isClosing func() bool) *coverInjector {
 	if cfg.BudgetRatio == 0 {
 		return nil
-	}
-	if cfg.BudgetRatio < 0 || cfg.BudgetRatio > 1 {
-		cfg.BudgetRatio = 0.03
-	}
-	if cfg.IdleTimeout <= 0 {
-		cfg.IdleTimeout = 300
-	}
-	if cfg.MinSize <= 0 {
-		cfg.MinSize = 128
-	}
-	if cfg.MaxSize <= 0 {
-		cfg.MaxSize = 1500
-	}
-	if cfg.MaxSize < cfg.MinSize {
-		cfg.MaxSize = cfg.MinSize
-	}
-	// Clamp to the wire format: Frame.Length is uint16, so a payload larger
-	// than 65535 would be truncated in the frame header and corrupt the
-	// record stream, and sizes beyond the bytes-pool ceiling (128KB) would
-	// make bytespool.Get return nil and panic on slicing. The budget cap
-	// bounds cover frames in the default configuration, but a misconfigured
-	// budget_cap must not be able to break the stream.
-	if cfg.MinSize > protocol.MaxUDPDataSize {
-		cfg.MinSize = protocol.MaxUDPDataSize
-	}
-	if cfg.MaxSize > protocol.MaxUDPDataSize {
-		cfg.MaxSize = protocol.MaxUDPDataSize
-	}
-	if cfg.MaxSize < cfg.MinSize {
-		cfg.MaxSize = cfg.MinSize
-	}
-	if cfg.BudgetCap <= 0 {
-		cfg.BudgetCap = 16 * 1024
 	}
 
 	ci := &coverInjector{
@@ -147,16 +117,14 @@ func (ci *coverInjector) onIdle() {
 	ci.mu.Unlock()
 
 	payload := bytespool.Get(frameSize)[:frameSize]
-	// The package-level RNG is shared across streams; math/rand/v2 sources
-	// are not safe for concurrent use, so guard the fill with a mutex.
+	// 包级 RNG 在多个流之间共享；math/rand/v2 的随机源不适合并发使用，
+	// 因此用互斥锁保护填充操作。
 	coverRNGMu.Lock()
 	_, _ = coverRNG.Read(payload)
 	coverRNGMu.Unlock()
-	frame := protocol.Frame{
-		Type:    protocol.FrameCOVER,
-		Length:  uint16(frameSize),
-		Payload: payload,
-	}
+	// NewFrameWithPayload 直接包装池化缓冲区而不复制：整形器在追加该帧后
+	// 会将这个缓冲区原样归还池。
+	frame := protocol.NewFrameWithPayload(protocol.FrameCOVER, payload)
 	_ = ci.inject(frame)
 }
 
@@ -168,9 +136,9 @@ func (ci *coverInjector) coverFrameSizeRange() (minSize, maxSize int) {
 	cfgMin, cfgMax := ci.cfg.MinSize, ci.cfg.MaxSize
 	span := float64(cfgMax - cfgMin)
 
-	// 初始阶段以接近 cfgMin 的小尺寸为主,模拟空闲连接的小数据包特征;
+	// 初始阶段以接近 cfgMin 的小尺寸为主，模拟空闲连接的小数据包特征；
 	// 随累计真实流量平滑过渡到接近真实 DATA 帧的尺寸分布。
-	// 默认配置(MinSize=128, MaxSize=1500)下:
+	// 默认配置（MinSize=128, MaxSize=1500）下：
 	//   ratio=0 -> [128, 509],  ratio=1 -> [512, 1500]
 	const (
 		minSteadyRatio = 0.28

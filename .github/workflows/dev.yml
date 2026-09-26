@@ -34,8 +34,8 @@ jobs:
       - name: golangci-lint
         run: make lint
 
-      - name: Test
-        run: make test
+      - name: Test (race)
+        run: make test-race
 
       - name: Set up Java
         uses: actions/setup-java@v5
@@ -49,13 +49,11 @@ jobs:
           export PATH="$(go env GOPATH)/bin:$PATH"
           gomobile init
 
-      - name: Build
-        run: make .PHONY
+      - name: Build (all platforms)
+        run: make build
 
-      - name: Build Linux Arm64
-        run: |
-          GOOS=linux GOARCH=arm64 make easyss
-          GOOS=linux GOARCH=arm64 make easyss-server
+      - name: Build Android AAR
+        run: make easyss-android-aar
 
   test-macos:
     name: Test-MacOS
@@ -81,8 +79,8 @@ jobs:
       - name: golangci-lint
         run: make lint
 
-      - name: Test
-        run: make test
+      - name: Test (race)
+        run: make test-race
 
   test-windows:
     name: Test-Windows
@@ -108,8 +106,8 @@ jobs:
       - name: golangci-lint
         run: make lint
 
-      - name: Test
-        run: go test -v ./...
+      - name: Test (race)
+        run: make test-race
 
   test-windows-arm64:
     name: Test-Windows-Arm64
@@ -122,5 +120,36 @@ jobs:
         with:
           go-version-file: 'go.mod'
 
+      # The Go race detector is not supported on windows/arm64 (only
+      # windows/amd64), so this job runs the plain tests with a longer
+      # timeout suited to the ARM runner.
       - name: Test
         run: go test -v -timeout 30m ./...
+
+  test-headless-linux:
+    name: Test-Headless-Linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Cache go module
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      # headless (Android / no tray) only changes which files compile into
+      # cmd/easyss; every other package is identical under the tag. The target
+      # vets the whole module with it (which is what catches a test file
+      # referencing a tray-only symbol) and runs the cmd/easyss tests.
+      - name: Test (race)
+        run: make test-race-headless

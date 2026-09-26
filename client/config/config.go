@@ -15,14 +15,27 @@ import (
 	"github.com/nange/easyss/v3/util"
 )
 
-// DirectDNSServers are the public DNS servers used for direct (non-proxied) DNS lookups.
-var DirectDNSServers = []string{"223.5.5.53:53", "119.29.29.29:53", "[2400:3200::1]:53", "[2400:3200:baba::1]:53"}
+// DirectDNSServers 是用于直连（不走代理）DNS 查询的公共 DNS 服务器列表。
+// IPv4 项在前、IPv6 项在后，顺序是唯一的优先级依据：服务端域名的预解析按顺序
+// 串行尝试（见 dns.Cache.PrePopulateWithFallback），在线查询则把整个列表并发
+// 下发、取首个成功结果（见 dns.QueryWithBuiltinFirst 与 proxy.resolveDirectDNS）。
+// 区域内可达性有差异的服务器（如北京联通 123.123.123.123）排在国家级公共 DNS 之后。
+var DirectDNSServers = []string{
+	"223.5.5.5:53",       // AliDNS
+	"119.29.29.29:53",    // DNSPod
+	"114.114.114.114:53", // 114DNS
+	"123.123.123.123:53", // 北京联通递归 DNS
+	"[2400:3200::1]:53",
+	"[2400:3200:baba::1]:53",
+}
 
-// ProxyDNSServer is the upstream DNS server used when proxying DNS queries through the tunnel.
+// ProxyDNSServer 是通过隧道代理 DNS 查询时使用的上游 DNS 服务器。
 const ProxyDNSServer = "8.8.8.8:53"
 
-// DefaultSystemDNS is the DNS server set on the system when TUN mode starts on Darwin.
-// It corresponds to the first entry of DirectDNSServers without the port.
+// DefaultSystemDNS 是写入系统解析器配置的保底裸 IPv4，等于 DirectDNSServers
+// 中第一个 IPv4 项。TUN 启动时实际取值优先用 dns.PreferredSystemDNS()——本会话
+// 实测可达的内置直连 DNS，其次是实测可达的系统 DNS（DHCP/内网解析器，覆盖
+// "全部内置 DNS 都不可用"的网络）——两者都没有记录时才回退到这里。
 const DefaultSystemDNS = "223.5.5.5"
 
 type ServerProfile struct {
@@ -58,8 +71,12 @@ type TransportConfig struct {
 	ConnCountMax      int     `json:"conn_count_max"`
 	StreamThreshold   int     `json:"stream_threshold"`
 	PrioritySlotRatio float64 `json:"priority_slot_ratio"`
-	ConnLifetimeSec   int     `json:"conn_lifetime_sec"` // max connection lifetime in seconds, 0 uses default
-	ConnMaxBytes      int64   `json:"conn_max_bytes"`    // max bytes carried by a connection in either direction, 0 uses default
+	ConnLifetimeSec   int     `json:"conn_lifetime_sec"` // 连接的最大生命周期（秒），0 表示使用默认值
+	ConnMaxBytes      int64   `json:"conn_max_bytes"`    // 连接在任一方向上承载的最大字节数，0 表示使用默认值
+	// DisableWarmUp 用于禁用传输层连接池的后台预热，该预热由 runner.Run 在核心
+	// 启动完成后派发（所使用的取值参见 config.WarmUpTimeout / config.WarmUpStartDelay）。
+	// false 是零值，因此在该选项出现之前写入的配置文件会保持预热开启。
+	DisableWarmUp bool `json:"disable_warm_up"`
 }
 
 type ShaperConfig struct {
@@ -209,18 +226,8 @@ func applyDefaults(c *ClientConfig) {
 	if c.Transport.ConnMaxBytes <= 0 {
 		c.Transport.ConnMaxBytes = config.DefaultConnMaxBytes
 	}
-	if c.Shaper.BatchWindowMS <= 0 {
-		c.Shaper.BatchWindowMS = config.DefaultBatchWindowMS
-	}
-	if c.Shaper.BatchWindowMS > 10 {
-		c.Shaper.BatchWindowMS = 10
-	}
-	if c.Shaper.CoverBudgetRatio <= 0 || c.Shaper.CoverBudgetRatio > 1 {
-		c.Shaper.CoverBudgetRatio = config.DefaultCoverBudgetRatio
-	}
-	if c.Shaper.CoverBudgetCap <= 0 {
-		c.Shaper.CoverBudgetCap = config.DefaultCoverBudgetCap
-	}
+	// shaper 设置在构建 shaper 时归一化（shaper.Config.Normalize），
+	// 由它持有这些默认值与边界；在这里再保留一份副本正是导致两者偏离的原因。
 	if c.Routing.ProxyRule == "" {
 		c.Routing.ProxyRule = config.DefaultProxyRule
 	}
@@ -240,11 +247,10 @@ func applyDefaults(c *ClientConfig) {
 	}
 }
 
-// ResolveFilePaths resolves relative file paths in the config against the
-// executable directory when they cannot be found in the current working
-// directory. On macOS the app is often launched by Finder/launchd with cwd=/,
-// so relative paths like direct.txt, proxy.txt or ca_path would otherwise not
-// be found even though the files sit next to the binary/.app bundle.
+// ResolveFilePaths 将配置中的相对文件路径解析为相对可执行文件目录的路径，
+// 前提是这些路径无法在当前工作目录中找到。在 macOS 上应用常由 Finder/launchd
+// 以 cwd=/ 启动，因此 direct.txt、proxy.txt 或 ca_path 等相对路径即使与
+// 二进制/.app bundle 位于同一目录，也照样无法被找到。
 func (c *ClientConfig) ResolveFilePaths() {
 	c.Routing.DirectFile = util.ResolvePath(c.Routing.DirectFile)
 	c.Routing.ProxyFile = util.ResolvePath(c.Routing.ProxyFile)

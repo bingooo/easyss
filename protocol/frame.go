@@ -142,113 +142,77 @@ func (f Frame) EncodedLen() int {
 	return FrameHeaderSize + int(f.Length)
 }
 
-func ReadFrame(r io.Reader) (Frame, error) {
-	var header [FrameHeaderSize]byte
-	if _, err := io.ReadFull(r, header[:]); err != nil {
-		return Frame{}, err
+// DecodeFrame 从 data 头部解码一个帧。它是记录层的非流式对应物：解密的
+// CryptoRecord 在内存中切分，因此不涉及 io.Reader。返回帧、其占用的字节数
+// 以及错误。帧的 payload 别名自 data，其生命周期由调用方负责。
+func DecodeFrame(data []byte) (Frame, int, error) {
+	if len(data) < FrameHeaderSize {
+		return Frame{}, 0, io.ErrUnexpectedEOF
 	}
-	ftype := FrameType(header[0])
-	length := binary.BigEndian.Uint16(header[1:3])
-
-	if ftype == FramePADDING || ftype == FrameCOVER {
-		if length > 0 {
-			if _, err := io.CopyN(io.Discard, r, int64(length)); err != nil {
-				return Frame{}, err
-			}
-		}
-		return Frame{
-			Type:   ftype,
-			Length: length,
-		}, nil
+	ftype := FrameType(data[0])
+	length := int(binary.BigEndian.Uint16(data[1:3]))
+	encoded := FrameHeaderSize + length
+	if encoded > len(data) {
+		return Frame{}, 0, io.ErrUnexpectedEOF
 	}
 
-	payload := make([]byte, length)
+	f := Frame{Type: ftype, Length: uint16(length)}
 	if length > 0 {
-		if _, err := io.ReadFull(r, payload); err != nil {
-			return Frame{}, err
-		}
+		f.Payload = data[FrameHeaderSize:encoded]
 	}
-
-	return Frame{
-		Type:    ftype,
-		Length:  length,
-		Payload: payload,
-	}, nil
+	return f, encoded, nil
 }
 
-func WriteFrame(w io.Writer, f Frame) error {
-	var header [FrameHeaderSize]byte
-	header[0] = byte(f.Type)
-	binary.BigEndian.PutUint16(header[1:3], f.Length)
-	if _, err := w.Write(header[:]); err != nil {
-		return err
+// NewFrame 构建给定类型的帧，并复制 payload，使调用方可以复用其缓冲区
+// （shaper 交出的是 bytespool 缓冲区）。Length 始终由 payload 推导，
+// 因此线上的头部永远不可能与随后写入的字节不一致。
+func NewFrame(typ FrameType, payload []byte) Frame {
+	return NewFrameWithPayload(typ, append([]byte(nil), payload...))
+}
+
+// NewFrameWithPayload 包装现有 payload 缓冲区而不复制，供持有池化缓冲区
+// （cover 流量）的调用方使用：必须原样交给 shaper，以便归还池中。
+func NewFrameWithPayload(typ FrameType, payload []byte) Frame {
+	checkPayloadLen(payload)
+	return Frame{
+		Type:    typ,
+		Length:  uint16(len(payload)),
+		Payload: payload,
 	}
-	if f.Length > 0 {
-		n, err := w.Write(f.Payload)
-		if err != nil {
-			return err
-		}
-		if n != len(f.Payload) {
-			return io.ErrShortWrite
-		}
+}
+
+// NewZeroFrame 构建给定类型的帧，payload 为 length 字节的零值缓冲区，
+// 供随后再填充缓冲区的调用方使用（padding）。
+func NewZeroFrame(typ FrameType, length uint16) Frame {
+	return Frame{
+		Type:    typ,
+		Length:  length,
+		Payload: make([]byte, length),
 	}
-	return nil
 }
 
 func NewFrameDATA(data []byte) Frame {
-	checkPayloadLen(data)
-	payload := append([]byte(nil), data...)
-	return Frame{
-		Type:    FrameDATA,
-		Length:  uint16(len(payload)),
-		Payload: payload,
-	}
+	return NewFrame(FrameDATA, data)
 }
 
 func NewFrameDATAGRAM(data []byte) Frame {
-	checkPayloadLen(data)
-	payload := append([]byte(nil), data...)
-	return Frame{
-		Type:    FrameDATAGRAM,
-		Length:  uint16(len(payload)),
-		Payload: payload,
-	}
+	return NewFrame(FrameDATAGRAM, data)
 }
 
 func NewFrameFIN() Frame {
-	return Frame{Type: FrameFIN, Length: 0}
+	return Frame{Type: FrameFIN}
 }
 
 func NewFrameRST() Frame {
-	return Frame{Type: FrameRST, Length: 0}
+	return Frame{Type: FrameRST}
 }
 
 func NewFramePADDING(length uint16) Frame {
-	payload := make([]byte, length)
-	return Frame{
-		Type:    FramePADDING,
-		Length:  length,
-		Payload: payload,
-	}
-}
-
-func NewFrameCOVER(length uint16) Frame {
-	payload := make([]byte, length)
-	return Frame{
-		Type:    FrameCOVER,
-		Length:  length,
-		Payload: payload,
-	}
+	return NewZeroFrame(FramePADDING, length)
 }
 
 func NewFrameHANDSHAKE(h Handshake) Frame {
-	payload := h.Encode()
-	checkPayloadLen(payload)
-	return Frame{
-		Type:    FrameHANDSHAKE,
-		Length:  uint16(len(payload)),
-		Payload: payload,
-	}
+	return NewFrame(FrameHANDSHAKE, h.Encode())
 }
 
 func checkPayloadLen(payload []byte) {
@@ -257,37 +221,27 @@ func checkPayloadLen(payload []byte) {
 	}
 }
 
-// AppendFrame appends a single frame (header + payload) to buf without
-// resetting existing content. This is the append-only variant of EncodeFrames
-// suitable for incrementally building a record buffer.
+// AppendFrame 把单个帧（头部 + payload）追加到 buf，不重置已有内容。
+// 这是唯一的帧编码路径：头部由 len(f.Payload) 推导而非 f.Length，
+// 因此两个字段不一致的 Frame（例如刚从线上解码出来的）永远不会产生
+// 损坏的记录。
 func AppendFrame(buf []byte, f Frame) []byte {
 	var header [FrameHeaderSize]byte
 	header[0] = byte(f.Type)
-	binary.BigEndian.PutUint16(header[1:3], f.Length)
+	binary.BigEndian.PutUint16(header[1:3], uint16(len(f.Payload)))
 	buf = append(buf, header[:]...)
 	return append(buf, f.Payload...)
 }
 
+// EncodeFrames 把一组帧编码进单个新缓冲区。
 func EncodeFrames(frames []Frame) []byte {
-	return EncodeFramesToBuf(frames, nil)
-}
-
-func EncodeFramesToBuf(frames []Frame, buf []byte) []byte {
 	total := 0
 	for _, f := range frames {
-		total += f.EncodedLen()
+		total += FrameHeaderSize + len(f.Payload)
 	}
-	if cap(buf) < total {
-		buf = make([]byte, 0, total)
-	} else {
-		buf = buf[:0]
-	}
+	buf := make([]byte, 0, total)
 	for _, f := range frames {
-		var header [FrameHeaderSize]byte
-		header[0] = byte(f.Type)
-		binary.BigEndian.PutUint16(header[1:3], f.Length)
-		buf = append(buf, header[:]...)
-		buf = append(buf, f.Payload...)
+		buf = AppendFrame(buf, f)
 	}
 	return buf
 }

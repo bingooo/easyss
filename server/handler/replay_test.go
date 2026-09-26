@@ -20,9 +20,8 @@ func TestSaltCache_MarkSeen(t *testing.T) {
 		t.Fatal("second MarkSeen of the same salt should report seen (replay)")
 	}
 
-	// The same salt on a different endpoint must not be treated as a replay:
-	// the per-endpoint AAD makes that record undecryptable, and burning the
-	// entry would let an attacker evict another endpoint's protection.
+	// 同一 salt 出现在不同端点上时不能视为重放：
+	// 按端点区分的 AAD 使该记录无法解密，而烧掉该条目会让攻击者逐出另一端点的防护。
 	if c.MarkSeen("/v3/udp", salt) {
 		t.Fatal("the same salt on a different endpoint should report not-seen")
 	}
@@ -36,7 +35,7 @@ func TestSaltCache_MarkSeen(t *testing.T) {
 func TestSaltCache_DistinctSalts(t *testing.T) {
 	c := newSaltCache()
 	rng := rand.New(rand.NewSource(42))
-	for i := 0; i < 1000; i++ {
+	for range 1000 {
 		buf := make([]byte, 16)
 		_, _ = rng.Read(buf)
 		salt := base64.RawURLEncoding.EncodeToString(buf)
@@ -46,9 +45,9 @@ func TestSaltCache_DistinctSalts(t *testing.T) {
 	}
 }
 
-// TestSaltCache_ConcurrentMarkSeen verifies the check-and-set is atomic:
-// concurrent requests carrying the same salt must observe exactly one
-// not-seen result (regression test for the Get/Set TOCTOU).
+// TestSaltCache_ConcurrentMarkSeen 验证 check-and-set 的原子性：
+// 携带同一 salt 的并发请求必须恰好观察到一次 not-seen 结果
+// （针对 Get/Set TOCTOU 的回归测试）。
 func TestSaltCache_ConcurrentMarkSeen(t *testing.T) {
 	c := newSaltCache()
 	salt := base64.RawURLEncoding.EncodeToString(make([]byte, 16))
@@ -56,7 +55,7 @@ func TestSaltCache_ConcurrentMarkSeen(t *testing.T) {
 
 	start := make(chan struct{})
 	results := make(chan bool, goroutines)
-	for i := 0; i < goroutines; i++ {
+	for range goroutines {
 		go func() {
 			<-start
 			results <- c.MarkSeen("/v3/tcp", salt)
@@ -65,7 +64,7 @@ func TestSaltCache_ConcurrentMarkSeen(t *testing.T) {
 	close(start)
 
 	seen := 0
-	for i := 0; i < goroutines; i++ {
+	for range goroutines {
 		if <-results {
 			seen++
 		}
@@ -80,7 +79,7 @@ func TestIPRateLimiter_BurstThenReject(t *testing.T) {
 	l := newIPRateLimiter()
 	l.now = func() time.Time { return now }
 
-	for i := 0; i < handshakeBurst; i++ {
+	for i := range handshakeBurst {
 		if !l.Allow("1.2.3.4") {
 			t.Fatalf("request %d within burst should be allowed", i)
 		}
@@ -95,14 +94,14 @@ func TestIPRateLimiter_Refill(t *testing.T) {
 	l := newIPRateLimiter()
 	l.now = func() time.Time { return now }
 
-	for i := 0; i < handshakeBurst; i++ {
+	for range handshakeBurst {
 		l.Allow("1.2.3.4")
 	}
 
-	// Advance 1s: exactly handshakeRate tokens are replenished.
+	// 前进 1 秒：恰好补充 handshakeRate 个令牌。
 	now = now.Add(time.Second)
 	allowed := 0
-	for i := 0; i < int(handshakeRate); i++ {
+	for range int(handshakeRate) {
 		if l.Allow("1.2.3.4") {
 			allowed++
 		}
@@ -120,7 +119,7 @@ func TestIPRateLimiter_PerIPIsolation(t *testing.T) {
 	l := newIPRateLimiter()
 	l.now = func() time.Time { return now }
 
-	for i := 0; i < handshakeBurst; i++ {
+	for range handshakeBurst {
 		l.Allow("1.2.3.4")
 	}
 	if l.Allow("1.2.3.4") {

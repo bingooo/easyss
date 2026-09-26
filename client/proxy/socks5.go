@@ -2,11 +2,8 @@ package proxy
 
 import (
 	"context"
-	"errors"
 	"io"
 	"net"
-	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -14,9 +11,6 @@ import (
 	"github.com/nange/easyss/v3/config"
 	"github.com/nange/easyss/v3/log"
 	"github.com/nange/easyss/v3/protocol"
-	"github.com/nange/easyss/v3/relay"
-	"github.com/nange/easyss/v3/util"
-	"github.com/nange/easyss/v3/util/bytespool"
 	"github.com/txthinking/socks5"
 
 	easydns "github.com/nange/easyss/v3/client/dns"
@@ -27,68 +21,120 @@ type Socks5Server struct {
 
 	handler           *StreamHandler
 	router            *router.Router
-	dnsCache          *easydns.Cache
-	serverDomain      string
+	policy            *routePolicy
+	dns               *dnsInterceptor
 	method            protocol.Method
 	disableQUIC       bool
 	directDialContext func(context.Context, string, string) (net.Conn, error)
 	dialTimeout       time.Duration
+	// streamIdleTimeout 限制直连 TCP 中继的空闲时长；由用户配置的基础超时经
+	// config.StreamIdleTimeout 派生而来，使直连路径与代理路径的流空闲超时一致。
+	streamIdleTimeout time.Duration
 
-	udpMu          sync.RWMutex
-	udpExch        map[string]*UDPExchange
-	udpInflight    map[string]*udpExchangeFactory
-	directUDP      map[string]*directUDPConn
-	quit           chan struct{}
-	closeOnce      sync.Once
+	// udp 管理两类 UDP 会话（经隧道的代理交换与直连 socket）及其空闲回收；
+	// SOCKS5 UDP 中继与 DNS 拦截共用它（见 udp_pool.go）。
+	udp            *udpPool
 	udpIdleTimeout time.Duration
-	// dnsRespTimeout bounds how long a proxied-DNS exchange may go without
-	// any server response before it is closed (read-idle timeout). Only DNS
-	// exchanges enable it; 0 disables the mechanism. It exists because the
-	// 60s udpIdleTimeout never fires for exchanges whose client keeps
-	// retrying queries (each Send refreshes lastSeen) while the upstream DNS
-	// server stays silent.
-	dnsRespTimeout time.Duration
-	started        atomic.Bool
-	closing        atomic.Bool
+	// started 记录 Start 已被派发（见 MarkStarted）：Close 依赖它区分
+	// "从未启动"与"启动后立刻关闭"两条路径（见 socks5_lifecycle.go）。
+	started atomic.Bool
 }
 
-// directUDPConn pairs a direct-UDP socket with its last-write timestamp so
-// the cleanup loop can recycle sessions whose remote peer went silent.
-type directUDPConn struct {
-	conn     net.Conn
-	lastSeen atomic.Int64 // UnixNano, refreshed on every datagram written
+// Socks5Options 用于配置 NewSocks5Server。它取代了一个已增长到十四个参数的
+// 位置参数列表——其中四个从同一个基础超时派生的时长可能被悄悄弄混。
+type Socks5Options struct {
+	ListenAddr string
+	Username   string
+	Password   string
+	Handler    *StreamHandler
+	Router     *router.Router
+	// ServerDomain 是代理服务器自身的主机名（为字面 IP 时是 ""）：针对它的 DNS
+	// 查询绝不能走代理路径。
+	ServerDomain string
+	Method       protocol.Method
+	// DisableQUIC 置为 true 时屏蔽 QUIC（HTTP/3）：启用后所有发往 443 端口的
+	// UDP 数据报都会被丢弃（见 handleUDP），与路由规则无关。
+	DisableQUIC bool
+	// Timeouts 保存所有派生的时长（拨号、TCP/UDP 空闲、DNS 响应）。参见
+	// config.NewTimeouts。
+	Timeouts config.Timeouts
+	// DNSCache 是调用方（runner）持有的共享 DNS 缓存：预解析（PrePopulate）与
+	// DNS pinning 地址发布都由调用方直接驱动，代理服务器只是它的一个使用者。
+	// 为 nil 时按 ServerDomain 自建，供独立使用本类型的调用方与测试使用。
+	DNSCache *easydns.Cache
+	// DirectDialContext 打开直连连接；为 nil 时使用普通的 net.Dialer。
+	DirectDialContext func(ctx context.Context, network, addr string) (net.Conn, error)
 }
 
-func NewSocks5Server(listenAddr, username, password string, handler *StreamHandler, rt *router.Router, serverDomain string, method protocol.Method, disableQUIC bool, dialTimeout, udpIdleTimeout, dnsRespTimeout time.Duration, directDialContext func(context.Context, string, string) (net.Conn, error)) (*Socks5Server, error) {
+func NewSocks5Server(opts Socks5Options) (*Socks5Server, error) {
+	dialTimeout := opts.Timeouts.Dial
 	if dialTimeout <= 0 {
-		dialTimeout = 10 * time.Second
+		dialTimeout = config.DefaultDialTimeout
 	}
+	udpIdleTimeout := opts.Timeouts.UDPIdle
 	if udpIdleTimeout <= 0 {
-		udpIdleTimeout = 30 * time.Second
+		udpIdleTimeout = config.DefaultUDPIdleTimeout
 	}
+	streamIdleTimeout := opts.Timeouts.StreamIdle
+	if streamIdleTimeout <= 0 {
+		streamIdleTimeout = config.DefaultStreamIdleTimeout
+	}
+	directDialContext := opts.DirectDialContext
 	if directDialContext == nil {
 		directDialContext = defaultDirectDialContext
 	}
+	serverDomain := opts.ServerDomain
 	if net.ParseIP(serverDomain) != nil {
 		serverDomain = ""
 	}
 	s := &Socks5Server{
-		handler:           handler,
-		router:            rt,
-		dnsCache:          easydns.NewCache(serverDomain),
-		serverDomain:      serverDomain,
-		method:            method,
-		disableQUIC:       disableQUIC,
+		handler:           opts.Handler,
+		router:            opts.Router,
+		method:            opts.Method,
+		disableQUIC:       opts.DisableQUIC,
 		directDialContext: directDialContext,
 		dialTimeout:       dialTimeout,
-		udpExch:           make(map[string]*UDPExchange),
-		udpInflight:       make(map[string]*udpExchangeFactory),
-		directUDP:         make(map[string]*directUDPConn),
-		quit:              make(chan struct{}),
+		streamIdleTimeout: streamIdleTimeout,
 		udpIdleTimeout:    udpIdleTimeout,
-		dnsRespTimeout:    dnsRespTimeout,
 	}
-	srv, err := socks5.NewClassicServer(listenAddr, "127.0.0.1", username, password, 0, 0)
+	// dial 以函数值晚绑定到 s.directDialContext：测试会在构造之后替换该字段
+	// 作为 seam（见 direct_udp_test.go / dnstcp_test.go），会话池与 DNS 拦截器
+	// 只看到一个拨号函数，不依赖 Socks5Server 类型。
+	s.udp = newUDPPool(udpPoolOptions{
+		Dial: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return s.directDialContext(ctx, network, addr)
+		},
+		DialTimeout: dialTimeout,
+		IdleTimeout: udpIdleTimeout,
+		OpenExchange: func(ctx context.Context, target string, firstPayload []byte) (*UDPExchange, error) {
+			return s.handler.OpenUDPExchange(ctx, target, s.method, firstPayload)
+		},
+	})
+	s.policy = newRoutePolicy(routePolicyOptions{
+		Router:            opts.Router,
+		DialTimeout:       dialTimeout,
+		StreamIdleTimeout: streamIdleTimeout,
+		Dial: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return s.directDialContext(ctx, network, addr)
+		},
+	})
+	dnsCache := opts.DNSCache
+	if dnsCache == nil {
+		dnsCache = easydns.NewCache(serverDomain)
+	}
+	s.dns = newDNSInterceptor(dnsOptions{
+		Router:       opts.Router,
+		Cache:        dnsCache,
+		Pool:         s.udp,
+		ServerDomain: serverDomain,
+		DialTimeout:  dialTimeout,
+		RespTimeout:  opts.Timeouts.DNSResp,
+		QueryIdle:    udpIdleTimeout,
+		Dial: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return s.directDialContext(ctx, network, addr)
+		},
+	})
+	srv, err := socks5.NewClassicServer(opts.ListenAddr, "127.0.0.1", opts.Username, opts.Password, 0, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -101,124 +147,6 @@ func defaultDirectDialContext(ctx context.Context, network, addr string) (net.Co
 		KeepAlive: 30 * time.Second,
 	}
 	return dialer.DialContext(ctx, network, addr)
-}
-
-// PrePopulateDNS pre-seeds the DNS cache with the resolved IPs for the
-// given domain, trying each of the given dns servers in order and falling
-// back to the system dns servers when all of them fail. This avoids a DNS
-// deadlock when TUN routes are active.
-func (s *Socks5Server) PrePopulateDNS(domain string, dnsServers []string, requireIPv4 bool) error {
-	return s.dnsCache.PrePopulateWithFallback(domain, dnsServers, requireIPv4)
-}
-
-// isServerDomain reports whether the given domain is the proxy server's own
-// hostname. DNS queries for it must never take the proxied path: resolving
-// the server domain would require opening a tunnel stream, which in turn
-// needs to dial the server domain — a circular dependency that deadlocks
-// (especially after system sleep/wake when cached entries may have expired).
-func (s *Socks5Server) isServerDomain(domain string) bool {
-	return s.serverDomain != "" && strings.EqualFold(domain, s.serverDomain)
-}
-
-// MarkStarted records that Start is about to be called. It must be called
-// synchronously before launching Start in a goroutine: the flag set inside
-// Start itself would race with a Close on a single-core scheduler, letting
-// the server goroutine leak its listener.
-func (s *Socks5Server) MarkStarted() {
-	s.started.Store(true)
-}
-
-func (s *Socks5Server) Start() error {
-	s.started.Store(true)
-	go s.cleanupLoop()
-	return s.srv.ListenAndServe(s)
-}
-
-// waitForAccept polls the listen address until the server has really
-// started accepting connections. A plain TCP dial is not enough: it
-// succeeds as soon as the listener is bound at the kernel level, before
-// the accept loop inside the txthinking/socks5 runnergroup library has
-// registered its runners. Calling Shutdown in that window either leaks
-// the listener (runnergroup.Done returns early when no runner has been
-// added yet) or deadlocks (Done skips runners whose start goroutine has
-// not run yet, then blocks forever waiting for a done signal that never
-// comes). Probing with a real SOCKS5 greeting and requiring a reply
-// only succeeds once the accept loop is up, so Close can never race
-// with the goroutine spawned by Start.
-func (s *Socks5Server) waitForAccept() {
-	if s.srv == nil {
-		return
-	}
-	addr := s.srv.Addr
-	if addr == "" {
-		return
-	}
-	// SOCKS5 greeting: version 5, one offered method, no auth. The
-	// server only answers after the accept loop accepted our connection
-	// and parsed the greeting.
-	greeting := []byte{0x05, 0x01, 0x00}
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if probeSocks5Accept(addr, greeting) {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-}
-
-// probeSocks5Accept dials addr and performs a SOCKS5 negotiation. It
-// reports whether the server accepted the connection and replied to the
-// greeting, which proves the accept loop is up and registered.
-func probeSocks5Accept(addr string, greeting []byte) bool {
-	c, err := net.DialTimeout("tcp", addr, 100*time.Millisecond)
-	if err != nil {
-		return false
-	}
-	defer c.Close() //nolint:errcheck
-	if err := c.SetDeadline(time.Now().Add(200 * time.Millisecond)); err != nil {
-		return false
-	}
-	if _, err := c.Write(greeting); err != nil {
-		return false
-	}
-	reply := make([]byte, 2)
-	if _, err := io.ReadFull(c, reply); err != nil {
-		return false
-	}
-	return reply[0] == 0x05
-}
-
-func (s *Socks5Server) Close() error {
-	s.closing.Store(true)
-	s.closeOnce.Do(func() { close(s.quit) })
-	if s.started.Load() {
-		s.waitForAccept()
-	}
-	var exchanges []*UDPExchange
-	s.udpMu.Lock()
-	for key, ue := range s.udpExch {
-		delete(s.udpExch, key)
-		exchanges = append(exchanges, ue)
-	}
-	for key, dc := range s.directUDP {
-		dc.conn.Close() //nolint:errcheck
-		delete(s.directUDP, key)
-	}
-	s.udpMu.Unlock()
-	// Close the exchanges outside the lock: Close flushes a FIN through the
-	// HTTP/2 stream (an io.Pipe write), which can block on transport
-	// backpressure — holding s.udpMu there would freeze all UDP handling.
-	// closeOnce makes this safe against the receiveLoop's own Close.
-	for _, ue := range exchanges {
-		ue.Close() //nolint:errcheck
-	}
-	// In-flight exchange creations are reaped by the creator itself: after
-	// OpenUDPExchange returns it observes the closing flag, closes the
-	// exchange and removes the factory entry (see getOrCreateUDPExchange).
-	if s.srv != nil {
-		return s.srv.Shutdown()
-	}
-	return nil
 }
 
 func (s *Socks5Server) TCPHandle(srv *socks5.Server, c *net.TCPConn, r *socks5.Request) error {
@@ -242,70 +170,82 @@ func (s *Socks5Server) TCPHandle(srv *socks5.Server, c *net.TCPConn, r *socks5.R
 	}
 
 	target := r.Address()
-	host, _, err := net.SplitHostPort(target)
+	host, port, err := net.SplitHostPort(target)
 	if err != nil {
 		log.Error("[SOCKS5] parse target", "target", target, "err", err)
 		return s.replyError(c, r, socks5.RepServerFailure)
 	}
 
-	if s.router.ShouldIPV6Disable() && util.IsIPV6(host) {
-		log.Warn("[SOCKS5] ipv6 target rejected, ipv6 disabled", "target", target)
-		return s.replyError(c, r, socks5.RepNotAllowed)
+	// 拦截 DNS over TCP：发往 53 端口的连接按查询域名分流（与 UDP DNS 拦截一致）。
+	// 否则解析器走 TCP 时（如 systemd-resolved 特性集降级）DNS 查询会按目标 IP 判
+	// 直连、从物理网卡发出而绕过隧道，被 GFW 污染。
+	if port == "53" {
+		return s.handleTCPDNS(c, r, target, host)
 	}
 
-	local := c.RemoteAddr().String()
-	rule := s.router.MatchHostRule(host)
-	switch rule {
-	case router.HostRuleBlock:
-		log.Info("[TCP_BLOCK] blocked", "host", host, "target", target, "local", local)
+	return s.routeTCP(c, r, target, host)
+}
+
+// routeTCP 对已完成 SOCKS5 CONNECT 的 TCP 连接执行 Block/Direct/Proxy 分流。
+// 正常路径与 TCP DNS 拦截的回退路径共用；判定与 HTTP 入口共用同一个
+// routePolicy（见 route.go）。
+func (s *Socks5Server) routeTCP(c net.Conn, r *socks5.Request, target, host string) error {
+	decision := s.policy.decide(host)
+	if decision.IPV6Rejected {
+		logRouteIPV6Rejected("[TCP]", target)
 		return s.replyError(c, r, socks5.RepNotAllowed)
-	case router.HostRuleDirect:
-		log.Info("[TCP_DIRECT]", "target", target, "local", local)
+	}
+	logRouteDecision("[TCP]", decision, host, target, c.RemoteAddr().String())
+
+	switch decision.Action {
+	case routeBlock:
+		return s.replyError(c, r, socks5.RepNotAllowed)
+	case routeDirect:
 		rc, err := s.directTCPConnect(c, r, target)
 		if err != nil {
-			log.Error("[TCP_DIRECT] connect", "target", target, "err", err)
+			log.Error("[TCP] direct connect", "target", target, "err", err)
 			return err
 		}
 		defer rc.Close() //nolint:errcheck
-		relayTCP(rc, c)
-		log.Debug("[TCP_DIRECT] relay finished", "target", target)
+		relayTCP(rc, c, s.policy.streamIdle())
+		log.Debug("[TCP] direct relay finished", "target", target)
 		return nil
-	case router.HostRuleProxy:
-		log.Info("[TCP_PROXY]", "target", target, "local", local)
-		a, bindAddr, bindPort, err := socks5.ParseAddress(c.LocalAddr().String())
-		if err != nil {
-			log.Error("[TCP_PROXY] parse local addr", "err", err)
-			return s.replyError(c, r, socks5.RepServerFailure)
-		}
-		if a == socks5.ATYPDomain {
-			bindAddr = bindAddr[1:]
-		}
-		p := socks5.NewReply(socks5.RepSuccess, a, bindAddr, bindPort)
-		if _, err := p.WriteTo(c); err != nil {
-			log.Error("[TCP_PROXY] reply", "err", err)
+	default:
+		if err := writeSocksSuccessReply(c); err != nil {
+			log.Error("[TCP] proxy reply", "err", err)
 			return err
 		}
-		err = s.handler.OpenTCPStream(context.Background(), target, s.method, c)
+		err := s.handler.OpenTCPStream(context.Background(), target, s.method, c)
 		if err != nil {
 			if isTransientStreamError(err) {
-				log.Debug("[TCP_PROXY] closed", "target", target, "err", err)
+				log.Debug("[TCP] proxy closed", "target", target, "err", err)
 				return nil
 			}
-			log.Error("[TCP_PROXY] stream", "target", target, "err", err)
+			log.Error("[TCP] proxy stream", "target", target, "err", err)
 		} else {
-			log.Debug("[TCP_PROXY] stream finished", "target", target)
+			log.Debug("[TCP] proxy stream finished", "target", target)
 		}
 		return err
 	}
+}
 
-	return nil
+// writeSocksSuccessReply 向客户端写 SOCKS5 CONNECT 成功应答，地址取自本地监听
+// 地址（与代理路径一致，供 TCP DNS 拦截复用）。
+func writeSocksSuccessReply(c net.Conn) error {
+	a, bindAddr, bindPort, err := socks5.ParseAddress(c.LocalAddr().String())
+	if err != nil {
+		return err
+	}
+	if a == socks5.ATYPDomain {
+		bindAddr = bindAddr[1:]
+	}
+	p := socks5.NewReply(socks5.RepSuccess, a, bindAddr, bindPort)
+	_, err = p.WriteTo(c)
+	return err
 }
 
 func (s *Socks5Server) directTCPConnect(c net.Conn, r *socks5.Request, target string) (net.Conn, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), s.dialTimeout)
-	defer cancel()
-
-	rc, err := s.directDialContext(ctx, "tcp", target)
+	rc, err := s.policy.dialDirect(target)
 	if err != nil {
 		_ = s.replyError(c, r, socks5.RepHostUnreachable)
 		return nil, err
@@ -342,98 +282,4 @@ func (s *Socks5Server) replyError(c net.Conn, r *socks5.Request, rep byte) error
 	}
 	_, err := p.WriteTo(c)
 	return err
-}
-
-// directRelayIdleTimeout bounds how long a direct TCP relay may sit idle
-// before both connections are torn down. The proxied path enforces its own
-// idle timeout via relay.Bidirectional (StreamHandler.streamIdleTimeout);
-// the direct path previously had no deadline at all, so a silent or
-// half-open peer left the two copy goroutines and their sockets leaked
-// forever.
-const directRelayIdleTimeout = 300 * time.Second
-
-// relayTCP copies bytes in both directions between dst and src with a shared
-// idle timeout, mirroring the proxied path's relay semantics: on clean EOF a
-// half-close is propagated, and on idle timeout or error both connections
-// are closed exactly once.
-func relayTCP(dst, src net.Conn) {
-	result := relay.Bidirectional(directRelayIdleTimeout, func() {
-		_ = dst.Close()
-		_ = src.Close()
-	},
-		func(signalActivity func()) error { return copyHalfClose(dst, src, signalActivity) },
-		func(signalActivity func()) error { return copyHalfClose(src, dst, signalActivity) },
-	)
-	if result.Err != nil && !result.TimedOut &&
-		!errors.Is(result.Err, io.EOF) &&
-		!errors.Is(result.Err, io.ErrClosedPipe) &&
-		!isLocalConnClosedError(result.Err) {
-		log.Debug("[TCP_DIRECT] relay copy error", "err", result.Err)
-	}
-}
-
-// copyHalfClose streams src to dst, signalling activity on every read and
-// half-closing dst on clean EOF.
-func copyHalfClose(dst, src net.Conn, signalActivity func()) error {
-	buf := bytespool.Get(config.TCPStreamBufferSize)
-	defer bytespool.MustPut(buf)
-	for {
-		n, rErr := src.Read(buf)
-		if n > 0 {
-			signalActivity()
-			if _, wErr := dst.Write(buf[:n]); wErr != nil {
-				return wErr
-			}
-		}
-		if rErr != nil {
-			if errors.Is(rErr, io.EOF) {
-				if cw, ok := dst.(interface{ CloseWrite() error }); ok {
-					_ = cw.CloseWrite()
-				}
-				return nil
-			}
-			return rErr
-		}
-	}
-}
-
-func (s *Socks5Server) cleanupLoop() {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			var stale []*UDPExchange
-			s.udpMu.Lock()
-			for key, ue := range s.udpExch {
-				if time.Since(ue.LastSeen()) > s.udpIdleTimeout {
-					log.Debug("[UDP_PROXY] idle cleanup", "key", key)
-					delete(s.udpExch, key)
-					stale = append(stale, ue)
-				}
-			}
-			// Direct UDP sessions get the same idle recycling: a remote peer
-			// that stops responding (or a datagram flow that simply ended)
-			// must not pin the socket and its reader goroutine until the
-			// 2-minute read deadline fires.
-			for key, dc := range s.directUDP {
-				if time.Since(time.Unix(0, dc.lastSeen.Load())) > s.udpIdleTimeout {
-					log.Debug("[UDP_DIRECT] idle cleanup", "key", key)
-					dc.conn.Close() //nolint:errcheck
-					delete(s.directUDP, key)
-				}
-			}
-			s.udpMu.Unlock()
-			// Close evicted exchanges outside the lock: Close flushes a FIN
-			// through the HTTP/2 stream (an io.Pipe write), which can block
-			// on transport backpressure — holding s.udpMu there would freeze
-			// all UDP handling. closeOnce makes this safe against the
-			// receiveLoop's own Close.
-			for _, ue := range stale {
-				ue.Close() //nolint:errcheck
-			}
-		case <-s.quit:
-			return
-		}
-	}
 }

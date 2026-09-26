@@ -20,7 +20,6 @@ import (
 	"github.com/nange/easyss/v3/log"
 	"github.com/nange/easyss/v3/protocol"
 	"github.com/nange/easyss/v3/stats"
-	"github.com/nange/easyss/v3/util"
 	"github.com/nange/easyss/v3/util/bytespool"
 	"github.com/txthinking/socks5"
 )
@@ -43,19 +42,21 @@ type HTTPProxyServer struct {
 	password   string
 	timeout    time.Duration
 	handler    *StreamHandler
-	router     *router.Router
-	method     protocol.Method
-	dial       func(context.Context, string, string) (net.Conn, error)
-	rp         *httputil.ReverseProxy
-	server     *http.Server
-	mu         sync.Mutex
+	// policy 与 SOCKS5 入口共用同一套 Block/Direct/Proxy 判定（见 route.go），
+	// 也是本入口唯一的路由规则持有者。
+	policy *routePolicy
+	method protocol.Method
+	dial   func(context.Context, string, string) (net.Conn, error)
+	rp     *httputil.ReverseProxy
+	server *http.Server
+	mu     sync.Mutex
 
-	// TUN helper support (macOS): config served at GET /tun.
+	// TUN 辅助程序支持（darwin/linux）：配置通过 GET /tun 提供。
 	tunCfg *TunConfig
 	tunMu  sync.RWMutex
 }
 
-// TunConfig is the configuration served to the TUN helper via GET /tun.
+// TunConfig 是通过 GET /tun 提供给 TUN 辅助程序的配置。
 type TunConfig struct {
 	Socks5Addr     string `json:"socks5_addr"`
 	DNSAddr        string `json:"dns_addr"`
@@ -71,34 +72,61 @@ type TunConfig struct {
 	MTU            int    `json:"mtu"`
 }
 
-func NewHTTPProxyServer(listenAddr, socksAddr, username, password string, timeout time.Duration, handler *StreamHandler, rt *router.Router, method protocol.Method, dial func(context.Context, string, string) (net.Conn, error)) (*HTTPProxyServer, error) {
+// HTTPProxyOptions 用于配置 NewHTTPProxyServer。它取代了一个已增长到九个参数的
+// 位置参数列表。
+type HTTPProxyOptions struct {
+	ListenAddr string
+	SocksAddr  string
+	Username   string
+	Password   string
+	// Timeout 是反向代理出站请求与空闲处理所用的基础超时。
+	Timeout time.Duration
+	Handler *StreamHandler
+	Router  *router.Router
+	Method  protocol.Method
+	// Dial 在路由把主机标记为直连时为转发路径打开直连连接（绕过本地 SOCKS5 代理）；
+	// 为 nil 时使用普通的 net.Dialer。
+	Dial func(ctx context.Context, network, addr string) (net.Conn, error)
+}
+
+func NewHTTPProxyServer(opts HTTPProxyOptions) (*HTTPProxyServer, error) {
+	listenAddr, socksAddr := opts.ListenAddr, opts.SocksAddr
 	if socksAddr == "" {
 		return nil, fmt.Errorf("http proxy requires a local socks5 address")
 	}
+	timeout := opts.Timeout
 	if timeout <= 0 {
-		timeout = 30 * time.Second
+		timeout = time.Duration(config.DefaultTimeout) * time.Second
 	}
+	dial := opts.Dial
 	if dial == nil {
 		dial = defaultDirectDialContext
 	}
 
 	socksURL := &url.URL{Scheme: "socks5", Host: socksAddr}
-	if username != "" || password != "" {
-		socksURL.User = url.UserPassword(username, password)
+	if opts.Username != "" || opts.Password != "" {
+		socksURL.User = url.UserPassword(opts.Username, opts.Password)
 	}
 
 	s := &HTTPProxyServer{
 		listenAddr: listenAddr,
 		socksAddr:  socksAddr,
 		socksURL:   socksURL,
-		username:   username,
-		password:   password,
+		username:   opts.Username,
+		password:   opts.Password,
 		timeout:    timeout,
-		handler:    handler,
-		router:     rt,
-		method:     method,
+		handler:    opts.Handler,
+		method:     opts.Method,
 		dial:       dial,
 	}
+	// 中继空闲超时与 SOCKS5 入口同源（config.StreamIdleTimeout 是唯一事实来源），
+	// 只是本入口持有的是基础超时而非派生值。
+	s.policy = newRoutePolicy(routePolicyOptions{
+		Router:            opts.Router,
+		Dial:              dial,
+		DialTimeout:       timeout,
+		StreamIdleTimeout: config.StreamIdleTimeout(timeout),
+	})
 	s.rp = s.newReverseProxy()
 	return s, nil
 }
@@ -147,26 +175,14 @@ func (s *HTTPProxyServer) Start() error {
 }
 
 func (s *HTTPProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if !s.authOK(r) {
-		w.Header().Set("Proxy-Authenticate", `Basic realm="Easyss"`)
-		http.Error(w, "Proxy auth required", http.StatusProxyAuthRequired)
-		return
-	}
-
-	// Serve /stats for direct requests to the proxy.
-	if r.URL.Host == "" && r.URL.Path == "/stats" {
-		s.serveStats(w)
-		return
-	}
-
-	// Serve /tsnet for direct requests to the proxy (Tailscale status).
-	if r.URL.Host == "" && r.URL.Path == "/tsnet" {
-		s.serveTsnetStatus(w)
-		return
-	}
-
-	// Serve /tun for TUN configuration (macOS helper).
+	// 在代理认证检查之前提供 /tun：提权的 TUN 辅助程序（darwin/linux）无需凭据
+	// 即可获取其配置。该端点被限制为仅接受回环来源，因此当代理监听所有接口
+	// （bind_all）时，配置也不会暴露到网络上。
 	if r.URL.Host == "" && r.URL.Path == "/tun" {
+		if !isLoopbackRequest(r) {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
 		if r.Method == http.MethodGet {
 			s.handleTunGET(w)
 		} else {
@@ -175,8 +191,35 @@ func (s *HTTPProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Prevent forwarding loops: reject requests that would be forwarded
-	// back to the proxy itself (both relative and absolute URLs).
+	if !s.authOK(r) {
+		w.Header().Set("Proxy-Authenticate", `Basic realm="Easyss"`)
+		http.Error(w, "Proxy auth required", http.StatusProxyAuthRequired)
+		return
+	}
+
+	if r.URL.Host == "" && r.URL.Path == "/stats" {
+		s.serveStats(w)
+		return
+	}
+
+	if r.URL.Host == "" && r.URL.Path == "/tsnet" {
+		s.serveTsnetStatus(w)
+		return
+	}
+
+	if !s.authOK(r) {
+		w.Header().Set("Proxy-Authenticate", `Basic realm="Easyss"`)
+		http.Error(w, "Proxy auth required", http.StatusProxyAuthRequired)
+		return
+	}
+
+	// 为直接发往代理的请求提供 /stats。
+	if r.URL.Host == "" && r.URL.Path == "/stats" {
+		s.serveStats(w)
+		return
+	}
+
+	// 防止转发环路：拒绝会被转发回代理自身的请求（包括相对与绝对 URL）。
 	if s.isSelfTarget(r) {
 		http.NotFound(w, r)
 		return
@@ -209,22 +252,22 @@ func (s *HTTPProxyServer) serveTsnetStatus(w http.ResponseWriter) {
 	}
 }
 
-// SetTunConfig stores the TUN configuration served at GET /tun.
-// Called before spawning the TUN helper on macOS.
+// SetTunConfig 存储通过 GET /tun 提供的 TUN 配置。
+// 在 darwin/linux 上启动 TUN 辅助程序之前调用。
 func (s *HTTPProxyServer) SetTunConfig(cfg *TunConfig) {
 	s.tunMu.Lock()
 	defer s.tunMu.Unlock()
 	s.tunCfg = cfg
 }
 
-// ClearTunConfig removes the TUN configuration. Called after the TUN helper exits.
+// ClearTunConfig 移除 TUN 配置。在 TUN 辅助程序退出后调用。
 func (s *HTTPProxyServer) ClearTunConfig() {
 	s.tunMu.Lock()
 	defer s.tunMu.Unlock()
 	s.tunCfg = nil
 }
 
-// handleTunGET serves the TUN configuration as JSON.
+// handleTunGET 以 JSON 形式提供 TUN 配置。
 func (s *HTTPProxyServer) handleTunGET(w http.ResponseWriter) {
 	s.tunMu.RLock()
 	cfg := s.tunCfg
@@ -241,8 +284,7 @@ func (s *HTTPProxyServer) handleTunGET(w http.ResponseWriter) {
 	}
 }
 
-// isSelfTarget reports whether r would be forwarded back to the proxy itself,
-// which would cause an infinite forwarding loop.
+// isSelfTarget 报告 r 是否会被转发回代理自身，从而造成无限的转发环路。
 func (s *HTTPProxyServer) isSelfTarget(r *http.Request) bool {
 	target := r.URL.Host
 	if target == "" {
@@ -267,12 +309,22 @@ func (s *HTTPProxyServer) isSelfTarget(r *http.Request) bool {
 	}
 	ip := net.ParseIP(th)
 	if ip == nil {
-		// Never resolve domain names here: the lookup would go through the
-		// proxied DNS path and could deadlock or recurse.
+		// 这里绝不解析域名：解析会走代理 DNS 路径，可能导致死锁或递归。
 		return false
 	}
 	_, local := localIPSet()[ip.String()]
 	return ip.IsLoopback() || local
+}
+
+// isLoopbackRequest 报告请求是否来自回环地址（本机自身）。它保护控制端点（例如
+// GET /tun），即使代理监听所有接口，这些端点也只能从本机访问。
+func isLoopbackRequest(r *http.Request) bool {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return false
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 const localIPsCacheTTL = 60 * time.Second
@@ -283,12 +335,10 @@ var localIPsCache = struct {
 	set     map[string]struct{}
 }{}
 
-// localIPSet returns the set of IP addresses currently assigned to local
-// interfaces, cached for localIPsCacheTTL. It detects requests targeting the
-// proxy host itself: when listening on [::]:port, a request to a LAN address
-// of this host (e.g. 192.168.1.5:port) would otherwise be tunneled to the
-// server and potentially loop back into this proxy, creating an infinite
-// forwarding loop.
+// localIPSet 返回当前分配给本地接口的 IP 地址集合，按 localIPsCacheTTL 缓存。
+// 它用于识别目标是代理主机自身的请求：当监听 [::]:port 时，指向本机局域网地址
+// （例如 192.168.1.5:port）的请求本来会被隧道转发到服务器，并可能回环进入本代理，
+// 形成无限的转发环路。
 func localIPSet() map[string]struct{} {
 	localIPsCache.Lock()
 	defer localIPsCache.Unlock()
@@ -337,21 +387,16 @@ func (s *HTTPProxyServer) handleConnect(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Mirror the SOCKS5 path's IPv6 policy: with ipv6_rule disabled the
-	// SOCKS5 handler rejects IPv6 targets before forwarding, so the CONNECT
-	// path must too, or the two entry points would behave inconsistently.
-	if s.router != nil && s.router.ShouldIPV6Disable() && util.IsIPV6(host) {
-		log.Warn("[HTTP-PROXY] CONNECT ipv6 target rejected, ipv6 disabled", "target", target)
+	// IPv6 策略门禁与路由规则来自与 SOCKS5 路径共享的同一个 routePolicy，
+	// 因此两个入口不会发生偏离（见 route.go）。
+	decision := s.policy.decide(host)
+	if decision.IPV6Rejected {
+		logRouteIPV6Rejected("[HTTP-PROXY]", target)
 		http.Error(w, "IPv6 disabled", http.StatusForbidden)
 		return
 	}
-
-	rule := router.HostRuleProxy
-	if s.router != nil {
-		rule = s.router.MatchHostRule(host)
-	}
-	if rule == router.HostRuleBlock {
-		log.Info("[HTTP-PROXY] CONNECT blocked", "target", target)
+	logRouteDecision("[HTTP-PROXY]", decision, host, target, r.RemoteAddr)
+	if decision.Action == routeBlock {
 		http.Error(w, "Forbidden", http.StatusForbidden)
 		return
 	}
@@ -359,17 +404,16 @@ func (s *HTTPProxyServer) handleConnect(w http.ResponseWriter, r *http.Request) 
 	rc := http.NewResponseController(w)
 	hijConn, _, err := rc.Hijack()
 	if err != nil {
-		// Never echo the internal error to the client: it may leak local
-		// details (interface names, file descriptors) to a remote caller.
+		// 绝不把内部错误回显给客户端：它可能向远端调用者泄露本地细节
+		// （接口名、文件描述符）。
 		http.Error(w, "CONNECT failed", http.StatusInternalServerError)
 		log.Error("[HTTP-PROXY] hijack CONNECT", "target", target, "err", err)
 		return
 	}
 	defer hijConn.Close() //nolint:errcheck
 
-	if rule == router.HostRuleDirect {
-		log.Info("[HTTP-PROXY] CONNECT direct", "target", target)
-		remote, err := s.directConnect(target)
+	if decision.Action == routeDirect {
+		remote, err := s.policy.dialDirect(target)
 		if err != nil {
 			log.Warn("[HTTP-PROXY] direct CONNECT", "target", target, "err", err)
 			return
@@ -378,7 +422,7 @@ func (s *HTTPProxyServer) handleConnect(w http.ResponseWriter, r *http.Request) 
 		if err := writeConnectEstablished(hijConn, target); err != nil {
 			return
 		}
-		relayTCP(remote, hijConn)
+		relayTCP(remote, hijConn, s.policy.streamIdle())
 		return
 	}
 
@@ -393,14 +437,13 @@ func (s *HTTPProxyServer) handleConnect(w http.ResponseWriter, r *http.Request) 
 		if err := writeConnectEstablished(hijConn, target); err != nil {
 			return
 		}
-		relayTCP(remote, hijConn)
+		relayTCP(remote, hijConn, s.policy.streamIdle())
 		return
 	}
 
 	if err := writeConnectEstablished(hijConn, target); err != nil {
 		return
 	}
-	log.Info("[HTTP-PROXY] CONNECT proxy", "target", target)
 	if err := s.handler.OpenTCPStream(context.Background(), target, s.method, hijConn); err != nil {
 		if isTransientStreamError(err) {
 			log.Debug("[HTTP-PROXY] CONNECT closed", "target", target, "err", err)
@@ -418,19 +461,9 @@ func writeConnectEstablished(conn net.Conn, target string) error {
 	return nil
 }
 
-func (s *HTTPProxyServer) directConnect(target string) (net.Conn, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), s.timeout)
-	defer cancel()
-	return s.dial(ctx, "tcp", target)
-}
-
 func (s *HTTPProxyServer) dialSOCKS5(target string) (net.Conn, error) {
-	// Round the timeout up so sub-second timeouts never truncate to 0 (the
-	// socks5 library treats 0 as "no timeout").
-	socksTimeout := int(math.Ceil(s.timeout.Seconds()))
-	if socksTimeout < 1 {
-		socksTimeout = 1
-	}
+	// 将超时向上取整，避免亚秒级超时被截断为 0（socks5 库把 0 视为"无超时"）。
+	socksTimeout := max(int(math.Ceil(s.timeout.Seconds())), 1)
 	client, err := socks5.NewClient(s.socksAddr, s.username, s.password, socksTimeout, socksTimeout)
 	if err != nil {
 		return nil, err
@@ -450,10 +483,9 @@ func connectTarget(r *http.Request) string {
 }
 
 func basicAuth(r *http.Request) (username, password string, ok bool) {
-	// Proxy credentials live in Proxy-Authorization; only fall back to the
-	// Authorization header when it is absent, so a client carrying both (an
-	// Authorization header destined for the origin alongside the proxy's own
-	// credentials) is not misrejected.
+	// 代理凭据放在 Proxy-Authorization 头中；仅当该头缺失时才回退到
+	// Authorization 头，这样同时携带两者的客户端（一个发给源站的 Authorization 头
+	// 连同代理自己的凭据）不会被误拒。
 	auth := r.Header.Get("Proxy-Authorization")
 	if auth != "" {
 		return parseBasicAuth(auth)

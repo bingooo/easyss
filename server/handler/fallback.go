@@ -2,64 +2,57 @@ package handler
 
 import (
 	"bytes"
-	"compress/gzip"
 	"context"
+	"embed"
+	"encoding/json"
 	"fmt"
-	"hash/fnv"
 	"html/template"
-	"io"
-	"math/rand/v2"
 	"net/http"
 	"net/http/httputil"
-	"net/url"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 
 	"github.com/nange/easyss/v3/stats"
-	"github.com/nange/easyss/v3/util"
 )
 
-var fallbackTmpl = template.Must(template.New("fallback").Parse(`<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{{.Title}}</title>
-    <style>{{.CSS}}</style>
-</head>
-<body>
-    <header>
-        <h1>{{.SiteName}}</h1>
-        <p>{{.Tagline}}</p>
-    </header>
-    <nav>
-        <a href="/">{{.NavHome}}</a>
-        <a href="/about">{{.NavAbout}}</a>
-        <a href="/services">{{.NavServices}}</a>
-        <a href="/contact">{{.NavContact}}</a>
-    </nav>
-    <main>
-        <h2>{{.Heading}}</h2>
-        {{range .Paragraphs}}<p>{{.}}</p>{{end}}
-    </main>
-    <footer>
-        <p>{{.Footer}}</p>
-    </footer>
-</body>
-</html>`))
+// fallbackFS 内嵌主题页面模板、主题定义和内容池（见 assets/fallback）。
+// 把它们放在 Go 源码之外，可以在不改动代码的情况下调整页面；它们会被编译进
+// 二进制，因此缺失或损坏的资源会在启动时立刻暴露，而不是等到请求时才出错。
+//
+//go:embed assets/fallback/*.html assets/fallback/*.json
+var fallbackFS embed.FS
+
+// mustReadFallback 读取内嵌资源，失败时直接 panic：资源已编译进二进制，
+// 文件缺失属于构建期错误，必须立即暴露出来。
+func mustReadFallback(name string) []byte {
+	b, err := fallbackFS.ReadFile(name)
+	if err != nil {
+		panic(fmt.Sprintf("embedded fallback asset %s: %v", name, err))
+	}
+	return b
+}
+
+var fallbackTmpl = template.Must(template.New("fallback").Parse(string(mustReadFallback("assets/fallback/template.html"))))
 
 // ---------------------------------------------------------------------------
-// Theme definitions — each theme has CSS and site-level info.
-// Themes are visually distinct: different color palettes, fonts, and layout
-// parameters. One theme is randomly selected at startup per deployment.
+// 主题定义——每个主题包含 CSS 和站点级信息。
+// 各主题在视觉上彼此不同：不同的配色、字体和布局参数。
+// 每次部署在启动时随机选择一个主题，并用该部署的种子替换 CSS 中的 {{token}}
+// 占位符（见 fallback_random.go），因此同一主题在不同部署里也不相同。
 // ---------------------------------------------------------------------------
 
 type themeDef struct {
+	// Name 标识资源文件中的主题（见 assets/fallback/themes.json）；该字段不会被渲染。
+	Name string
+	// Mode 是 "light" 或 "dark"，决定调色板派生的明度分档。
+	Mode string
+	// MinimalNav 为真时导航背景使用页面底色而不是页眉底色（低调排版主题）。
+	MinimalNav bool
+	// CSS 中允许出现 {{token}} 占位符，由 themePalette 在启动时替换为随机值。
+	// 未被替换的 token 会原样发给扫描器，因此渲染后会做残留断言。
 	CSS         template.CSS
 	SiteName    string
 	Tagline     string
@@ -69,117 +62,25 @@ type themeDef struct {
 	NavContact  string
 }
 
-var themes = []themeDef{
-	// 1. Ocean Blue — corporate, clean, blue tones
-	{
-		CSS: `body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;margin:0;padding:0;background:#edf2f7;color:#2d3748;line-height:1.6}
-header{background:#1a365d;color:#fff;padding:32px 20px;text-align:center}
-header h1{font-size:2rem;margin:0 0 8px 0;font-weight:700}
-header p{font-size:1rem;margin:0;opacity:0.85}
-nav{background:#2c5282;padding:12px 20px;text-align:center}
-nav a{color:#bee3f8;text-decoration:none;margin:0 18px;font-size:.95rem;font-weight:500;transition:color .2s}
-nav a:hover{color:#fff}
-main{max-width:780px;margin:40px auto;padding:32px;background:#fff;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.08)}
-main h2{font-size:1.5rem;margin-top:0;color:#1a365d}
-main p{margin:16px 0;font-size:1rem}
-footer{text-align:center;padding:24px;color:#a0aec0;font-size:.85rem;border-top:1px solid #e2e8f0}`,
-		SiteName:    "Acme Solutions",
-		Tagline:     "Innovation delivered with integrity",
-		NavHome:     "Home",
-		NavAbout:    "About",
-		NavServices: "Services",
-		NavContact:  "Contact",
-	},
-
-	// 2. Forest Green — natural, friendly, rounded
-	{
-		CSS: `body{font-family:Georgia,"Times New Roman",serif;margin:0;padding:0;background:#f0f7f4;color:#2d3a2e;line-height:1.7}
-header{background:#22543d;color:#f0fff4;padding:36px 24px;text-align:center}
-header h1{font-size:2.1rem;margin:0 0 6px 0;letter-spacing:-0.5px}
-header p{font-size:1.05rem;margin:0;font-style:italic;opacity:0.8}
-nav{background:#38a169;padding:14px 20px;text-align:center;border-bottom:3px solid #22543d}
-nav a{color:#f0fff4;text-decoration:none;margin:0 20px;font-size:.95rem;text-transform:uppercase;letter-spacing:.5px}
-nav a:hover{text-decoration:underline}
-main{max-width:760px;margin:36px auto;padding:28px 32px;background:#fff;border-radius:12px;border-left:6px solid #38a169;box-shadow:0 1px 4px rgba(0,0,0,.06)}
-main h2{font-size:1.5rem;margin-top:0;color:#22543d}
-main p{margin:14px 0;font-size:.98rem}
-footer{text-align:center;padding:20px;color:#718096;font-size:.8rem;background:#e2e8e0}`,
-		SiteName:    "Greenfield Partners",
-		Tagline:     "Rooted in values, growing together",
-		NavHome:     "Home",
-		NavAbout:    "About Us",
-		NavServices: "Solutions",
-		NavContact:  "Get in Touch",
-	},
-
-	// 3. Dark Modern — tech-forward, dark mode, code-like accents
-	{
-		CSS: `body{font-family:ui-sans-serif,system-ui,-apple-system,sans-serif;margin:0;padding:0;background:#0d1117;color:#c9d1d9;line-height:1.65}
-header{background:#010409;padding:28px 24px;border-bottom:1px solid #21262d;text-align:center}
-header h1{font-size:1.8rem;margin:0;color:#58a6ff;font-weight:600}
-header p{font-size:.9rem;margin:6px 0 0 0;color:#8b949e}
-nav{background:#161b22;padding:10px 20px;text-align:center;border-bottom:1px solid #30363d}
-nav a{color:#c9d1d9;text-decoration:none;margin:0 16px;font-size:.88rem}
-nav a:hover{color:#58a6ff}
-main{max-width:720px;margin:36px auto;padding:28px;background:#161b22;border:1px solid #30363d;border-radius:6px}
-main h2{font-size:1.4rem;margin-top:0;color:#f0f6fc}
-main p{margin:14px 0;font-size:.92rem;color:#8b949e}
-footer{text-align:center;padding:20px;color:#484f58;font-size:.78rem;border-top:1px solid #21262d}`,
-		SiteName:    "NexusCode",
-		Tagline:     "Engineering the future, one line at a time",
-		NavHome:     "Home",
-		NavAbout:    "About",
-		NavServices: "Platform",
-		NavContact:  "Contact",
-	},
-
-	// 4. Sunset Amber — warm, traditional, serif-heavy
-	{
-		CSS: `body{font-family:Cambria,"Hoefler Text",Utopia,"Liberation Serif","Times New Roman",serif;margin:0;padding:0;background:#fef9f0;color:#3e2a1e;line-height:1.7}
-header{background:#c05621;color:#fffaf0;padding:38px 20px 28px;text-align:center;border-bottom:4px solid #9c4221}
-header h1{font-size:2.2rem;margin:0;font-weight:400;text-shadow:1px 1px 2px rgba(0,0,0,.2)}
-header p{font-size:1rem;margin:8px 0 0;opacity:0.9;font-style:italic}
-nav{background:#edf2f7;padding:16px 20px;text-align:center}
-nav a{color:#9c4221;text-decoration:none;margin:0 22px;font-size:.95rem;font-variant:small-caps}
-nav a:hover{color:#c05621;border-bottom:2px solid #c05621}
-main{max-width:700px;margin:42px auto;padding:30px 36px;background:#fffaf0;border:1px solid #e2d5c0;box-shadow:0 2px 6px rgba(156,66,33,.08)}
-main h2{font-size:1.6rem;margin-top:0;color:#9c4221;font-weight:400}
-main p{margin:16px 0;font-size:1rem}
-footer{text-align:center;padding:22px;color:#8b6f5e;font-size:.82rem;font-style:italic}`,
-		SiteName:    "Crestwood Advisory",
-		Tagline:     "Wisdom, trust, and the human touch",
-		NavHome:     "Home",
-		NavAbout:    "About",
-		NavServices: "Expertise",
-		NavContact:  "Contact",
-	},
-
-	// 5. Minimal Mono — grayscale, clean, modern
-	{
-		CSS: `body{font-family:"Helvetica Neue",Helvetica,Arial,sans-serif;margin:0;padding:0;background:#fff;color:#333;line-height:1.6}
-header{background:transparent;padding:40px 20px 20px;text-align:center;border-bottom:1px solid #eaeaea}
-header h1{font-size:1.6rem;margin:0;font-weight:300;color:#111;text-transform:uppercase;letter-spacing:2px}
-header p{font-size:.85rem;margin:8px 0 0;color:#999}
-nav{padding:16px 20px;text-align:center;border-bottom:1px solid #eaeaea}
-nav a{color:#555;text-decoration:none;margin:0 24px;font-size:.8rem;text-transform:uppercase;letter-spacing:1.5px;font-weight:500}
-nav a:hover{color:#111}
-main{max-width:640px;margin:48px auto;padding:0 24px}
-main h2{font-size:1.3rem;margin:0 0 24px;font-weight:400;color:#111}
-main p{margin:0 0 20px;font-size:.95rem;color:#555}
-footer{text-align:center;padding:28px 20px;color:#bbb;font-size:.75rem;border-top:1px solid #f0f0f0}`,
-		SiteName:    "Mode Studio",
-		Tagline:     "Crafting clarity through design",
-		NavHome:     "Work",
-		NavAbout:    "Studio",
-		NavServices: "Capabilities",
-		NavContact:  "Contact",
-	},
+func loadThemes() []themeDef {
+	var themes []themeDef
+	if err := json.Unmarshal(mustReadFallback("assets/fallback/themes.json"), &themes); err != nil {
+		panic(fmt.Sprintf("embedded fallback asset themes.json: %v", err))
+	}
+	return themes
 }
 
+var themes = loadThemes()
+
 // ---------------------------------------------------------------------------
-// Content pools — realistic, varied text for each page type.
-// Content is selected via deterministic hash of the request path,
-// so the same URL always gets the same content.
+// 内容池——每种页面类型对应的真实、多样的文本。
+//
+// 页面由三段拼装而成：intros + bodies(+extras) + outros，标题与一级标题从
+// titles/headings 池中独立抽取，页脚从 footers 池中抽取。路径族决定使用哪个
+// 子池，因此拼出来的段落始终是同一话题，读起来是一篇连贯的页面。
+//
+// 旧式的"每种页面类型一整篇"内容（legacyPool）仍然支持：只提供整篇文案的
+// 部署不会因此出问题。
 // ---------------------------------------------------------------------------
 
 type pageContent struct {
@@ -189,241 +90,256 @@ type pageContent struct {
 	Footer     string
 }
 
-type contentPool map[string][]pageContent
+// legacyPool 是每种页面类型下的整篇页面文案。
+type legacyPool map[string][]pageContent
 
-var contentPools = contentPool{
-	// ---------- Home ----------
-	"home": {
-		{
-			Title:      "Welcome to Our Site",
-			Heading:    "Delivering Results That Matter",
-			Paragraphs: []string{"We help organizations navigate complexity and achieve measurable outcomes through strategic thinking and operational excellence.", "Our team brings decades of combined experience across multiple industries. Whether you are launching a new initiative or scaling an existing operation, we have the expertise to guide you."},
-			Footer:     "\u00a9 2024 All rights reserved.",
-		},
-		{
-			Title:      "Home \u2014 Trusted Partner for Growth",
-			Heading:    "Your Vision, Our Commitment",
-			Paragraphs: []string{"Every great achievement starts with a clear vision. We work alongside our clients to turn ambitious ideas into practical, sustainable results.", "From strategy through execution, our collaborative approach ensures alignment at every stage. We measure success by the impact we create together."},
-			Footer:     "\u00a9 2024 All rights reserved.",
-		},
-		{
-			Title:      "Leading the Way in Innovation",
-			Heading:    "Transforming Challenges into Opportunities",
-			Paragraphs: []string{"In a rapidly evolving landscape, staying ahead requires more than just keeping up. Our forward-thinking methodology helps organizations anticipate change and adapt proactively.", "We partner with leaders who are ready to challenge the status quo and build lasting competitive advantage."},
-			Footer:     "\u00a9 2024 All rights reserved.",
-		},
-		{
-			Title:      "Excellence in Every Engagement",
-			Heading:    "Quality Without Compromise",
-			Paragraphs: []string{"For over a decade, organizations have trusted us to deliver solutions that stand the test of time. Our commitment to quality is reflected in everything we do.", "We believe that exceptional outcomes require exceptional partnerships. That is why we invest deeply in understanding your unique context."},
-			Footer:     "\u00a9 2024 All rights reserved.",
-		},
-		{
-			Title:      "Welcome to the Future of Business",
-			Heading:    "Built for What Is Next",
-			Paragraphs: []string{"The pace of change has never been faster. We provide the clarity, tools, and support you need to thrive in an uncertain world.", "Our integrated approach combines deep industry knowledge with cutting-edge practices to deliver sustainable results."},
-			Footer:     "\u00a9 2024 All rights reserved.",
-		},
-	},
+// fragmentSet 是同一路径族下可自由组合的片段池。
+type fragmentSet struct {
+	Intros   []string
+	Bodies   []string
+	Extras   []string
+	Outros   []string
+	Footers  []string
+	Titles   []string
+	Headings []string
+}
 
-	// ---------- About ----------
-	"about": {
-		{
-			Title:      "About Us \u2014 Our Story",
-			Heading:    "Who We Are",
-			Paragraphs: []string{"Founded in 2010, we have grown from a small team of passionate individuals into a respected organization serving clients across the globe.", "Our mission is simple: deliver exceptional value through expertise, integrity, and relentless focus on our clients\u2019 success."},
-			Footer:     "\u00a9 2024 All rights reserved.",
-		},
-		{
-			Title:      "About \u2014 Our Mission and Values",
-			Heading:    "Driven by Purpose",
-			Paragraphs: []string{"We believe that business can be a force for good. Every engagement is guided by our core values of transparency, collaboration, and continuous improvement.", "Our diverse team brings perspectives from technology, finance, operations, and creative disciplines\u2014united by a shared commitment to making a difference."},
-			Footer:     "\u00a9 2024 All rights reserved.",
-		},
-		{
-			Title:      "Our Team",
-			Heading:    "Meet the People Behind the Work",
-			Paragraphs: []string{"Our strength lies in our people. We have assembled a team of dedicated professionals who are experts in their respective fields.", "From seasoned consultants to emerging talent, everyone on our team shares a passion for solving complex problems and delivering meaningful impact."},
-			Footer:     "\u00a9 2024 All rights reserved.",
-		},
-		{
-			Title:      "Company Overview",
-			Heading:    "A Legacy of Excellence",
-			Paragraphs: []string{"With offices in three major cities and a growing remote workforce, we combine local expertise with global reach.", "Our track record speaks for itself: hundreds of successful engagements, long-term client relationships, and a reputation for delivering on our promises."},
-			Footer:     "\u00a9 2024 All rights reserved.",
-		},
-		{
-			Title:      "About Our Approach",
-			Heading:    "How We Think",
-			Paragraphs: []string{"We take a first-principles approach to every challenge, questioning assumptions and exploring possibilities before committing to a path forward.", "This rigorous, thoughtful methodology has earned us the trust of some of the most demanding organizations in the world."},
-			Footer:     "\u00a9 2024 All rights reserved.",
-		},
-	},
+// contentPool 是 content.json 解析后的全部内容资源。
+type contentPool struct {
+	Intros   map[string][]string
+	Bodies   map[string][]string
+	Extras   map[string][]string
+	Outros   map[string][]string
+	Footers  map[string][]string
+	Titles   map[string][]string
+	Headings map[string][]string
+	Notices  []string
 
-	// ---------- Contact ----------
-	"contact": {
-		{
-			Title:      "Contact Us",
-			Heading:    "Get in Touch",
-			Paragraphs: []string{"We would love to hear from you. Whether you have a question about our services, want to explore a partnership, or simply want to learn more, our team is here to help.", "You can reach us by phone at +1 (555) 123-4567, by email at info@example.com, or by visiting our office at 123 Business Avenue, Suite 400, New York, NY 10001."},
-			Footer:     "\u00a9 2024 All rights reserved.",
-		},
-		{
-			Title:      "Contact \u2014 Let\u2019s Talk",
-			Heading:    "We Are Ready to Help",
-			Paragraphs: []string{"Our team is available Monday through Friday, 9 AM to 6 PM Eastern Time. We strive to respond to all inquiries within one business day.", "For general inquiries: contact@example.com. For support: support@example.com. Phone: +1 (555) 987-6543."},
-			Footer:     "\u00a9 2024 All rights reserved.",
-		},
-		{
-			Title:      "Find Us",
-			Heading:    "Our Locations",
-			Paragraphs: []string{"Headquarters: 456 Park Avenue, 12th Floor, San Francisco, CA 94102. Satellite office: 789 Innovation Drive, Austin, TX 78701.", "We also offer virtual consultations for clients around the world. Schedule a call at your convenience."},
-			Footer:     "\u00a9 2024 All rights reserved.",
-		},
-		{
-			Title:      "Contact Information",
-			Heading:    "Reach Out Anytime",
-			Paragraphs: []string{"We value open communication and are always happy to discuss how we can support your goals.", "Email: hello@example.com | Phone: +1 (555) 456-7890 | Follow us on LinkedIn and Twitter for the latest updates."},
-			Footer:     "\u00a9 2024 All rights reserved.",
-		},
-		{
-			Title:      "Support Center",
-			Heading:    "How Can We Assist You?",
-			Paragraphs: []string{"For existing clients, our support portal provides a knowledge base, ticket submission, and live chat during business hours.", "Not a client yet? Our sales team can walk you through our offerings and help identify the right solution for your needs."},
-			Footer:     "\u00a9 2024 All rights reserved.",
-		},
-	},
+	// Pages 保存旧式整篇文案，键是页面类型。
+	Pages legacyPool
+}
 
-	// ---------- Services ----------
-	"services": {
-		{
-			Title:      "Our Services",
-			Heading:    "What We Offer",
-			Paragraphs: []string{"We provide a comprehensive suite of services designed to help organizations thrive in a competitive environment. Our core offerings include strategic consulting, technology implementation, and operational optimization.", "Each engagement is tailored to the specific needs of our clients. We do not believe in one-size-fits-all solutions."},
-			Footer:     "\u00a9 2024 All rights reserved.",
-		},
-		{
-			Title:      "Products and Solutions",
-			Heading:    "Tools That Empower",
-			Paragraphs: []string{"Our product portfolio spans data analytics, cloud infrastructure, workflow automation, and customer engagement platforms.", "Built on modern architecture with security and scalability at the core, our solutions integrate seamlessly with your existing technology stack."},
-			Footer:     "\u00a9 2024 All rights reserved.",
-		},
-		{
-			Title:      "Pricing",
-			Heading:    "Transparent and Flexible",
-			Paragraphs: []string{"We offer flexible pricing models designed to align with your budget and business needs. From project-based engagements to ongoing retainers, we work with you to find the right arrangement.", "Contact our team for a customized quote based on your specific requirements and scope."},
-			Footer:     "\u00a9 2024 All rights reserved.",
-		},
-		{
-			Title:      "Consulting Services",
-			Heading:    "Expert Guidance, Tangible Results",
-			Paragraphs: []string{"Our consulting practice helps organizations address their most pressing challenges: growth strategy, digital transformation, organizational design, and operational efficiency.", "We bring an outside perspective grounded in data, experience, and rigorous analysis."},
-			Footer:     "\u00a9 2024 All rights reserved.",
-		},
-		{
-			Title:      "Managed Services",
-			Heading:    "Focus on Your Core Business",
-			Paragraphs: []string{"Let us handle the complexity. Our managed services team provides ongoing support, monitoring, and optimization for your critical systems and processes.", "With 24/7 coverage and proactive issue resolution, you can focus on what matters most: serving your customers and growing your business."},
-			Footer:     "\u00a9 2024 All rights reserved.",
-		},
-	},
+func loadContentPools() contentPool {
+	var pool contentPool
+	if err := json.Unmarshal(mustReadFallback("assets/fallback/content.json"), &pool); err != nil {
+		panic(fmt.Sprintf("embedded fallback asset content.json: %v", err))
+	}
+	return pool
+}
 
-	// ---------- Blog / News ----------
-	"blog": {
-		{
-			Title:      "Industry Insights and Trends",
-			Heading:    "What Is Shaping the Landscape",
-			Paragraphs: []string{"The industry is undergoing significant transformation driven by advances in artificial intelligence, shifting regulatory frameworks, and evolving customer expectations.", "In this article, we explore the key trends that leaders should be paying attention to in the coming year."},
-			Footer:     "\u00a9 2024 All rights reserved.",
-		},
-		{
-			Title:      "Latest News and Announcements",
-			Heading:    "What\u2019s New",
-			Paragraphs: []string{"We are excited to share recent developments, including new partnerships, expanded capabilities, and recognition from industry analysts.", "Stay tuned for more updates as we continue to grow and evolve."},
-			Footer:     "\u00a9 2024 All rights reserved.",
-		},
-		{
-			Title:      "Best Practices Guide",
-			Heading:    "A Practical Framework for Success",
-			Paragraphs: []string{"After years of working with organizations of all sizes, we have distilled our learning into a practical guide for navigating complex initiatives.", "This guide covers planning, execution, measurement, and continuous improvement."},
-			Footer:     "\u00a9 2024 All rights reserved.",
-		},
-		{
-			Title:      "Case Study: Driving Operational Excellence",
-			Heading:    "How One Organization Achieved a 40% Efficiency Gain",
-			Paragraphs: []string{"We recently partnered with a mid-size manufacturing company to overhaul their supply chain operations. The results exceeded expectations.", "Read the full case study to learn about the approach, the challenges, and the lessons we learned along the way."},
-			Footer:     "\u00a9 2024 All rights reserved.",
-		},
-		{
-			Title:      "Technology Radar",
-			Heading:    "Tools and Platforms Worth Watching",
-			Paragraphs: []string{"Our team regularly evaluates emerging technologies to help clients make informed decisions about their technology investments.", "Here are the tools and platforms that have caught our attention this quarter."},
-			Footer:     "\u00a9 2024 All rights reserved.",
-		},
-	},
+var contentPools = loadContentPools()
 
-	// ---------- Generic (any other path) ----------
-	"generic": {
-		{
-			Title:      "\u00a0",
-			Heading:    "Page Not Found",
-			Paragraphs: []string{"The page you are looking for might have been moved or is temporarily unavailable. Please check the URL and try again, or navigate back to the homepage."},
-			Footer:     "\u00a9 2024 All rights reserved.",
-		},
-		{
-			Title:      "Resource Center",
-			Heading:    "Explore Our Resources",
-			Paragraphs: []string{"Our resource center provides a wealth of information including whitepapers, webinars, case studies, and industry reports.", "Browse by topic or use the search function to find what you need."},
-			Footer:     "\u00a9 2024 All rights reserved.",
-		},
-		{
-			Title:      "Knowledge Base",
-			Heading:    "Find Answers Fast",
-			Paragraphs: []string{"Our knowledge base contains hundreds of articles covering common questions, troubleshooting guides, and best practices.", "If you cannot find what you are looking for, our support team is ready to assist."},
-			Footer:     "\u00a9 2024 All rights reserved.",
-		},
-		{
-			Title:      "Documentation",
-			Heading:    "Technical Documentation",
-			Paragraphs: []string{"Comprehensive documentation for our products and services, including API references, integration guides, and release notes.", "Documentation is updated regularly to reflect the latest features and improvements."},
-			Footer:     "\u00a9 2024 All rights reserved.",
-		},
-		{
-			Title:      "FAQ",
-			Heading:    "Frequently Asked Questions",
-			Paragraphs: []string{"We have compiled answers to the most common questions we receive from clients and partners.", "If your question is not addressed here, please do not hesitate to contact us directly."},
-			Footer:     "\u00a9 2024 All rights reserved.",
-		},
-	},
+// fragments 返回某个页面类型的片段池。缺失的键一律退化为空池，
+// 由 pickRand 的空池守卫兜底，不会 panic。
+func (c contentPool) fragments(pageType string) fragmentSet {
+	return fragmentSet{
+		Intros:   c.Intros[pageType],
+		Bodies:   c.Bodies[pageType],
+		Extras:   c.Extras[pageType],
+		Outros:   c.Outros[pageType],
+		Footers:  c.Footers[pageType],
+		Titles:   c.Titles[pageType],
+		Headings: c.Headings[pageType],
+	}
 }
 
 // ---------------------------------------------------------------------------
-// Types for rendering
+// 渲染用类型
 // ---------------------------------------------------------------------------
+
+// navItem 是渲染后的一个导航链接。
+type navItem struct {
+	Label string
+	Href  string
+}
 
 type renderData struct {
-	CSS         template.CSS
-	SiteName    string
-	Tagline     string
-	NavHome     string
-	NavAbout    string
-	NavServices string
-	NavContact  string
-	Title       string
-	Heading     string
-	Paragraphs  []string
-	Footer      string
+	CSS          template.CSS
+	SiteName     string
+	Tagline      string
+	NavItems     []navItem
+	Title        string
+	Description  string
+	Heading      string
+	Paragraphs   []string
+	Footer       string
+	FooterNotice string
+	BodyClass    string
+	HeadExtras   template.HTML
+	Analytics    template.HTML
 }
 
 // ---------------------------------------------------------------------------
-// Global state
+// 渲染
 // ---------------------------------------------------------------------------
 
-// ctxKey is an unexported context key type used to pass the original client-
-// facing Host and scheme from ServeFallback into the reverse proxy's
-// ModifyResponse hook, so that Location headers pointing at the upstream host
-// can be rewritten back to the client-facing host without leaking the upstream
-// via X-Forwarded-Host.
+// renderPage 为一个路径渲染完整页面。随机源按 (种子, 路径) 域分离派生，
+// 因此同一路径总是得到同一页面（真实静态站的行为），cache 溢出后
+// 重算也得到同样的字节。
+func (fb *Fallback) renderPage(path string) []byte {
+	dep := fb.dep
+	pageType := detectPageType(path)
+	content := composeContent(dep, path, pageType)
+
+	data := renderData{
+		CSS:          dep.theme.CSS,
+		SiteName:     dep.site.Name,
+		Tagline:      dep.tagline,
+		NavItems:     dep.nav,
+		Title:        resolveTitle(content.Title, dep.site.Name),
+		Description:  firstParagraph(content.Paragraphs),
+		Heading:      content.Heading,
+		Paragraphs:   content.Paragraphs,
+		Footer:       content.Footer,
+		FooterNotice: dep.footerNotice,
+		BodyClass:    bodyClass(pageType),
+		HeadExtras:   headExtras(dep),
+		// 统计注释、构建号与图标名都来自本包内的固定池或十六进制标记，
+		// 不含任何请求数据，因此可以直接注入。
+		Analytics: template.HTML(analyticsScript(dep)), //nolint:gosec // 见上
+	}
+
+	var buf bytes.Buffer
+	if err := fallbackTmpl.Execute(&buf, data); err != nil {
+		return []byte("Internal Server Error")
+	}
+	return buf.Bytes()
+}
+
+// composeContent 为路径拼装页面内容。优先使用片段池；片段池为空时回退到
+// 旧式整篇文案；仍然为空时用兜底文案，保证任何输入都能渲染出页面。
+func composeContent(dep *deployment, path, pageType string) pageContent {
+	r := gen(dep.seed, "content:"+path)
+	f := contentPools.fragments(pageType)
+
+	var paragraphs []string
+	if len(f.Intros) > 0 || len(f.Bodies) > 0 {
+		introCount := 1
+		if len(f.Intros) > 1 {
+			introCount += r.IntN(2)
+		}
+		for i := 0; i < introCount; i++ {
+			paragraphs = append(paragraphs, pickRand(r, f.Intros))
+		}
+		if len(f.Bodies) > 0 {
+			bodyCount := 1 + r.IntN(3)
+			for range bodyCount {
+				paragraphs = append(paragraphs, pickRand(r, f.Bodies))
+			}
+		}
+		if len(f.Extras) > 0 && r.IntN(2) == 0 {
+			paragraphs = append(paragraphs, pickRand(r, f.Extras))
+		}
+		if len(f.Outros) > 0 && r.IntN(3) > 0 {
+			paragraphs = append(paragraphs, pickRand(r, f.Outros))
+		}
+		paragraphs = dedupeParagraphs(paragraphs)
+	}
+
+	title := pickRand(r, f.Titles)
+	heading := pickRand(r, f.Headings)
+	footer := pickRand(r, f.Footers)
+
+	// 片段池为空：退回旧式整篇文案。
+	if len(paragraphs) == 0 {
+		if legacy := contentPools.Pages[pageType]; len(legacy) > 0 {
+			c := legacy[r.IntN(len(legacy))]
+			paragraphs = c.Paragraphs
+			if title == "" {
+				title = c.Title
+			}
+			if heading == "" {
+				heading = c.Heading
+			}
+			if footer == "" {
+				footer = c.Footer
+			}
+		}
+	}
+
+	if len(paragraphs) == 0 {
+		// 最后的兜底：任何内容资源损坏的情况下页面仍然是完整可读的。
+		paragraphs = []string{"This page is temporarily unavailable. Please try again later."}
+	}
+
+	return pageContent{
+		Title:      title,
+		Heading:    resolveHeading(heading, title),
+		Paragraphs: paragraphs,
+		Footer:     resolveFooter(dep, footer),
+	}
+}
+
+// dedupeParagraphs 去掉拼装过程中可能重复的段落，保持原有顺序。
+func dedupeParagraphs(in []string) []string {
+	seen := make(map[string]bool, len(in))
+	out := make([]string, 0, len(in))
+	for _, p := range in {
+		p = strings.TrimSpace(p)
+		if p == "" || seen[p] {
+			continue
+		}
+		seen[p] = true
+		out = append(out, p)
+	}
+	return out
+}
+
+// resolveHeading 返回一级标题；为空时退回页面标题。
+func resolveHeading(heading, title string) string {
+	if h := strings.TrimSpace(heading); h != "" {
+		return h
+	}
+	return strings.TrimSpace(title)
+}
+
+// resolveFooter 替换页脚里的 {site} 与 {year} 占位符。年份取自本部署的
+// Last-Modified，使页脚版权年份与 HTTP 头自洽。
+func resolveFooter(dep *deployment, footer string) string {
+	footer = strings.TrimSpace(footer)
+	footer = strings.ReplaceAll(footer, "{site}", dep.site.Name)
+	footer = strings.ReplaceAll(footer, "{year}", strconv.Itoa(dep.lastModified.Year()))
+	if footer == "" {
+		footer = fmt.Sprintf("© %d %s. All rights reserved.", dep.lastModified.Year(), dep.site.Name)
+	}
+	return footer
+}
+
+// headExtras 生成 <head> 中的可选内容。内容由本包生成，只包含十六进制标记，
+// 因此以 template.HTML 注入是安全的（html/template 不会转义它）。
+func headExtras(dep *deployment) template.HTML {
+	token := hexToken(dep.seed, "asset")
+	return template.HTML(fmt.Sprintf(
+		`<link rel="icon" href="/favicon-%s.ico">%s<meta name="generator" content="%s">`,
+		token, "\n    ", pickBuildTag(dep.seed)))
+}
+
+// bodyClass 为 <body> 生成一个看似由主题/模板生成的 class。
+func bodyClass(pageType string) string {
+	if pageType == "home" {
+		return "home page"
+	}
+	return "page " + pageType
+}
+
+// hexToken 派生一个短十六进制标记，用作资源文件名的构建指纹。
+func hexToken(seed [32]byte, purpose string) string {
+	r := gen(seed, purpose)
+	const alphabet = "0123456789abcdef"
+	var b strings.Builder
+	for range 8 {
+		b.WriteByte(alphabet[r.IntN(len(alphabet))])
+	}
+	return b.String()
+}
+
+// ---------------------------------------------------------------------------
+// Fallback：回退服务实例
+// ---------------------------------------------------------------------------
+
+// ctxKey 是一个未导出的 context 键类型，用于把客户端可见的原始 Host 和 scheme
+// 从 Serve 传入反向代理的 ModifyResponse 钩子，从而可以把指向上游主机
+// 的 Location 头重写回客户端可见的主机，而无需通过 X-Forwarded-Host 暴露上游。
 type ctxKey int
 
 const (
@@ -432,65 +348,136 @@ const (
 	ctxOrigAcceptEncoding
 )
 
+// Fallback 持有一次部署的全部回退状态：模式配置与部署级身份在构造完成后只读，
+// 因此可以并发服务请求；运行期唯一的可变状态是有界的生成页缓存（cacheMu 保护）。
+//
+// 每个实例拥有独立的身份与缓存，因此不再需要"配置必须发生在服务器接受请求之前"
+// 这类只写在注释里的顺序契约：顺序由 constructor → handler 的数据流表达。
+type Fallback struct {
+	dep *deployment // 部署级身份（主题、站点名、导航、Last-Modified），构造后只读
+
+	custom  []byte            // 单文件自定义回退 HTML
+	pages   map[string][]byte // 目录模式：URL 路径 → HTML 字节
+	page404 []byte            // 目录模式的可选 404 页面
+
+	proxy    *httputil.ReverseProxy // 反代模式；nil 表示未启用
+	cdnHosts map[string]bool        // 反代模式允许的 CDN 主机集合（小写）
+
+	cacheMu    sync.Mutex
+	cache      map[string][]byte // 路径 → 生成页字节（有界，见 maxCachedFallbackPages）
+	cacheCount int
+}
+
+// FallbackConfig 是回退目标配置。Target 的解释见 (*Fallback).SetTarget；
+// PreserveHost 与 CDNDomains 只在反向代理模式下生效。
+type FallbackConfig struct {
+	Target       string
+	PreserveHost bool
+	CDNDomains   []string
+}
+
+// fallbackOptions 保存构造期的身份注入值（测试用固定种子/主题）。
+type fallbackOptions struct {
+	seed  []byte
+	theme string
+}
+
+// FallbackOption 在构造部署级身份时注入固定值，使测试得到可复现的输出。
+type FallbackOption func(*fallbackOptions)
+
+// WithSeed 用固定种子构造部署身份；nil 表示使用 crypto/rand 随机种子。
+func WithSeed(seed []byte) FallbackOption {
+	return func(o *fallbackOptions) { o.seed = seed }
+}
+
+// WithTheme 固定主题名（必须存在于内嵌 themes.json；不存在时回退为随机选择）。
+func WithTheme(name string) FallbackOption {
+	return func(o *fallbackOptions) { o.theme = name }
+}
+
+// NewFallback 构造一个回退服务实例：先生成部署级身份，再按 cfg.Target 装配模式。
+// 配置失败时返回错误，且不会产生任何可见状态（所有写入都发生在尚未返回的实例上，
+// 因此不存在旧实现那种"入口先清空全局、解析失败留下部分改写"的中间态）。
+func NewFallback(cfg FallbackConfig, opts ...FallbackOption) (*Fallback, error) {
+	var o fallbackOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
+	fb := &Fallback{
+		dep:   newDeployment(fallbackVariant{Seed: o.seed, Theme: o.theme}),
+		cache: make(map[string][]byte),
+	}
+	if err := fb.SetTarget(cfg.Target, cfg.PreserveHost, cfg.CDNDomains); err != nil {
+		return nil, err
+	}
+	return fb, nil
+}
+
+// builtinFallbackPtr 是包级内置实例（延迟构造）。测试通过
+// setBuiltinFallbackForTest 注入固定种子的实例；生产路径它始终只由
+// builtinFallback 在 sync.Once 内写一次。
 var (
-	initOnce       sync.Once
-	selectedTheme  themeDef
-	customFallback []byte
-	htmlCache      sync.Map // path string → []byte
-	htmlCacheCount atomic.Int32
-
-	// Directory-based multi-file fallback.
-	fallbackPages map[string][]byte // path → HTML bytes (e.g. "/about" → <html>...)
-	fallback404   []byte            // optional 404 page
-
-	// Reverse proxy to upstream HTTP service (e.g. local nginx).
-	fallbackProxy *httputil.ReverseProxy
-
-	// Allowed CDN hosts for /__cdn__/<host>/... path-prefix routing.
-	// Populated by SetFallbackProxy from the cdnDomains config. Keys are
-	// lowercased hostnames; a request to /__cdn__/github.githubassets.com/x
-	// is only proxied if "github.githubassets.com" is in this set.
-	fallbackCDNHosts map[string]bool
+	builtinFallbackOnce sync.Once
+	builtinFallbackPtr  *Fallback
 )
 
+// builtinFallback 返回进程级的内置回退实例，供未注入 Fallback 的 handler
+// （例如零值 ProxyHandler）兜底使用。它保证一个进程内只诞生一次身份，
+// 与旧 currentDeployment() 的按需初始化语义一致。
+func builtinFallback() *Fallback {
+	builtinFallbackOnce.Do(func() {
+		if builtinFallbackPtr == nil {
+			fb, err := NewFallback(FallbackConfig{})
+			if err != nil {
+				// FallbackConfig{} 不会失败，除非内嵌资源损坏；这里不能静默降级。
+				panic(fmt.Sprintf("fallback builtin init: %v", err))
+			}
+			builtinFallbackPtr = fb
+		}
+	})
+	return builtinFallbackPtr
+}
+
+// setBuiltinFallbackForTest 用给定实例（或 nil，表示恢复自动构造）替换包级内置
+// 实例。它只供测试使用，且必须在没有并发调用 builtinFallback 时调用。
+func setBuiltinFallbackForTest(fb *Fallback) {
+	builtinFallbackOnce = sync.Once{}
+	builtinFallbackPtr = fb
+}
+
 const (
-	// maxCachedFallbackPages bounds the generated-page cache. The curated
-	// paths (/, /about, ...) would use 9 entries; the rest of the budget
-	// serves arbitrary (generic) paths so a scanner hitting random URLs
-	// cannot force a template render on every single request. Once the cap
-	// is reached, further distinct paths render without caching (a render is
-	// a small template execution), so the cache can never grow unbounded.
+	// maxCachedFallbackPages 限制生成页面的缓存规模。固定的关键字路径
+	// （/、/about、/contact、/services、/blog 及其别名）只会占用少量条目；
+	// 其余预算用于任意（generic）路径，这样扫描器命中随机 URL 时
+	// 不会每次请求都触发模板渲染。达到上限后，新的不同路径直接渲染而不缓存
+	// （一次渲染只是一次小规模模板执行），因此缓存不会无限增长。
 	maxCachedFallbackPages = 320
 
-	// cdnPathPrefix is the URL path prefix under which requests for
-	// configured CDN domains are routed. A request to
+	// cdnPathPrefix 是配置的 CDN 域请求所路由到的 URL 路径前缀。请求
 	//   /__cdn__/github.githubassets.com/assets/foo.css
-	// is proxied to
+	// 会被代理到
 	//   https://github.githubassets.com/assets/foo.css
 	cdnPathPrefix = "/__cdn__/"
 )
 
-// SetFallbackHTML overrides the built-in fallback system with custom HTML.
-// Must be called before the server starts accepting requests.
-func SetFallbackHTML(html []byte) {
+// setHTML 用自定义 HTML 覆盖内置的回退系统。空内容表示未启用该模式。
+func (fb *Fallback) setHTML(html []byte) {
 	if len(html) == 0 {
 		return
 	}
-	customFallback = make([]byte, len(html))
-	copy(customFallback, html)
+	fb.custom = make([]byte, len(html))
+	copy(fb.custom, html)
 }
 
-// SetFallbackDir loads all .html files from a directory as multi-route fallback
-// pages. File-to-path mapping:
+// setDir 把目录下所有 .html 文件加载为多路由回退页面。文件到路径的映射：
 //   - index.html         → "/"
-//   - 404.html           → unmatched paths
+//   - 404.html           → 未匹配的路径
 //   - <name>.html        → "/<name>"
 //   - <sub>/<name>.html  → "/<sub>/<name>"
 //   - <sub>/index.html   → "/<sub>"
 //
-// Non-.html files are ignored. Must be called before the server starts
-// accepting requests.
-func SetFallbackDir(dir string) error {
+// 非 .html 文件会被忽略。仅应由构造路径调用（配置在构造后只读）。
+func (fb *Fallback) setDir(dir string) error {
 	pages := make(map[string][]byte)
 	var page404 []byte
 
@@ -517,16 +504,16 @@ func SetFallbackDir(dir string) error {
 
 		nameWithoutExt := strings.TrimSuffix(d.Name(), ".html")
 
-		// 404.html is special: stored for unmatched paths, not as a regular page.
+		// 404.html 是特殊的：作为未匹配路径的页面存储，而不是普通页面。
 		if strings.EqualFold(nameWithoutExt, "404") {
 			page404 = content
 			return nil
 		}
 
-		// Build URL path from relative file path.
+		// 根据相对文件路径构建 URL 路径。
 		urlPath := "/" + filepath.ToSlash(strings.TrimSuffix(rel, ".html"))
 
-		// index.html maps to parent directory (or "/" for root).
+		// index.html 映射到父目录（根目录时为 "/"）。
 		if strings.EqualFold(nameWithoutExt, "index") {
 			if dir := filepath.Dir(rel); dir == "." {
 				urlPath = "/"
@@ -542,735 +529,35 @@ func SetFallbackDir(dir string) error {
 		return err
 	}
 
-	fallbackPages = pages
-	fallback404 = page404
+	fb.pages = pages
+	fb.page404 = page404
 	return nil
 }
 
-// SetFallbackProxy configures a reverse proxy to forward non-proxy requests to
-// an upstream HTTP service (e.g. a local nginx). When set, this takes the
-// highest priority over all other fallback modes.
-// Pass an empty string to disable.
+// SetTarget 解析单个回退目标字符串并配置相应的回退模式。目标字符串按如下解释：
+//   - ""                           → 内置的主题化自动生成页面
+//   - "http://..." / "https://..." → 指向上游 HTTP 服务的反向代理
+//   - 目录路径                       → 多文件 HTML 回退（setDir）
+//   - 普通文件路径                    → 单文件自定义 HTML（setHTML）
 //
-// Unlike httputil.NewSingleHostReverseProxy, this uses Rewrite + SetURL so
-// that req.Host is set to the upstream host (some upstreams — e.g. GitHub —
-// return a 301 redirect to their canonical host when the Host header does not
-// match). A ModifyResponse hook rewrites Location headers that point at the
-// upstream host back to the client-facing host (read from the request
-// context, injected by ServeFallback), so that 3xx redirects issued by the
-// upstream do not cause the browser's address bar to jump to the upstream.
+// preserveHost 和 cdnDomains 只影响反向代理模式（见 setProxy）；
+// 在目录/文件/内置模式下会被忽略。
 //
-// If preserveHost is true, the client-facing Host header is forwarded to the
-// upstream unchanged (i.e. SetURL is still called for scheme/host/path but
-// Out.Host is restored to the original request Host). This is useful when
-// proxying to a local nginx that uses server_name-based virtual host routing
-// and expects to see the public-facing Host.
-//
-// HTML response bodies and the Content-Security-Policy header are always
-// rewritten so that absolute URLs pointing at the upstream host (e.g.
-// https://github.com/...) are replaced with the client-facing origin (e.g.
-// https://my-site.com/...). This is needed for upstreams like GitHub that
-// embed absolute URLs in turbo-frame src attributes or CSP directives, which
-// otherwise cause CSP violations and direct browser connections to the
-// upstream.
-//
-// cdnDomains is a list of additional hosts (e.g. "github.githubassets.com")
-// whose resources should also be proxied through the client-facing origin.
-// Requests to /__cdn__/<host>/<path> are routed to https://<host>/<path>, and
-// HTML/CSP content referencing these hosts is rewritten to the /__cdn__/
-// prefix form. Pass nil/empty to disable CDN proxying.
-//
-// Accept-Encoding negotiation: the proxy intersects the client's
-// Accept-Encoding with the encodings it can handle (gzip and identity). If
-// the client accepts gzip, the upstream request advertises "identity, gzip"
-// so the upstream may compress large responses; gzip HTML is decompressed for
-// rewriting and re-compressed before returning to the client. If the client
-// does not accept gzip, the upstream request advertises "identity" only, so
-// no decompression/recompression is needed.
-func SetFallbackProxy(targetURL string, preserveHost bool, cdnDomains []string) error {
-	if targetURL == "" {
-		fallbackProxy = nil
-		fallbackCDNHosts = nil
-		return nil
-	}
-	u, err := url.Parse(targetURL)
-	if err != nil {
-		return fmt.Errorf("parse fallback proxy url: %w", err)
-	}
-	targetHost := u.Host
-
-	// Build the allowed CDN host set (lowercased for case-insensitive match).
-	cdnSet := make(map[string]bool, len(cdnDomains))
-	for _, d := range cdnDomains {
-		cdnSet[strings.ToLower(strings.TrimSpace(d))] = true
-	}
-	fallbackCDNHosts = cdnSet
-
-	fallbackProxy = &httputil.ReverseProxy{
-		Rewrite: func(pr *httputil.ProxyRequest) {
-			// Check if this is a CDN-routed request (/__cdn__/<host>/...).
-			if cdnTarget, ok := routeCDN(pr, cdnSet); ok {
-				// CDN request: route to the extracted CDN host. Set
-				// URL fields directly (not SetURL) to avoid path joining.
-				pr.Out.URL.Scheme = cdnTarget.Scheme
-				pr.Out.URL.Host = cdnTarget.Host
-				pr.Out.URL.Path = cdnTarget.Path
-				pr.Out.URL.RawQuery = cdnTarget.RawQuery
-				pr.Out.Host = cdnTarget.Host
-				setAcceptEncoding(pr)
-				return
-			}
-
-			// Normal request: route to the main upstream.
-			pr.SetURL(u)
-			if preserveHost {
-				pr.Out.Host = pr.In.Host
-			}
-			setAcceptEncoding(pr)
-			// Rewrite Origin and Referer request headers so the upstream
-			// sees its own origin. Without this, Rails CSRF protection
-			// (e.g. GitHub) rejects POST requests because the Origin header
-			// is "https://my-site.com" instead of "https://github.com",
-			// resulting in HTTP 422.
-			rewriteRequestOriginReferrer(pr.Out, pr.In.Host, u)
-		},
-		ModifyResponse: func(resp *http.Response) error {
-			// Determine the effective target host for this response: if it
-			// was a CDN request, use the CDN host; otherwise use the main
-			// upstream host.
-			effectiveHost := targetHost
-			if cdnHost, ok := cdnHostFromRequest(resp.Request, cdnSet); ok {
-				effectiveHost = cdnHost
-			}
-			if err := rewriteLocationHeader(resp, effectiveHost); err != nil {
-				return err
-			}
-			rewriteSetCookieHeaders(resp, effectiveHost)
-			// Rewrite CSP header independently of body rewriting, so that
-			// CSP is always processed even if the body cannot be read
-			// (e.g. unsupported Content-Encoding like br).
-			rewriteCSPHeader(resp, effectiveHost)
-			return rewriteResponseBody(resp, effectiveHost)
-		},
-	}
-	return nil
-}
-
-// setAcceptEncoding sets the outbound Accept-Encoding header based on what
-// the client accepts, intersected with what the proxy can handle (gzip and
-// identity).
-func setAcceptEncoding(pr *httputil.ProxyRequest) {
-	clientAE := pr.In.Header.Get("Accept-Encoding")
-	if clientAcceptsGzip(clientAE) {
-		pr.Out.Header.Set("Accept-Encoding", "identity, gzip")
-	} else {
-		pr.Out.Header.Set("Accept-Encoding", "identity")
-	}
-}
-
-// cdnHostMatches reports whether host matches any configured CDN domain.
-// It matches exactly (host == domain) or as a subdomain (host's parent
-// domain is in the set), using util.SubDomains for parent-domain extraction.
-// For example, if "githubassets.com" is configured, both "githubassets.com"
-// and "github.githubassets.com" match, but "notgithubassets.com" does not.
-func cdnHostMatches(host string, cdnSet map[string]bool) bool {
-	if cdnSet[strings.ToLower(host)] {
-		return true
-	}
-	for _, sub := range util.SubDomains(host) {
-		if cdnSet[strings.ToLower(sub)] {
-			return true
-		}
-	}
-	return false
-}
-
-// routeCDN checks if the outbound request path starts with the CDN path
-// prefix (/__cdn__/<host>/...) and, if the extracted host is in the allowed
-// set (exact or subdomain match), returns the upstream URL to proxy to.
-// Returns ok=false if the request is not a CDN-routed request or the host
-// is not allowed.
-func routeCDN(pr *httputil.ProxyRequest, cdnSet map[string]bool) (*url.URL, bool) {
-	path := pr.Out.URL.Path
-	if !strings.HasPrefix(path, cdnPathPrefix) {
-		return nil, false
-	}
-	rest := path[len(cdnPathPrefix):]
-	// Extract the host: everything up to the next "/".
-	slashIdx := strings.Index(rest, "/")
-	var host, restPath string
-	if slashIdx < 0 {
-		host = rest
-		restPath = ""
-	} else {
-		host = rest[:slashIdx]
-		restPath = rest[slashIdx:]
-	}
-	if host == "" {
-		return nil, false
-	}
-	if !cdnHostMatches(host, cdnSet) {
-		return nil, false
-	}
-	target := &url.URL{
-		Scheme: "https",
-		Host:   host,
-		Path:   restPath,
-	}
-	if pr.Out.URL.RawQuery != "" {
-		target.RawQuery = pr.Out.URL.RawQuery
-	}
-	return target, true
-}
-
-// cdnHostFromRequest extracts the CDN host from a request's URL path if it
-// is a /__cdn__/ request with an allowed host (exact or subdomain match).
-// Returns ok=false otherwise.
-func cdnHostFromRequest(req *http.Request, cdnSet map[string]bool) (string, bool) {
-	if req == nil {
-		return "", false
-	}
-	path := req.URL.Path
-	if !strings.HasPrefix(path, cdnPathPrefix) {
-		return "", false
-	}
-	rest := path[len(cdnPathPrefix):]
-	slashIdx := strings.Index(rest, "/")
-	var host string
-	if slashIdx < 0 {
-		host = rest
-	} else {
-		host = rest[:slashIdx]
-	}
-	if host == "" || !cdnHostMatches(host, cdnSet) {
-		return "", false
-	}
-	return host, true
-}
-
-// clientAcceptsGzip reports whether the given Accept-Encoding header value
-// indicates that gzip is acceptable to the client (q-value > 0). The wildcard
-// "*" is treated as accepting gzip.
-func clientAcceptsGzip(acceptEncoding string) bool {
-	if acceptEncoding == "" {
-		return false
-	}
-	for _, part := range strings.Split(acceptEncoding, ",") {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
-		}
-		coding := part
-		q := 1.0
-		for i, p := range strings.Split(part, ";") {
-			p = strings.TrimSpace(p)
-			if i == 0 {
-				coding = p
-				continue
-			}
-			if strings.HasPrefix(p, "q=") {
-				if v, err := strconv.ParseFloat(p[2:], 64); err == nil {
-					q = v
-				}
-			}
-		}
-		if (coding == "gzip" || coding == "*") && q > 0 {
-			return true
-		}
-	}
-	return false
-}
-
-// rewriteRequestOriginReferrer rewrites the Origin and Referer headers on the
-// outbound request so the upstream sees its own origin instead of the
-// proxy's client-facing host. This is required for upstreams that validate
-// the Origin header as part of CSRF protection (e.g. Rails/GitHub return HTTP
-// 422 when the Origin doesn't match). Only headers whose host equals the
-// client-facing host are rewritten; headers pointing at other hosts are left
-// untouched.
-func rewriteRequestOriginReferrer(out *http.Request, clientHost string, upstream *url.URL) {
-	for _, hdr := range []string{"Origin", "Referer"} {
-		val := out.Header.Get(hdr)
-		if val == "" {
-			continue
-		}
-		parsed, err := url.Parse(val)
-		if err != nil {
-			continue
-		}
-		if parsed.Host != clientHost {
-			continue
-		}
-		parsed.Scheme = upstream.Scheme
-		parsed.Host = upstream.Host
-		out.Header.Set(hdr, parsed.String())
-	}
-}
-
-// rewriteLocationHeader rewrites a 3xx Location header so that browser
-// redirects stay on the proxy's address. It handles two cases:
-//  1. Location pointing at the main upstream host → rewrite to client-facing host
-//  2. Location pointing at a configured CDN domain → rewrite to /__cdn__/<host>/<path>
-//
-// Relative-path Locations (e.g. "/login") and Locations pointing at other
-// hosts are left untouched.
-func rewriteLocationHeader(resp *http.Response, targetHost string) error {
-	loc := resp.Header.Get("Location")
-	if loc == "" {
-		return nil
-	}
-	locURL, err := url.Parse(loc)
-	if err != nil {
-		// Malformed Location — leave it untouched and let the client decide.
-		return nil
-	}
-	if locURL.Host == "" {
-		return nil
-	}
-
-	ctx := resp.Request.Context()
-	origHost, _ := ctx.Value(ctxOrigHost).(string)
-	if origHost == "" {
-		return nil
-	}
-	origScheme, _ := ctx.Value(ctxOrigScheme).(string)
-	if origScheme == "" {
-		origScheme = "https"
-	}
-
-	// Case 1: Location points at the main upstream host.
-	if locURL.Host == targetHost {
-		locURL.Scheme = origScheme
-		locURL.Host = origHost
-		resp.Header.Set("Location", locURL.String())
-		return nil
-	}
-
-	// Case 2: Location points at a configured CDN domain (or subdomain).
-	// Rewrite to /__cdn__/<host>/<path> so the browser follows the
-	// redirect through the proxy instead of going directly to the CDN.
-	// This handles cases like GitHub's /raw/ URLs redirecting to
-	// raw.githubusercontent.com.
-	if cdnHostMatches(locURL.Host, fallbackCDNHosts) {
-		cdnHost := locURL.Host
-		locURL.Scheme = origScheme
-		locURL.Host = origHost
-		locURL.Path = cdnPathPrefix + cdnHost + locURL.Path
-		resp.Header.Set("Location", locURL.String())
-		return nil
-	}
-
-	return nil
-}
-
-// rewriteSetCookieHeaders rewrites Set-Cookie response headers so that cookies
-// set by the upstream for its own domain are accepted by the browser visiting
-// the proxy's host. Without this, an upstream like GitHub that sets
-// "Domain=github.com" on its session cookies would be rejected by the browser
-// (the page origin is my-site.com, not a subdomain of github.com), causing
-// features that depend on session cookies — such as CSRF tokens in the login
-// form — to fail with HTTP 422.
-//
-// For each Set-Cookie header whose Domain attribute equals the upstream host
-// (case-insensitive, leading dot ignored), the Domain attribute is removed
-// entirely so the cookie becomes a host-only cookie bound to the proxy's host.
-// Cookies with a Domain pointing at a different host are left untouched.
-func rewriteSetCookieHeaders(resp *http.Response, targetHost string) {
-	cookies := resp.Header["Set-Cookie"]
-	if len(cookies) == 0 {
-		return
-	}
-
-	targetHostLower := strings.ToLower(strings.TrimPrefix(targetHost, "."))
-
-	rewritten := make([]string, 0, len(cookies))
-	for _, raw := range cookies {
-		parts := strings.Split(raw, ";")
-		for i, part := range parts {
-			p := strings.TrimSpace(part)
-			if len(p) <= 7 { // len("Domain=") == 7
-				continue
-			}
-			if !strings.EqualFold(p[:7], "Domain=") {
-				continue
-			}
-			domain := strings.TrimSpace(p[7:])
-			domain = strings.TrimPrefix(domain, ".")
-			if strings.EqualFold(domain, targetHostLower) {
-				// Remove the Domain attribute so the cookie becomes a
-				// host-only cookie for the proxy's host.
-				rewrittenParts := append(append([]string{}, parts[:i]...), parts[i+1:]...)
-				raw = strings.Join(rewrittenParts, ";")
-				break
-			}
-		}
-		rewritten = append(rewritten, raw)
-	}
-	resp.Header["Set-Cookie"] = rewritten
-}
-
-// rewriteCSP rewrites a Content-Security-Policy header value so that source
-// expressions referencing the upstream host are replaced with the
-// client-facing origin. It handles three forms:
-//  1. Scheme-prefixed: "https://github.com/path" → "https://my-site.com/path"
-//  2. Scheme-prefixed http: "http://github.com/path" → "https://my-site.com/path"
-//  3. Bare host: "github.com/assets-cdn/worker/" → "my-site.com/assets-cdn/worker/"
-//
-// Bare-host replacement is done token-by-token (CSP source lists are
-// space-separated) to avoid accidentally replacing substrings of other hosts
-// (e.g. "api.github.com" or "github.githubassets.com").
-func rewriteCSP(csp, targetHost, origOrigin string) string {
-	// Replace scheme-prefixed forms first.
-	csp = strings.ReplaceAll(csp, "https://"+targetHost, origOrigin)
-	csp = strings.ReplaceAll(csp, "http://"+targetHost, origOrigin)
-
-	// Replace bare-host forms (no scheme prefix). CSP source lists are
-	// space-separated, so split on space and replace tokens that start
-	// with the target host followed by "/" or end exactly at the target
-	// host. This avoids matching substrings of other hosts like
-	// "api.github.com" or "github.githubassets.com".
-	origHost := strings.TrimPrefix(origOrigin, "http://")
-	origHost = strings.TrimPrefix(origHost, "https://")
-	parts := strings.Split(csp, " ")
-	for i, part := range parts {
-		// Strip trailing ";" (CSP directive separator) so it doesn't
-		// interfere with host matching, then reattach it after.
-		suffix := ""
-		if strings.HasSuffix(part, ";") {
-			suffix = ";"
-			part = strings.TrimRight(part, ";")
-		}
-		if part == targetHost || strings.HasPrefix(part, targetHost+"/") {
-			parts[i] = strings.Replace(part, targetHost, origHost, 1) + suffix
-		}
-	}
-	return strings.Join(parts, " ")
-}
-
-// cdnURLRegexpCache caches compiled regexps for CDN domain patterns so we
-// don't recompile on every response.
-var cdnURLRegexpCache sync.Map // cdnHost string → *regexp.Regexp
-
-// rewriteCDNURLs replaces absolute URLs (http and https) pointing at any
-// configured CDN domain or its subdomains with the /__cdn__/<host> prefix
-// form. For example, if "githubassets.com" is configured:
-//
-//	https://github.githubassets.com/assets/foo.css
-//	→ https://my-site.com/__cdn__/github.githubassets.com/assets/foo.css
-//
-//	https://githubassets.com/assets/bar.css
-//	→ https://my-site.com/__cdn__/githubassets.com/assets/bar.css
-//
-// The original host (including subdomain) is preserved in the /__cdn__/ path
-// so that the proxy can route to the correct upstream.
-func rewriteCDNURLs(body []byte, origOrigin string, cdnHosts map[string]bool) []byte {
-	for cdnHost := range cdnHosts {
-		re := getCdnURLRegexp(cdnHost)
-		replaced := re.ReplaceAllFunc(body, func(match []byte) []byte {
-			// The match is "https://<full-host>/" or "https://<full-host>:".
-			// Extract the full host (everything between "://" and the
-			// trailing "/" or ":").
-			s := string(match)
-			idx := strings.Index(s, "://")
-			rest := s[idx+3:]
-			// Trim trailing "/" or ":" to get the host.
-			fullHost := rest
-			if last := fullHost[len(fullHost)-1]; last == '/' || last == ':' {
-				fullHost = fullHost[:len(fullHost)-1]
-			}
-			// Reconstruct: origOrigin + /__cdn__/<full-host> + trailing char.
-			trailing := string(rest[len(fullHost):])
-			return []byte(origOrigin + cdnPathPrefix + fullHost + trailing)
-		})
-		body = replaced
-	}
-	return body
-}
-
-// getCdnURLRegexp returns a compiled regexp that matches "https://<host>" or
-// "http://<host>" where <host> is the configured CDN domain or any of its
-// subdomains. The regexp is cached for reuse.
-//
-// The pattern matches the scheme and host only (not the path), and requires
-// the host to be followed by "/" or ":" (port) or to be at a word boundary
-// to avoid matching "notgithubassets.com" when the configured host is
-// "githubassets.com".
-func getCdnURLRegexp(cdnHost string) *regexp.Regexp {
-	if cached, ok := cdnURLRegexpCache.Load(cdnHost); ok {
-		return cached.(*regexp.Regexp)
-	}
-	escaped := regexp.QuoteMeta(cdnHost)
-	// Match "https://" or "http://" followed by an optional subdomain
-	// prefix (one or more labels ending with ".") then the CDN host.
-	// The host must be followed by "/" or ":" (port) — captured as a
-	// trailing group so it is not consumed by the match.
-	pattern := `https?://(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?\.)?` + escaped + `(?:/|:)`
-	re := regexp.MustCompile(pattern)
-	cdnURLRegexpCache.Store(cdnHost, re)
-	return re
-}
-
-// rewriteCDNInCSP rewrites a Content-Security-Policy header value so that
-// source expressions referencing any configured CDN domain (or its
-// subdomains) are replaced with the /__cdn__/<host>/ prefix form. This
-// handles both scheme-prefixed forms (e.g. "https://github.githubassets.com")
-// and bare-host forms (e.g. "github.githubassets.com/assets/").
-//
-// For example, if "githubassets.com" is configured:
-//
-//	https://github.githubassets.com → https://my-site.com/__cdn__/github.githubassets.com/ https://github.githubassets.com
-//	github.githubassets.com/assets/ → my-site.com/__cdn__/github.githubassets.com/assets/ github.githubassets.com/assets/
-//
-// A trailing "/" is added when the original token had no path (bare host),
-// because CSP path matching requires a trailing "/" to match sub-paths.
-//
-// The original CDN host token is PRESERVED alongside the rewritten form.
-// This is necessary because JavaScript code may dynamically construct URLs
-// pointing at the original CDN host (e.g. by string concatenation), which
-// cannot be caught by body rewriting. Without the original host in CSP,
-// these JS-initiated requests would be blocked (blocked:csp). Keeping the
-// original host allows the request to go through (directly to the CDN),
-// trading some privacy for functionality.
-//
-// The full host (including subdomain) is preserved in the /__cdn__/ path.
-func rewriteCDNInCSP(csp, origScheme, origHost string, cdnHosts map[string]bool) string {
-	origOrigin := origScheme + "://" + origHost
-	parts := strings.Split(csp, " ")
-	for i, part := range parts {
-		// CSP directives are separated by ";", which may stick to the
-		// end of a token after space-splitting (e.g.
-		// "https://github.githubassets.com;"). Strip and preserve the
-		// trailing ";" so it doesn't break URL parsing or host matching.
-		suffix := ""
-		if strings.HasSuffix(part, ";") {
-			suffix = ";"
-			part = strings.TrimRight(part, ";")
-		}
-
-		// Check if this is a scheme-prefixed URL.
-		if strings.HasPrefix(part, "https://") || strings.HasPrefix(part, "http://") {
-			u, err := url.Parse(part)
-			if err != nil || u.Host == "" {
-				continue
-			}
-			if !cdnHostMatches(u.Host, cdnHosts) {
-				continue
-			}
-			// Reconstruct: origOrigin + /__cdn__/<full-host> + path + query.
-			// If the original had no path, add "/" so CSP matches sub-paths.
-			pathQuery := u.Path
-			if pathQuery == "" {
-				pathQuery = "/"
-			}
-			if u.RawQuery != "" {
-				pathQuery += "?" + u.RawQuery
-			}
-			rewritten := origOrigin + cdnPathPrefix + u.Host + pathQuery
-			// Preserve the original token so JS-constructed URLs to the
-			// CDN host are not blocked by CSP.
-			parts[i] = rewritten + " " + part + suffix
-			continue
-		}
-		// Bare-host form: check if the token starts with a CDN host.
-		host := part
-		hasPath := false
-		if slashIdx := strings.Index(part, "/"); slashIdx >= 0 {
-			host = part[:slashIdx]
-			hasPath = true
-		}
-		if host == "" {
-			continue
-		}
-		if !cdnHostMatches(host, cdnHosts) {
-			continue
-		}
-		// Replace the host portion with my-site.com/__cdn__/<full-token>.
-		// If the original had no path, add "/" for CSP sub-path matching.
-		// Preserve the original token so JS-constructed URLs to the CDN
-		// host are not blocked by CSP.
-		var rewritten string
-		if !hasPath {
-			rewritten = origHost + cdnPathPrefix + part + "/"
-		} else {
-			rewritten = origHost + cdnPathPrefix + part
-		}
-		parts[i] = rewritten + " " + part + suffix
-	}
-	return strings.Join(parts, " ")
-}
-
-// rewriteCSPHeader rewrites the Content-Security-Policy response header
-// independently of body rewriting. This ensures CSP is always processed even
-// when the response body cannot be read (e.g. unsupported Content-Encoding
-// like br) or is not HTML. Without this, browsers may block sub-resources
-// (CSS, JS, workers) loaded via /__cdn__/ paths because the CSP still
-// references the original upstream/CDN hosts.
-func rewriteCSPHeader(resp *http.Response, targetHost string) {
-	csp := resp.Header.Get("Content-Security-Policy")
-	if csp == "" {
-		return
-	}
-	ctx := resp.Request.Context()
-	origHost, _ := ctx.Value(ctxOrigHost).(string)
-	if origHost == "" {
-		return
-	}
-	origScheme, _ := ctx.Value(ctxOrigScheme).(string)
-	if origScheme == "" {
-		origScheme = "https"
-	}
-	origOrigin := origScheme + "://" + origHost
-	csp = rewriteCSP(csp, targetHost, origOrigin)
-	csp = rewriteCDNInCSP(csp, origScheme, origHost, fallbackCDNHosts)
-	resp.Header.Set("Content-Security-Policy", csp)
-}
-
-// isRewritableContentType reports whether a response with the given
-// Content-Type should have its body rewritten for URL substitution. Only
-// HTML is rewritable; JavaScript is not because JS often constructs URLs
-// dynamically (string concatenation) which cannot be caught by body
-// rewriting, and scanning large JS files wastes CPU.
-func isRewritableContentType(ct string) bool {
-	ct = strings.ToLower(strings.TrimSpace(ct))
-	// Strip any parameters (e.g. "; charset=utf-8").
-	if idx := strings.Index(ct, ";"); idx >= 0 {
-		ct = strings.TrimSpace(ct[:idx])
-	}
-	return ct == "text/html"
-}
-
-// rewriteResponseBody reads an HTML response body and replaces absolute URLs
-// pointing at the upstream host (both http and https variants) with the
-// client-facing origin, so that browser-initiated requests (e.g. Turbo frame
-// fetches, <a> links, <form> actions) stay on the proxy instead of going
-// directly to the upstream. The Content-Security-Policy response header is
-// similarly rewritten (see rewriteCSPHeader). Non-HTML responses are passed
-// through unchanged.
-//
-// The upstream request's Accept-Encoding is set to "identity, gzip" (when the
-// client accepts gzip) or "identity" (otherwise), so the upstream may return
-// either plain text or gzip-compressed content; gzip is transparently
-// decompressed before rewriting. After rewriting, if the client accepts gzip,
-// the response is re-compressed with gzip before being returned; otherwise it
-// is sent uncompressed.
-func rewriteResponseBody(resp *http.Response, targetHost string) error {
-	// Only rewrite HTML and JavaScript responses.
-	ct := resp.Header.Get("Content-Type")
-	if !isRewritableContentType(ct) {
-		return nil
-	}
-
-	// Read the body, decompressing gzip if necessary.
-	enc := resp.Header.Get("Content-Encoding")
-	var body []byte
-	var err error
-
-	switch enc {
-	case "", "identity":
-		body, err = io.ReadAll(resp.Body)
-		resp.Body.Close() //nolint:errcheck
-	case "gzip":
-		gr, gerr := gzip.NewReader(resp.Body)
-		if gerr != nil {
-			resp.Body.Close() //nolint:errcheck
-			return nil        // skip rewriting on decompress error
-		}
-		body, err = io.ReadAll(gr)
-		gr.Close()        //nolint:errcheck
-		resp.Body.Close() //nolint:errcheck
-	default:
-		// Unsupported encoding (br, deflate, etc.) — skip rewriting.
-		return nil
-	}
-	if err != nil {
-		return nil
-	}
-
-	// Get the client-facing host/scheme from the request context.
-	ctx := resp.Request.Context()
-	origHost, _ := ctx.Value(ctxOrigHost).(string)
-	if origHost == "" {
-		// No client-facing host available — return body as-is.
-		resp.Body = io.NopCloser(bytes.NewReader(body))
-		return nil
-	}
-	origScheme, _ := ctx.Value(ctxOrigScheme).(string)
-	if origScheme == "" {
-		origScheme = "https"
-	}
-
-	// Replace absolute URLs: both http and https variants of the upstream
-	// host are replaced with the client-facing origin.
-	origOrigin := origScheme + "://" + origHost
-	replaced := body
-	replaced = bytes.ReplaceAll(replaced, []byte("http://"+targetHost), []byte(origOrigin))
-	replaced = bytes.ReplaceAll(replaced, []byte("https://"+targetHost), []byte(origOrigin))
-
-	// Replace CDN domain URLs with /__cdn__/<host> prefix form so that
-	// browser requests for static assets (CSS, JS, images) hosted on CDN
-	// domains are routed through the proxy instead of going directly to
-	// the CDN host. This matches both the configured domain exactly and
-	// any subdomain (e.g. "githubassets.com" matches both
-	// "githubassets.com" and "github.githubassets.com").
-	replaced = rewriteCDNURLs(replaced, origOrigin, fallbackCDNHosts)
-
-	// Note: Content-Security-Policy header rewriting is handled
-	// independently by rewriteCSPHeader in ModifyResponse, not here,
-	// so that CSP is always processed even when the body cannot be read.
-
-	// Re-compress with gzip if the client accepts it, so we don't waste
-	// bandwidth on the client<->proxy leg. Otherwise send uncompressed.
-	origAE, _ := ctx.Value(ctxOrigAcceptEncoding).(string)
-	if clientAcceptsGzip(origAE) {
-		var buf bytes.Buffer
-		gw := gzip.NewWriter(&buf)
-		if _, werr := gw.Write(replaced); werr != nil {
-			gw.Close() //nolint:errcheck
-			// Fall back to uncompressed on error.
-			resp.Body = io.NopCloser(bytes.NewReader(replaced))
-			resp.ContentLength = int64(len(replaced))
-			resp.Header.Set("Content-Length", strconv.Itoa(len(replaced)))
-			resp.Header.Del("Content-Encoding")
-			return nil
-		}
-		gw.Close() //nolint:errcheck
-		resp.Body = io.NopCloser(bytes.NewReader(buf.Bytes()))
-		resp.ContentLength = int64(buf.Len())
-		resp.Header.Set("Content-Length", strconv.Itoa(buf.Len()))
-		resp.Header.Set("Content-Encoding", "gzip")
-		return nil
-	}
-
-	resp.Body = io.NopCloser(bytes.NewReader(replaced))
-	resp.ContentLength = int64(len(replaced))
-	resp.Header.Set("Content-Length", strconv.Itoa(len(replaced)))
-	resp.Header.Del("Content-Encoding")
-	return nil
-}
-
-// SetFallbackTarget resolves a single fallback target string and configures the
-// appropriate fallback mode. The target is interpreted as:
-//   - ""                        → built-in themed auto-generated pages
-//   - "http://..." / "https://..." → reverse proxy to an upstream HTTP service
-//   - a directory path             → multi-file HTML fallback (SetFallbackDir)
-//   - a regular file path          → single-file custom HTML (SetFallbackHTML)
-//
-// preserveHost and cdnDomains only affect the reverse-proxy mode (see
-// SetFallbackProxy); they are ignored for the directory/file/built-in modes.
-func SetFallbackTarget(target string, preserveHost bool, cdnDomains []string) error {
-	// Reset all fallback state.
-	fallbackProxy = nil
-	fallbackCDNHosts = nil
-	fallbackPages = nil
-	fallback404 = nil
-	customFallback = nil
+// 每次调用都会先清空全部模式，因此新配置总是替换旧配置，而不是叠加。
+func (fb *Fallback) SetTarget(target string, preserveHost bool, cdnDomains []string) error {
+	// 重置所有回退模式。
+	fb.proxy = nil
+	fb.cdnHosts = nil
+	fb.pages = nil
+	fb.page404 = nil
+	fb.custom = nil
 
 	if target == "" {
 		return nil
 	}
 
 	if strings.HasPrefix(target, "http://") || strings.HasPrefix(target, "https://") {
-		return SetFallbackProxy(target, preserveHost, cdnDomains)
+		return fb.setProxy(target, preserveHost, cdnDomains)
 	}
 
 	info, err := os.Stat(target)
@@ -1279,78 +566,134 @@ func SetFallbackTarget(target string, preserveHost bool, cdnDomains []string) er
 	}
 
 	if info.IsDir() {
-		return SetFallbackDir(target)
+		return fb.setDir(target)
 	}
 
 	data, err := os.ReadFile(target)
 	if err != nil {
 		return fmt.Errorf("read fallback target: %w", err)
 	}
-	SetFallbackHTML(data)
+	fb.setHTML(data)
 	return nil
 }
 
-// ServeFallback writes a fallback HTML page to the response.
-// Priority (highest first):
-//  0. Reverse proxy to upstream HTTP service (SetFallbackProxy)
-//  1. Directory-based multi-file fallback (SetFallbackDir)
-//  2. Single-file custom fallback (SetFallbackHTML)
-//  3. Auto-generated themed pages
-func ServeFallback(w http.ResponseWriter, r *http.Request) {
+// Serve 向响应写入一个回退页面。
+// 优先级（从高到低）：
+//  0. 指向上游 HTTP 服务的反向代理（setProxy）
+//  1. 基于目录的多文件回退（setDir）
+//  2. 单文件自定义回退（setHTML）
+//  3. 自动生成的主题化页面
+func (fb *Fallback) Serve(w http.ResponseWriter, r *http.Request) {
 	stats.RecordServerFallbackPage()
-	initOnce.Do(func() {
-		selectedTheme = themes[rand.IntN(len(themes))]
-	})
 
-	// Priority 0 (highest): reverse proxy to upstream HTTP service.
-	if fallbackProxy != nil {
+	// 优先级 0（最高）：指向上游 HTTP 服务的反向代理。
+	if fb.proxy != nil {
 		scheme := "http"
 		if r.TLS != nil {
 			scheme = "https"
 		}
-		// Strip easyss-specific headers (e.g. x-es) before forwarding so the
-		// upstream service never sees proxy protocol traces.
+		// 转发前剥离 easyss 特有的请求头（如 x-es），使上游服务永远看不到代理协议痕迹。
 		r2 := r.Clone(r.Context())
 		r2.Header.Del("x-es")
 		ctx := context.WithValue(r2.Context(), ctxOrigHost, r2.Host)
 		ctx = context.WithValue(ctx, ctxOrigScheme, scheme)
 		ctx = context.WithValue(ctx, ctxOrigAcceptEncoding, r2.Header.Get("Accept-Encoding"))
-		fallbackProxy.ServeHTTP(w, r2.WithContext(ctx))
+		fb.proxy.ServeHTTP(w, r2.WithContext(ctx))
 		return
 	}
 
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Server", "nginx")
-	w.WriteHeader(http.StatusOK)
+	path := cleanPath(r.URL.Path)
 
-	// Priority 1: directory-based multi-file fallback.
-	if len(fallbackPages) > 0 {
-		content, ok := fallbackPages[cleanPath(r.URL.Path)]
+	// 优先级 1：基于目录的多文件回退。这些页面完全由运营者提供，
+	// 因此状态码与缓存头保持原样（200 + 固定的 Content-Type）。
+	if len(fb.pages) > 0 {
+		content, ok := fb.pages[path]
 		if !ok {
-			content = fallback404
+			content = fb.page404
 		}
 		if !ok && len(content) == 0 {
-			// No matching page and no 404.html — fall back to index.
-			content = fallbackPages["/"]
+			// 没有匹配的页面也没有 404.html——回退到 index。
+			content = fb.pages["/"]
 		}
 		if len(content) > 0 {
-			w.Write(content) //nolint:errcheck
+			writeRawFallback(w, content)
 			return
 		}
 	}
 
-	// Priority 2: single-file custom fallback.
-	if len(customFallback) > 0 {
-		w.Write(customFallback) //nolint:errcheck
+	// 优先级 2：单文件自定义回退。
+	if len(fb.custom) > 0 {
+		writeRawFallback(w, fb.custom)
 		return
 	}
 
-	// Priority 3: auto-generated themed pages.
-	w.Write(getOrRenderHTML(r.URL.Path)) //nolint:errcheck
+	// 优先级 3：自动生成的主题化页面。这里走完整的 HTTP 真实性层：
+	// 未知路径返回 404，并补齐 ETag/Last-Modified/条件请求。
+	fb.serveGeneratedPage(w, r, path)
 }
 
-// cleanPath normalizes a URL path for lookup: "/" stays "/", everything else
-// gets its trailing slash removed.
+// writeRawFallback 写出运营者提供的回退页面。保持此前的行为：
+// 固定 200、固定 Content-Type，不注入任何部署级元信息。
+func writeRawFallback(w http.ResponseWriter, content []byte) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Server", "nginx")
+	w.WriteHeader(http.StatusOK)
+	w.Write(content) //nolint:errcheck
+}
+
+// serveGeneratedPage 服务自动生成的页面，并补齐真实静态站点会有的响应头与
+// 条件请求语义。
+func (fb *Fallback) serveGeneratedPage(w http.ResponseWriter, r *http.Request, path string) {
+	body := fb.getOrRenderHTML(path)
+	lastModified := fb.dep.lastModified
+
+	if prepareFallbackResponse(w, r, body, lastModified, generatedStatus(r, path)) {
+		w.Write(body) //nolint:errcheck
+	}
+}
+
+// generatedStatus 决定自动生成页面的状态码。
+//
+// 浏览器式的内容请求（Accept 中含 text/html）命中未知路径时返回 404：
+// 对随机 URL 一律回 200 首页本身就是可观测的伪装特征，真实站点会 404。
+//
+// 非内容请求（例如 easyss 客户端对 /v3/probe 的主动探测，Accept 为 */*）
+// 保持 200 + 页面正文：那里没有任何指纹收益，而保持响应形状不变可以避免
+// 影响既有客户端与探测降级逻辑。
+func generatedStatus(r *http.Request, path string) int {
+	if detectPageType(path) != "generic" {
+		return http.StatusOK
+	}
+	if strings.Contains(strings.ToLower(r.Header.Get("Accept")), "text/html") {
+		return http.StatusNotFound
+	}
+	return http.StatusOK
+}
+
+// getOrRenderHTML 返回路径对应的页面字节，命中缓存时直接复用。
+// 缓存有界：达到 maxCachedFallbackPages 后，新路径直接渲染而不入缓存。
+func (fb *Fallback) getOrRenderHTML(path string) []byte {
+	path = cleanPath(path)
+
+	fb.cacheMu.Lock()
+	if cached, ok := fb.cache[path]; ok {
+		fb.cacheMu.Unlock()
+		return cached
+	}
+	fb.cacheMu.Unlock()
+
+	html := fb.renderPage(path)
+
+	fb.cacheMu.Lock()
+	defer fb.cacheMu.Unlock()
+	if _, ok := fb.cache[path]; !ok && fb.cacheCount < maxCachedFallbackPages {
+		fb.cache[path] = html
+		fb.cacheCount++
+	}
+	return html
+}
+
+// cleanPath 规范化用于查找的 URL 路径："/" 保持 "/" 不变，其余路径去除末尾的斜杠。
 func cleanPath(p string) string {
 	if p == "" || p == "/" {
 		return "/"
@@ -1359,50 +702,8 @@ func cleanPath(p string) string {
 }
 
 // ---------------------------------------------------------------------------
-// Internal helpers
+// 内部辅助函数
 // ---------------------------------------------------------------------------
-
-func getOrRenderHTML(path string) []byte {
-	path = cleanPath(path)
-	if cached, ok := htmlCache.Load(path); ok {
-		return cached.([]byte)
-	}
-
-	html := renderHTML(path)
-	if htmlCacheCount.Load() < maxCachedFallbackPages {
-		if _, loaded := htmlCache.LoadOrStore(path, html); !loaded {
-			htmlCacheCount.Add(1)
-		}
-	}
-	return html
-}
-
-func renderHTML(path string) []byte {
-	pageType := detectPageType(path)
-	pool := contentPools[pageType]
-	idx := hashIndex(path, len(pool))
-	content := pool[idx]
-
-	data := renderData{
-		CSS:         selectedTheme.CSS,
-		SiteName:    selectedTheme.SiteName,
-		Tagline:     selectedTheme.Tagline,
-		NavHome:     selectedTheme.NavHome,
-		NavAbout:    selectedTheme.NavAbout,
-		NavServices: selectedTheme.NavServices,
-		NavContact:  selectedTheme.NavContact,
-		Title:       resolveTitle(content.Title, selectedTheme.SiteName),
-		Heading:     content.Heading,
-		Paragraphs:  content.Paragraphs,
-		Footer:      content.Footer,
-	}
-
-	var buf bytes.Buffer
-	if err := fallbackTmpl.Execute(&buf, data); err != nil {
-		return []byte("Internal Server Error")
-	}
-	return buf.Bytes()
-}
 
 func detectPageType(path string) string {
 	path = strings.ToLower(strings.Trim(path, "/"))
@@ -1427,18 +728,28 @@ func detectPageType(path string) string {
 	}
 }
 
-func hashIndex(input string, n int) int {
-	h := fnv.New32a()
-	h.Write([]byte(input))
-	return int(h.Sum32()) % n
-}
-
-// resolveTitle returns the page title. If the content title is empty or just a
-// space, the site name is used as a fallback.
+// resolveTitle 返回页面标题。如果内容标题为空或只有空白字符，则回退使用站点名称。
 func resolveTitle(title, siteName string) string {
 	title = strings.TrimSpace(title)
 	if title == "" {
 		return siteName
 	}
 	return title
+}
+
+// firstParagraph 返回首段，用作 <meta name="description">；没有段落时返回空串。
+func firstParagraph(paragraphs []string) string {
+	if len(paragraphs) == 0 {
+		return ""
+	}
+	d := paragraphs[0]
+	const maxLen = 160
+	if len(d) <= maxLen {
+		return d
+	}
+	// 截断到最后一个空格，避免把单词切一半。
+	if i := strings.LastIndex(d[:maxLen], " "); i > 0 {
+		return d[:i]
+	}
+	return d[:maxLen]
 }

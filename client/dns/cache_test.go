@@ -1,10 +1,14 @@
 package dns
 
 import (
+	"context"
+	"slices"
 	"testing"
 	"time"
 
 	"github.com/miekg/dns"
+
+	"github.com/nange/easyss/v3/client/config"
 )
 
 func TestNewCache(t *testing.T) {
@@ -148,22 +152,22 @@ func TestCache_DirectVsProxied(t *testing.T) {
 	msgProxied.SetQuestion("example.com.", dns.TypeA)
 	rrP, _ := dns.NewRR("example.com. 3600 IN A 1.1.1.1")
 	msgProxied.Answer = append(msgProxied.Answer, rrP)
-	c.Set(msgProxied, false)
+	c.Set(msgProxied, false) //nolint:errcheck
 
 	// 存储到 direct
 	msgDirect := &dns.Msg{}
 	msgDirect.SetQuestion("example.com.", dns.TypeA)
 	rrD, _ := dns.NewRR("example.com. 3600 IN A 2.2.2.2")
 	msgDirect.Answer = append(msgDirect.Answer, rrD)
-	c.Set(msgDirect, true)
+	c.Set(msgDirect, true) //nolint:errcheck
 
-	// proxied → 1.1.1.1
+	// 代理 → 1.1.1.1
 	gotP := c.Get("example.com.", "A", false)
 	if gotP == nil || gotP.Answer[0].(*dns.A).A.String() != "1.1.1.1" {
 		t.Error("proxied cache returned wrong IP")
 	}
 
-	// direct → 2.2.2.2
+	// 直连 → 2.2.2.2
 	gotD := c.Get("example.com.", "A", true)
 	if gotD == nil || gotD.Answer[0].(*dns.A).A.String() != "2.2.2.2" {
 		t.Error("direct cache returned wrong IP")
@@ -232,7 +236,7 @@ func TestCache_ServerDomain_NeverExpires(t *testing.T) {
 		t.Fatalf("Set error: %v", err)
 	}
 
-	// 应答 TTL=1s，普通域名 1s 后即过期；服务器域名需保持命中
+	// 应答 TTL=1s，服务器域名不受 TTL 影响、需保持命中
 	time.Sleep(1500 * time.Millisecond)
 	if got := c.Get("mysite.net.", "A", false); got == nil {
 		t.Fatal("server domain entry expired, expected never-expiring cache")
@@ -267,7 +271,7 @@ func TestJitterTTL_NeverExpire(t *testing.T) {
 func TestJitterTTL_Range(t *testing.T) {
 	const base = 1800
 	seen := make(map[int]bool)
-	for i := 0; i < 1000; i++ {
+	for range 1000 {
 		ttl := jitterTTL(base)
 		// 结果必须在 [base, 2*base) 区间内
 		if ttl < base || ttl >= 2*base {
@@ -282,8 +286,8 @@ func TestJitterTTL_Range(t *testing.T) {
 }
 
 func TestCachePrePopulateWithFallback(t *testing.T) {
-	failAddr := startTestDNSServer(t, true) // replies SERVFAIL, fails fast
-	okAddr := startTestDNSServer(t, false)  // answers A/AAAA records
+	failAddr := startTestDNSServer(t, true) // 回复 SERVFAIL，快速失败
+	okAddr := startTestDNSServer(t, false)  // 正常应答 A/AAAA 记录
 	old := systemDNSServersFunc
 	systemDNSServersFunc = func() []string {
 		return []string{okAddr}
@@ -295,11 +299,45 @@ func TestCachePrePopulateWithFallback(t *testing.T) {
 	})
 
 	c := NewCache("example.com")
-	if err := c.PrePopulateWithFallback("example.com", []string{failAddr}, true); err != nil {
+	if err := c.PrePopulateWithFallback(context.Background(), "example.com", []string{failAddr}, true); err != nil {
 		t.Fatalf("PrePopulateWithFallback error: %v", err)
 	}
 	if got := c.Get("example.com.", "A", true); got == nil {
 		t.Fatal("direct cache should have the A record after fallback")
+	}
+}
+
+// TestCachePrePopulateWithFallbackRecordsSystemDNS 验证内置全失败、系统 DNS 兜底
+// 成功时会记录那台系统服务器：TUN 启动据此挑选系统解析器，避免把当前网络已知
+// 不可达的内置地址写进系统（见 PreferredSystemDNS）。本地假服务器是环回地址，
+// 读取时会被过滤掉，因此记录值本身要直接断言。
+func TestCachePrePopulateWithFallbackRecordsSystemDNS(t *testing.T) {
+	resetBuiltinDNSCircuit()
+	failAddr := startTestDNSServer(t, true)
+	okAddr := startTestDNSServer(t, false)
+	old := systemDNSServersFunc
+	systemDNSServersFunc = func() []string {
+		return []string{okAddr}
+	}
+	t.Cleanup(func() {
+		systemDNSServersFunc = old
+		resetSystemDNSCache()
+		resetBuiltinDNSCircuit()
+	})
+
+	c := NewCache("example.com")
+	if err := c.PrePopulateWithFallback(context.Background(), "example.com", []string{failAddr}, true); err != nil {
+		t.Fatalf("PrePopulateWithFallback error: %v", err)
+	}
+
+	reachableDNSMu.Lock()
+	got := slices.Clone(reachableSystemDNS)
+	reachableDNSMu.Unlock()
+	if len(got) != 1 || got[0] != okAddr {
+		t.Fatalf("reachableSystemDNS = %v, want [%s]", got, okAddr)
+	}
+	if v := PreferredSystemDNS(); v != config.DefaultSystemDNS {
+		t.Fatalf("PreferredSystemDNS = %q, want %q (a loopback system dns must not be used)", v, config.DefaultSystemDNS)
 	}
 }
 
@@ -316,7 +354,189 @@ func TestCachePrePopulateWithFallbackAllFail(t *testing.T) {
 	})
 
 	c := NewCache("example.com")
-	if err := c.PrePopulateWithFallback("example.com", []string{failAddr}, true); err == nil {
+	if err := c.PrePopulateWithFallback(context.Background(), "example.com", []string{failAddr}, true); err == nil {
 		t.Fatal("expected error")
+	}
+	// 没有系统 DNS 兜底时不得熔断内置服务器，否则冷却期内的解析会立刻失败
+	if !BuiltinDNSAvailable() {
+		t.Fatal("builtin dns must not be tripped when there is no system dns fallback")
+	}
+}
+
+// TestCachePrePopulateWithFallbackArmedBreakerWithoutSystemDNS 覆盖 F3：熔断是在
+// "当时还有系统兜底"时置位的，随后兜底消失。此时冷却期不得变成彻底的解析中断：
+// 仍然尝试内置池，成功后清掉熔断。
+func TestCachePrePopulateWithFallbackArmedBreakerWithoutSystemDNS(t *testing.T) {
+	resetBuiltinDNSCircuit()
+	okAddr := startTestDNSServer(t, false)
+	old := systemDNSServersFunc
+	systemDNSServersFunc = func() []string {
+		return nil
+	}
+	t.Cleanup(func() {
+		systemDNSServersFunc = old
+		resetSystemDNSCache()
+		resetBuiltinDNSCircuit()
+	})
+	MarkBuiltinDNSUnavailable() // 先有兜底、后兜底消失
+
+	c := NewCache("example.com")
+	if err := c.PrePopulateWithFallback(context.Background(), "example.com", []string{okAddr}, true); err != nil {
+		t.Fatalf("PrePopulateWithFallback error: %v", err)
+	}
+	if got := c.Get("example.com.", "A", true); got == nil {
+		t.Fatal("direct cache should have the A record after ignoring the armed breaker")
+	}
+	if !BuiltinDNSAvailable() {
+		t.Fatal("a successful builtin query must clear the breaker")
+	}
+}
+
+// TestCachePrePopulateWithFallbackBlackholeBuiltin 验证内置 DNS 是黑洞时系统
+// DNS 兜底仍能拿到时间预算：黑洞服务器（只收不回）会一直等到截止时间，若兜底
+// 复用同一个已过期的 ctx，它就会以 dial i/o timeout 在毫秒内全部失败——即使
+// 系统 DNS 本身完全可用。这正是"内置 DNS 被改成不可达地址"时的表现。
+func TestCachePrePopulateWithFallbackBlackholeBuiltin(t *testing.T) {
+	resetBuiltinDNSCircuit()
+	blackhole := startBlackholeDNSServer(t)
+	okAddr := startTestDNSServer(t, false) // 正常应答 A/AAAA 记录
+	oldServers := systemDNSServersFunc
+	systemDNSServersFunc = func() []string {
+		return []string{okAddr}
+	}
+	oldItem := ResolveItemTimeout
+	ResolveItemTimeout = 100 * time.Millisecond
+	t.Cleanup(func() {
+		systemDNSServersFunc = oldServers
+		ResolveItemTimeout = oldItem
+		resetSystemDNSCache()
+		resetBuiltinDNSCircuit()
+	})
+
+	c := NewCache("example.com")
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	if err := c.PrePopulateWithFallback(ctx, "example.com", []string{blackhole}, true); err != nil {
+		t.Fatalf("PrePopulateWithFallback error: %v (a reachable system dns must still be used)", err)
+	}
+	if got := c.Get("example.com.", "A", true); got == nil {
+		t.Fatal("direct cache should have the A record after the system dns fallback")
+	}
+}
+
+// TestCachePrePopulateQueriesAAndAAAAConcurrently 验证同一个条目的 A 与 AAAA
+// 查询并发进行：服务器对两种查询都延迟 60% 的条目预算才应答，串行实现只能赶上
+// 第一条（A），并发实现两条都能在预算内落进缓存。
+func TestCachePrePopulateQueriesAAndAAAAConcurrently(t *testing.T) {
+	oldItem := ResolveItemTimeout
+	ResolveItemTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { ResolveItemTimeout = oldItem })
+
+	addr := startSlowTestDNSServer(t, 60*time.Millisecond)
+
+	c := NewCache("example.com")
+	if _, err := c.PrePopulate(context.Background(), "example.com", addr, true); err != nil {
+		t.Fatalf("PrePopulate error: %v", err)
+	}
+	if got := c.Get("example.com.", "A", true); got == nil {
+		t.Fatal("direct cache should have the A record")
+	}
+	if got := c.Get("example.com.", "AAAA", true); got == nil {
+		t.Fatal("direct cache should have the AAAA record: A and AAAA must run concurrently within one item budget")
+	}
+}
+
+// TestCachePrePopulateNormalizesCorruptEDNS0Answer 验证"OPT 在 ANSWER 段"的畸形
+// 应答不会让预解析失败：被挤到 ADDITIONAL 段的真实记录会被回收，缓存里拿到可用
+// 地址，且不会把 OPT 一起缓存下来（见 normalizeEDNS0Answer）。
+func TestCachePrePopulateNormalizesCorruptEDNS0Answer(t *testing.T) {
+	addr := startCorruptEDNS0DNSServer(t)
+
+	c := NewCache("example.com")
+	ips, err := c.PrePopulate(context.Background(), "example.com", addr, true)
+	if err != nil {
+		t.Fatalf("PrePopulate error: %v", err)
+	}
+	// 返回的地址就是成功日志里打印的那些（见 PrePopulateWithFallback）。
+	if want := []string{"1.2.3.4", "2001:db8::1"}; !slices.Equal(ips, want) {
+		t.Fatalf("resolved ips = %v, want %v", ips, want)
+	}
+
+	got := c.Get("example.com.", "A", true)
+	if got == nil || len(got.Answer) == 0 {
+		t.Fatal("direct cache should have the A record salvaged from the malformed answer")
+	}
+	a, ok := got.Answer[0].(*dns.A)
+	if !ok || a.A.String() != "1.2.3.4" {
+		t.Fatalf("cached answer = %v, want A 1.2.3.4", got.Answer)
+	}
+	if got.IsEdns0() != nil {
+		t.Fatal("cached answer must not carry an OPT record")
+	}
+}
+
+// TestCachePrePopulateRejectsAnswerWithoutRecords 验证"NOERROR 但没有请求类型的
+// 记录"不算解析成功：否则调用方会认为服务端域名已解析，而缓存里其实什么都没有
+// （服务端域名的缓存条目还永不过期，见 dnsCacheTTL）。
+func TestCachePrePopulateRejectsAnswerWithoutRecords(t *testing.T) {
+	addr := startNODATADNSServer(t)
+
+	c := NewCache("example.com")
+	if _, err := c.PrePopulate(context.Background(), "example.com", addr, true); err == nil {
+		t.Fatal("expected error: a NOERROR answer without an A record is not a successful pre-resolve")
+	}
+	if got := c.Get("example.com.", "A", true); got != nil {
+		t.Fatalf("nothing must be cached, got %v", got.Answer)
+	}
+	if got := c.Get("example.com.", "AAAA", true); got != nil {
+		t.Fatalf("nothing must be cached, got %v", got.Answer)
+	}
+}
+
+// TestCacheServerAddrs 验证 DNS pinning 的数据来源：预解析成功后能拿到
+// A/AAAA 地址（A 在前），没有服务端域名时为空。
+func TestCacheServerAddrs(t *testing.T) {
+	addr := startTestDNSServer(t, false)
+	c := NewCache("example.com")
+	if _, err := c.PrePopulate(context.Background(), "example.com", addr, true); err != nil {
+		t.Fatalf("PrePopulate error: %v", err)
+	}
+
+	want := []string{"1.2.3.4", "2001:db8::1"}
+	if got := c.ServerAddrs(); !slices.Equal(got, want) {
+		t.Fatalf("ServerAddrs = %v, want %v", got, want)
+	}
+	if got := NewCache("").ServerAddrs(); got != nil {
+		t.Fatalf("ServerAddrs without a server domain = %v, want nil", got)
+	}
+}
+
+// TestCachePrePopulateWithFallbackBoundedByContext 验证 context 截止时间会
+// 约束整个预填充过程：否则黑洞 DNS 服务器会使查询按每种记录类型各等待 5s
+// 超时。
+func TestCachePrePopulateWithFallbackBoundedByContext(t *testing.T) {
+	blackhole := startBlackholeDNSServer(t)
+	old := systemDNSServersFunc
+	systemDNSServersFunc = func() []string {
+		return nil
+	}
+	t.Cleanup(func() {
+		systemDNSServersFunc = old
+		resetSystemDNSCache()
+		resetBuiltinDNSCircuit()
+	})
+
+	c := NewCache("example.com")
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	err := c.PrePopulateWithFallback(ctx, "example.com", []string{blackhole}, true)
+	if err == nil {
+		t.Fatal("expected error against blackhole dns server")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("pre-population took %v, want bounded by the context deadline", elapsed)
 	}
 }

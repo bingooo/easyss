@@ -3,22 +3,24 @@
 package main
 
 import (
+	"context"
 	"fmt"
-	"net"
 	"os"
 	"runtime"
 	"time"
 
 	"github.com/nange/easyss/v3/client/config"
+	"github.com/nange/easyss/v3/client/dns"
 	"github.com/nange/easyss/v3/client/proxy"
 	"github.com/nange/easyss/v3/client/tun"
 	"github.com/nange/easyss/v3/log"
+	"github.com/nange/easyss/v3/util"
 	"golang.org/x/sys/unix"
 )
 
-// createTun2socksViaHelper spawns a long-running elevated helper to open the
-// TUN device, set up routes/DNS, and pass the fd back. The helper stays alive
-// monitoring its stdin (a FIFO) for the main process lifecycle signal.
+// createTun2socksViaHelper 生成一个长期运行的提权 helper 来打开
+// TUN 设备、配置路由/DNS，并将 fd 传回。helper 持续存活，
+// 监控其 stdin（一个 FIFO）以接收主进程的生命周期信号。
 func (a *TrayApp) createTun2socksViaHelper() error {
 	a.tunHelperMu.Lock()
 	defer a.tunHelperMu.Unlock()
@@ -36,20 +38,48 @@ func (a *TrayApp) createTun2socksViaHelper() error {
 		return fmt.Errorf("client not initialized")
 	}
 
-	// 1. Build TunConfig from the temporary manager to get device defaults.
-	tmpCfg := tun.Config{
-		Socks5Addr: fmt.Sprintf("socks5://127.0.0.1:%d", a.cfg.Local.SocksPort),
-		DNSServer:  tunDNS(a.cfg),
-	}
-	if ipv6 := a.core.Client.Router().ServerIPV6(); ipv6 != "" {
-		tmpCfg.ServerIPV6 = ipv6
-	}
+	// 1. 用临时 manager 构建 TunConfig 以获取设备默认值。
+	// manager 配置来自共享 builder，因此此路径与直接路径使用相同的
+	// socks/dns/server-ipv6 值（它同时会刷新服务端 IPv6）。
+	tmpCfg := a.tunConfig()
 	tmpMgr := tun.New(tmpCfg)
 	devCfg := tmpMgr.DeviceConfig()
 
+	if a.core.HTTPServer == nil {
+		return fmt.Errorf("http proxy server not started")
+	}
+
+	// 2. 在生成 helper 之前预解析代理服务器主机名并填充 DNS 缓存，
+	// 以避免 helper 将系统 DNS 指向 TUN 后产生循环依赖。
+	//
+	// 只做一次有界尝试（预算为 dns.PreResolveTimeout，与启动期预解析同一个
+	// 常量）：这是用户主动触发的操作，失败就报错让用户重试，而不是在界面无
+	// 反馈的情况下把最坏等待叠成"尝试次数 × 总预算"。
+	if serverAddr := a.cfg.DefaultServer().Address; !util.IsIP(serverAddr) {
+		if len(config.DirectDNSServers) == 0 {
+			a.core.HTTPServer.ClearTunConfig()
+			return fmt.Errorf("failed to pre-resolve server hostname %s: dns cache not available", serverAddr)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), dns.PreResolveTimeout)
+		// 缓存由核心持有（见 runner.Core.PrePopulateServerDomain）：它是 DNS
+		// pinning 与 TUN 系统 DNS 的同一个来源，不再经由本地 SOCKS5 服务器。
+		err := a.core.PrePopulateServerDomain(ctx, serverAddr, config.DirectDNSServers,
+			a.cfg.Routing.IPV6Rule != "enable")
+		cancel()
+		if err != nil {
+			a.core.HTTPServer.ClearTunConfig()
+			return fmt.Errorf("failed to pre-resolve server hostname %s: %w", serverAddr, err)
+		}
+		log.Info("[SYSTRAY] pre-populated dns cache for server", "host", serverAddr)
+	}
+
+	// 3. 预解析之后再取 tunDNS 并注册配置：预解析成功的内置/系统解析器只有在这
+	// 之后才可能被记录（见 dns.PreferredSystemDNS）。先取值会让"此前所有标记
+	// 尝试都失败、恰好这次预解析才成功"的情形把 TUN 的系统 DNS 写成已知不可达的
+	// 默认值。
 	tunHTTPCfg := &proxy.TunConfig{
-		Socks5Addr:     fmt.Sprintf("socks5://127.0.0.1:%d", a.cfg.Local.SocksPort),
-		DNSAddr:        tunDNS(a.cfg),
+		Socks5Addr:     util.Socks5URI(a.cfg.Local.SocksPort),
+		DNSAddr:        tunDNS(),
 		Device:         devCfg.Device,
 		TunIP:          devCfg.TunIP,
 		TunGW:          devCfg.TunGW,
@@ -62,40 +92,11 @@ func (a *TrayApp) createTun2socksViaHelper() error {
 		MTU:            1500,
 	}
 
-	// 2. Register the config so the helper can fetch it via GET /tun.
-	if a.core.HTTPServer == nil {
-		return fmt.Errorf("http proxy server not started")
-	}
+	// 让 helper 可以通过 GET /tun 获取配置。
 	a.core.HTTPServer.SetTunConfig(tunHTTPCfg)
 
-	// 3. Pre-resolve the proxy server hostname and populate the DNS cache
-	// before spawning the helper, to avoid a circular dependency once the
-	// helper sets the system DNS to go through TUN.
-	if serverAddr := a.cfg.DefaultServer().Address; net.ParseIP(serverAddr) == nil {
-		var err error
-		for i := 0; i < 3; i++ {
-			if a.core.SocksServer == nil || len(config.DirectDNSServers) == 0 {
-				err = fmt.Errorf("dns cache not available")
-				break
-			}
-			err = a.core.SocksServer.PrePopulateDNS(serverAddr, config.DirectDNSServers,
-				a.cfg.Routing.IPV6Rule != "enable")
-			if err == nil {
-				log.Info("[SYSTRAY] pre-populated dns cache for server", "host", serverAddr)
-				break
-			}
-			if i < 2 {
-				time.Sleep(time.Second)
-			}
-		}
-		if err != nil {
-			a.core.HTTPServer.ClearTunConfig()
-			return fmt.Errorf("failed to pre-resolve server hostname %s: %w", serverAddr, err)
-		}
-	}
-
-	// 4. Spawn the elevated helper. Use the configured timeout (seconds) as
-	//    the spawn wait limit; fall back to 30s if unset or invalid.
+	// 4. 生成提权 helper。将配置的超时时间（秒）作为生成等待上限；
+	//    未设置或无效时回退到 30s。
 	spawnTimeout := 30 * time.Second
 	if a.cfg.Timeout > 0 {
 		spawnTimeout = time.Duration(a.cfg.Timeout) * time.Second
@@ -108,7 +109,7 @@ func (a *TrayApp) createTun2socksViaHelper() error {
 		return fmt.Errorf("spawn tun helper: %w", err)
 	}
 
-	// 5. Receive the TUN fd from the helper.
+	// 5. 从 helper 接收 TUN fd。
 	fd, err := ReceiveFd(fdListener)
 	fdListener.Close() //nolint:errcheck
 	if runtime.GOOS != "linux" {
@@ -120,32 +121,28 @@ func (a *TrayApp) createTun2socksViaHelper() error {
 		return fmt.Errorf("receive tun fd: %w", err)
 	}
 
-	// Ensure the fd is non-blocking so Go's netpoller (kqueue) reliably
-	// wakes up the iobased dispatchLoop when engine.Stop() closes the fd.
-	// The O_NONBLOCK flag may be lost during SCM_RIGHTS transfer on macOS.
+	// 确保 fd 是非阻塞的，这样 Go 的 netpoller (kqueue) 能在 engine.Stop()
+	// 关闭 fd 时可靠地唤醒 iobased dispatchLoop。
+	// O_NONBLOCK 标志可能在 macOS 的 SCM_RIGHTS 传输过程中丢失。
 	if err := unix.SetNonblock(fd, true); err != nil {
 		fifoWriter.Close() //nolint:errcheck
 		a.core.HTTPServer.ClearTunConfig()
 		return fmt.Errorf("set nonblock: %w", err)
 	}
 
-	// 6. Create the tun manager using the received fd.
+	// 6. 使用接收到的 fd 创建 tun manager。
 	a.cfg.Local.EnableTun2socks = true
 	a.tunMgr = tun.New(tun.Config{
-		Socks5Addr:       fmt.Sprintf("socks5://127.0.0.1:%d", a.cfg.Local.SocksPort),
+		Socks5Addr:       util.Socks5URI(a.cfg.Local.SocksPort),
 		DeviceFD:         fd,
-		SkipRouteCleanup: true, // helper handles route/DNS cleanup
+		SkipRouteCleanup: true, // helper 负责路由/DNS 清理
 	})
 
 	icmpHandler := tun.NewICMPHandler(a.core.Client.Router())
-	icmpHandler.SetProxy(a.core.StreamHandler, methodFromString(a.cfg.DefaultServer().Method))
+	icmpHandler.SetProxy(a.core.StreamHandler, a.methodFromServer())
 	a.tunMgr.SetICMPHandler(icmpHandler)
 
-	go func() {
-		if err := a.tunMgr.Start(); err != nil {
-			log.Error("[SYSTRAY] tun2socks start (fd)", "err", err)
-		}
-	}()
+	startTunEngine(a.tunMgr, "fd")
 
 	a.tunHelperStdin = fifoWriter
 

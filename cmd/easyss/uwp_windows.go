@@ -19,8 +19,67 @@ func (a *TrayApp) addUWPLoopbackMenu(root *systray.Menu) {
 
 	a.uwpMenu.Add("刷新列表", func() { go a.uwpRefresh() })
 
-	// Populate the list asynchronously; the menu already shows "刷新列表".
+	// 异步填充列表；菜单此时已显示 "刷新列表"。
 	go a.uwpRefresh()
+}
+
+// refreshUWPAppItems 按当前已安装应用重建 UWP 子菜单的列表。
+//
+// 菜单列表是动态的：已存在的条目就地更新，新安装的应用追加到末尾，
+// 已卸载/已消失的应用对应的条目置灰（systray 没有移除菜单项的 API，
+// 列表可能随着时间增长，但只会显示当前有效的应用）。只要菜单形状
+// 发生变化就调用一次 SetMenu，让原生菜单与这份列表同步。
+//
+// 这样做的前提是 nange/systray 修复了 gogpu/systray issue #39：
+// 每个菜单项使用稳定的命令 ID，且在菜单显示期间到达的重建请求会被排队，
+// 等菜单关闭后再应用，因此重建绝不会把用户的点击派发到另一个菜单项，
+// 也不会销毁正在被 TrackPopupMenu 跟踪的 HMENU。
+func (a *TrayApp) refreshUWPAppItems(apps []UWPApp) {
+	needsRebuild := false
+	appIndex := 0
+
+	for i := range apps {
+		app := &apps[i]
+		if app.Name == "" || app.PackageFamilyName == "" {
+			continue
+		}
+
+		if appIndex >= len(a.uwpItems) {
+			uwpItem := &UWPMenuItem{App: app}
+			item := a.uwpMenu.AddCheckbox(app.Name, app.Exempt, func(u *UWPMenuItem) func() {
+				return func() { a.onUWPItemClicked(u) }
+			}(uwpItem))
+			uwpItem.MenuItem = item
+			a.uwpItems = append(a.uwpItems, uwpItem)
+			needsRebuild = true
+		} else {
+			uwpItem := a.uwpItems[appIndex]
+			uwpItem.Mu.Lock()
+			uwpItem.App = app
+			uwpItem.Mu.Unlock()
+
+			uwpItem.MenuItem.SetLabel(app.Name)
+			uwpItem.MenuItem.SetDisabled(false)
+			uwpItem.MenuItem.SetChecked(app.Exempt)
+		}
+		appIndex++
+	}
+
+	// 剩余条目对应的应用已不存在：置灰并清空目标应用，
+	// 这样点击它们不会对任何应用生效。
+	for i := appIndex; i < len(a.uwpItems); i++ {
+		uwpItem := a.uwpItems[i]
+		uwpItem.MenuItem.SetDisabled(true)
+		uwpItem.Mu.Lock()
+		uwpItem.App = nil
+		uwpItem.Mu.Unlock()
+	}
+
+	if needsRebuild && a.tray != nil {
+		// 重建发生在持有 uwpMu 期间：systray 的重建请求在菜单显示期间会被排队，
+		// 因此这里不会与正在浏览菜单的用户产生竞争（托盘未构建时为无操作）。
+		a.tray.SetMenu(a.rootMenu)
+	}
 }
 
 func (a *TrayApp) uwpRefresh() {
@@ -49,50 +108,7 @@ func (a *TrayApp) uwpRefresh() {
 		return strings.ToLower(apps[i].Name) < strings.ToLower(apps[j].Name)
 	})
 
-	// gogpu/systray builds the native menu (HMENU) on SetMenu; there is no
-	// Show/Hide for menu items. Reuse existing items and append new ones,
-	// then re-SetMenu only when the menu tree shape changed. Items that no
-	// longer correspond to an installed app are disabled instead of hidden.
-	needsRebuild := false
-	appIndex := 0
-	for _, app := range apps {
-		if app.Name == "" || app.PackageFamilyName == "" {
-			continue
-		}
-
-		if appIndex >= len(a.uwpItems) {
-			uwpItem := &UWPMenuItem{App: &app}
-			item := a.uwpMenu.AddCheckbox(app.Name, app.Exempt, func(u *UWPMenuItem) func() {
-				return func() { a.onUWPItemClicked(u) }
-			}(uwpItem))
-			uwpItem.MenuItem = item
-			item.SetChecked(app.Exempt)
-			a.uwpItems = append(a.uwpItems, uwpItem)
-			needsRebuild = true
-		} else {
-			uwpItem := a.uwpItems[appIndex]
-			uwpItem.Mu.Lock()
-			uwpItem.App = &app
-			uwpItem.Mu.Unlock()
-
-			uwpItem.MenuItem.SetLabel(app.Name)
-			uwpItem.MenuItem.SetDisabled(false)
-			uwpItem.MenuItem.SetChecked(app.Exempt)
-		}
-		appIndex++
-	}
-
-	for i := appIndex; i < len(a.uwpItems); i++ {
-		uwpItem := a.uwpItems[i]
-		uwpItem.MenuItem.SetDisabled(true)
-		uwpItem.Mu.Lock()
-		uwpItem.App = nil
-		uwpItem.Mu.Unlock()
-	}
-
-	if needsRebuild && a.tray != nil {
-		a.tray.SetMenu(a.rootMenu)
-	}
+	a.refreshUWPAppItems(apps)
 }
 
 func (a *TrayApp) onUWPItemClicked(u *UWPMenuItem) {

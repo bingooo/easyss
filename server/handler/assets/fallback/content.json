@@ -1,0 +1,286 @@
+{
+  "intros": {
+    "home": [
+      "We help organisations turn complicated problems into straightforward plans, then stay with them until the work is done.",
+      "Since 2010 we have worked alongside teams of every size, from two-person startups to departments inside listed companies.",
+      "Good work starts with listening. We spend the first weeks of every engagement understanding how you already operate."
+    ],
+    "about": [
+      "We started as a small group of practitioners who wanted to do the work properly, without the layers that usually get in the way.",
+      "Our team brings together people from technology, finance, operations and design, united by a preference for plain answers.",
+      "What began as a single office has grown into a distributed team across four time zones, still small enough that everyone knows the client's name."
+    ],
+    "contact": [
+      "We read every message that reaches this site, and a person — not an autoresponder — replies to it.",
+      "Whether you have a defined brief or just an early question, the fastest route is to write to us directly.",
+      "Enquiries arrive from all over, so we ask for a little context up front to make the first reply useful."
+    ],
+    "services": [
+      "Our work falls into a handful of areas, most of which overlap in practice rather than sitting in tidy boxes.",
+      "We are deliberately narrow about what we take on, so that the advice you get is the advice we would follow ourselves.",
+      "Every engagement is scoped in writing before it starts, including what we will not do."
+    ],
+    "blog": [
+      "Notes from the work itself: things we got wrong, things that surprised us, and the occasional short opinion.",
+      "We write here when we have something concrete to say rather than to fill a publishing schedule.",
+      "Field notes, post-mortems and short technical write-ups from the team."
+    ],
+    "generic": [
+      "The page you asked for is not available on this site."
+    ]
+  },
+  "bodies": {
+    "home": [
+      "Most of our clients come to us mid-project, with a decision to make and not much time to make it. We start by mapping what is actually true — the constraints, the dependencies, the things nobody has written down — and then work out which of those constraints are real.",
+      "We prefer small teams. A handful of people who know the details will usually out-deliver a larger group that needs a weekly status meeting to stay aligned.",
+      "Engagements run from a two-week review to a multi-year partnership. The shape of the work changes, but the way we run it does not: one point of contact, written scopes, and a clear view of what has been done each week.",
+      "We do not resell tools, and we do not take referral fees. If the honest answer is that you should buy something off the shelf and go home, that is the answer you will get.",
+      "Practical experience across regulated industries means we are comfortable with the paperwork as well as the technical work — audits, change boards and the rest of it included."
+    ],
+    "about": [
+      "Our working method is unglamorous. Write down the problem, agree on what finished looks like, do the work in visible increments, and say plainly when something is not going to plan.",
+      "Seniority matters to us in a specific way: the person who scopes your work is the person who delivers it. There is no handover to a junior team once the contract is signed.",
+      "We keep a deliberately small client list, so nobody is juggling six engagements at once. When we are at capacity we say so and give you a date rather than an apology.",
+      "Every member of the team spends part of the year on internal work — tooling, research, writing — because advice that stopped being tested three years ago is not worth paying for.",
+      "Independence is the thing we guard most carefully. We take no commission from vendors and hold no inventory of products to move."
+    ],
+    "contact": [
+      "Write to us with a paragraph about the problem, any deadline you are working towards, and the best way to reach you. If the request is a good fit for our team we will suggest a short call within a couple of working days.",
+      "For existing clients, your usual contact is still the fastest route and does not need to go through this page. For everything else, use the address above and we will route it to the right person.",
+      "We answer enquiries from 09:00 to 18:00 on working days. Messages that arrive outside those hours are read the next morning, not at midnight.",
+      "If you are a supplier or recruiter, please say so in the first line — it saves everyone a round trip."
+    ],
+    "services": [
+      "Reviews and assessments: an independent look at work in progress, delivered as a short written report and a session to walk through it. Most useful when a decision is close and the internal view has stopped being objective.",
+      "Delivery support: hands on the work alongside your team for a fixed period, usually between four and twelve weeks, with a defined exit rather than an open-ended retainer.",
+      "Architecture and planning: turning a rough direction into a sequence of steps that can be started next quarter, including the parts that will be uncomfortable to fund.",
+      "Ongoing advisory: a standing arrangement for teams that need a second opinion on a regular basis. Billed monthly, cancellable with a month's notice.",
+      "Training and enablement: workshops built around your own material rather than generic exercises, so that what is learned applies on Monday morning."
+    ],
+    "blog": [
+      "A post-mortem of a migration that took twice as long as planned, and the three assumptions that caused it. Written by the person who made the estimate.",
+      "Short notes on measuring the cost of a service that nobody budgets for explicitly, with the spreadsheet we actually used.",
+      "What we changed after a client asked us to justify every line in our own proposal — including the lines we removed.",
+      "A write-up of a small internal tool that saved more time than the project it was built to support.",
+      "On the difference between a status report and a warning, and why teams often mistake one for the other until it is late."
+    ],
+    "generic": [
+      "The link may be out of date, or the address may have been mistyped. You can start again from the home page, or use the navigation above to find the section you were looking for."
+    ]
+  },
+  "extras": {
+    "home": [
+      "We work in short cycles and review progress with you every week, so that a wrong turn is a conversation rather than a quarter.",
+      "Everything we produce is written for the people who will have to maintain it after we leave.",
+      "Remote-first by default, on site when the work needs it."
+    ],
+    "about": [
+      "Several of us have run teams inside large organisations, which shapes how we write and how much we assume.",
+      "We publish what we learn where we can, including the parts that did not work.",
+      "The same three people have been answering the phone here for nine years."
+    ],
+    "contact": [
+      "We do not run an automated booking system; a short exchange first saves time for everyone.",
+      "If your message needs someone specific, name them in the subject line and it will reach them.",
+      "Postal and registered office details are available on request."
+    ],
+    "services": [
+      "We are happy to work alongside your existing suppliers rather than replacing them.",
+      "All engagements include a written handover, whether or not the work continues.",
+      "If a smaller piece of work would answer the question, we will suggest that instead."
+    ],
+    "blog": [
+      "Corrections are added to the bottom of a post rather than quietly edited away.",
+      "Guest posts are rare and always labelled as such.",
+      "Nothing here is sponsored, and no links are paid for."
+    ],
+    "generic": [
+      "You can also go back to the previous page using your browser's back button."
+    ]
+  },
+  "outros": {
+    "home": [
+      "If that sounds like how you would want to work, the contact page is the next step.",
+      "We are happy to talk through whether we are the right fit before anyone commits to anything."
+    ],
+    "about": [
+      "You can read more about how we work on the services page.",
+      "The team page lists who does what, along with the areas each of us covers."
+    ],
+    "contact": [
+      "We will confirm receipt, then reply properly once we have read your message.",
+      "If your enquiry is urgent, say so in the subject line and we will prioritise it."
+    ],
+    "services": [
+      "Each of these can be scoped as a standalone piece of work or as part of a longer arrangement.",
+      "Pricing depends on scope and is always given in writing before work begins."
+    ],
+    "blog": [
+      "Older posts remain available in the archive, unsorted by anything in particular.",
+      "If you would like to be told when something new is published, say so and we will add you to the list."
+    ],
+    "generic": [
+      "If you followed a link from somewhere on this site and it led here, we would rather know about it than not."
+    ]
+  },
+  "footers": {
+    "home": [
+      "© {year} {site}. All rights reserved.",
+      "© {year} {site}. Registered in England and Wales.",
+      "{site} — trading since 2010."
+    ],
+    "about": [
+      "© {year} {site}. All rights reserved.",
+      "Company details available on request."
+    ],
+    "contact": [
+      "© {year} {site}. All rights reserved.",
+      "We aim to reply within two working days."
+    ],
+    "services": [
+      "© {year} {site}. All rights reserved.",
+      "Terms and conditions supplied with each engagement."
+    ],
+    "blog": [
+      "© {year} {site}. Opinions are the authors' own.",
+      "© {year} {site}. All rights reserved."
+    ],
+    "generic": [
+      "© {year} {site}. All rights reserved.",
+      "If you believe this is an error, please let us know."
+    ]
+  },
+  "notices": [
+    "Built with a static site generator. No tracking scripts are used on this site.",
+    "This site sets no cookies and collects no analytics.",
+    "Hosted in the EU. Content served from cache where possible.",
+    "Accessibility: we aim to meet WCAG 2.2 AA. Tell us if something falls short.",
+    "Last reviewed by the editorial team this quarter."
+  ],
+  "titles": {
+    "home": ["Home", "Welcome", "Home Page"],
+    "about": ["About Us — Our Story", "About — Our Mission and Values", "Our Team", "Company Overview"],
+    "contact": ["Contact Us", "Support", "Get in Touch", "Help and Enquiries"],
+    "services": ["Services", "Our Services", "What We Do", "Expertise and Engagements"],
+    "blog": ["Blog", "News", "Articles and Notes", "Recent Updates"],
+    "generic": ["Page Not Found", "Not Found"]
+  },
+  "headings": {
+    "home": ["Practical help for complicated work", "Experience you can put to work", "Small team, direct answers", "We make hard decisions easier"],
+    "about": ["Who We Are", "Driven by Purpose", "Meet the People Behind the Work", "A Legacy of Excellence", "How We Work"],
+    "contact": ["Get in Touch", "How Can We Help?", "Reach the Right Person", "Enquiries"],
+    "services": ["What We Do", "Solutions Built Around Your Needs", "Areas of Work", "How We Can Help"],
+    "blog": ["Latest Articles", "Recent Updates", "Notes From the Team", "Writing and Commentary"],
+    "generic": ["We Could Not Find That Page", "This Page Is Not Available"]
+  },
+  "home": [
+    {
+      "Title": "Home",
+      "Heading": "Practical help for complicated work",
+      "Paragraphs": [
+        "We are a small consultancy that helps organisations plan, build and fix the systems they depend on. Most of our work arrives as a decision somebody has to make by a particular date.",
+        "Everything we take on is scoped in writing, delivered by the people who scoped it, and reviewed with you at the end. No handovers, no surprises in the invoice."
+      ],
+      "Footer": "© {year} {site}. All rights reserved."
+    },
+    {
+      "Title": "Welcome",
+      "Heading": "Experience you can put to work",
+      "Paragraphs": [
+        "For over a decade we have worked with teams who need an outside view that is worth the money: direct, evidence-based, and free of jargon.",
+        "Our engagements are deliberately small. If we cannot help, we will say so early rather than bill for the discovery phase."
+      ],
+      "Footer": "© {year} {site}. All rights reserved."
+    }
+  ],
+  "about": [
+    {
+      "Title": "About Us — Our Story",
+      "Heading": "Who We Are",
+      "Paragraphs": [
+        "Founded in 2010, we have grown from a small team of passionate individuals into a respected organization serving clients across the globe.",
+        "Our mission is simple: deliver exceptional value through expertise, integrity, and relentless focus on our clients’ success."
+      ],
+      "Footer": "© {year} {site}. All rights reserved."
+    },
+    {
+      "Title": "About — Our Mission and Values",
+      "Heading": "Driven by Purpose",
+      "Paragraphs": [
+        "We believe that business can be a force for good. Every engagement is guided by our core values of transparency, collaboration, and continuous improvement.",
+        "Our diverse team brings perspectives from technology, finance, operations, and creative disciplines—united by a shared commitment to making a difference."
+      ],
+      "Footer": "© {year} {site}. All rights reserved."
+    }
+  ],
+  "contact": [
+    {
+      "Title": "Contact Us",
+      "Heading": "Get in Touch",
+      "Paragraphs": [
+        "Whether you have a specific project in mind or simply want to explore how we might help, we would be glad to hear from you.",
+        "Use the details on this page, or send a short note describing your situation and we will reply with the next steps."
+      ],
+      "Footer": "© {year} {site}. All rights reserved."
+    },
+    {
+      "Title": "Support",
+      "Heading": "How Can We Help?",
+      "Paragraphs": [
+        "Our support team is available during working hours to answer questions about existing engagements, invoices, and technical matters.",
+        "For anything urgent, please mark your message clearly and we will prioritise it ahead of the usual queue."
+      ],
+      "Footer": "© {year} {site}. All rights reserved."
+    }
+  ],
+  "services": [
+    {
+      "Title": "Services",
+      "Heading": "What We Do",
+      "Paragraphs": [
+        "We offer a focused set of services: advisory work, delivery support, and technical reviews, each available as a standalone engagement or as part of a longer programme.",
+        "Every service begins with a short scoping conversation, so that both sides understand what will be delivered before any work starts."
+      ],
+      "Footer": "© {year} {site}. All rights reserved."
+    },
+    {
+      "Title": "Our Services",
+      "Heading": "Solutions Built Around Your Needs",
+      "Paragraphs": [
+        "From first assessment through to handover, we work alongside your team rather than at arm's length.",
+        "We are equally comfortable leading a piece of work or strengthening an existing team where the expertise is already in place."
+      ],
+      "Footer": "© {year} {site}. All rights reserved."
+    }
+  ],
+  "blog": [
+    {
+      "Title": "Blog",
+      "Heading": "Latest Articles",
+      "Paragraphs": [
+        "Notes, observations and longer write-ups from the work we do. New posts appear here as they are finished, without a fixed schedule.",
+        "If you would like to suggest a topic, or disagree with something we have written, we would rather hear about it than not."
+      ],
+      "Footer": "© {year} {site}. Opinions are the authors' own."
+    },
+    {
+      "Title": "News",
+      "Heading": "Recent Updates",
+      "Paragraphs": [
+        "Announcements, project notes and occasional commentary from the team, collected in one place.",
+        "Older entries remain available in the archive."
+      ],
+      "Footer": "© {year} {site}. All rights reserved."
+    }
+  ],
+  "generic": [
+    {
+      "Title": "Page Not Found",
+      "Heading": "We Could Not Find That Page",
+      "Paragraphs": [
+        "The link may be out of date, or the address may have been mistyped. You can start again from the home page, or use the navigation above to find the section you were looking for."
+      ],
+      "Footer": "© {year} {site}. All rights reserved."
+    }
+  ]
+}

@@ -8,6 +8,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/nange/easyss/v3/util"
 )
 
 const launchAgentPlist = `<?xml version="1.0" encoding="UTF-8"?>
@@ -36,38 +38,11 @@ func launchAgentPath() (string, error) {
 	return filepath.Join(home, "Library", "LaunchAgents", "com.github.nange.easyss.plist"), nil
 }
 
-// executablePathForAutoStart returns the path to use in the LaunchAgent plist.
-// If the current binary is inside an .app bundle (e.g., Easyss.app/Contents/MacOS/easyss),
-// it uses the bundle path so that macOS treats it as a proper application.
-// Otherwise, it falls back to the raw binary path.
-func executablePathForAutoStart() (string, error) {
-	exe, err := os.Executable()
-	if err != nil {
-		return "", err
-	}
-
-	// Resolve symlinks to get the real path.
-	realExe, err := filepath.EvalSymlinks(exe)
-	if err != nil {
-		realExe = exe
-	}
-
-	// Check if running from inside an .app bundle.
-	// The bundle structure is: Easyss.app/Contents/MacOS/easyss
-	macOSDir := filepath.Dir(realExe)      // .../Contents/MacOS
-	contentsDir := filepath.Dir(macOSDir)  // .../Contents
-	appBundle := filepath.Dir(contentsDir) // .../Easyss.app
-
-	if strings.HasSuffix(macOSDir, "/MacOS") && strings.HasSuffix(contentsDir, "/Contents") && strings.HasSuffix(appBundle, ".app") {
-		// Running from inside a proper .app bundle, use the bundle path.
-		return realExe, nil
-	}
-
-	return realExe, nil
-}
-
 func enableAutoStart() error {
-	exePath, err := executablePathForAutoStart()
+	// 解析符号链接后的路径使 plist 在多次启动间保持稳定
+	// （Finder/launchd 通过符号链接的 bundle 路径启动应用），
+	// 并让 isAutoStartEnabled 能与这里写入的确切字符串比较。
+	exePath, err := util.ExecutablePath()
 	if err != nil {
 		return fmt.Errorf("resolve executable path: %w", err)
 	}
@@ -86,10 +61,9 @@ func enableAutoStart() error {
 		return fmt.Errorf("write plist: %w", err)
 	}
 
-	// Only write the plist — do NOT load it with launchctl.
-	// launchctl load would start a second instance immediately, causing
-	// duplicate tray icons. The plist has RunAtLoad=true, so macOS will
-	// auto-start the app on next login.
+	// 只写 plist——绝不用 launchctl 加载它。
+	// launchctl load 会立即启动第二个实例，导致托盘图标重复。
+	// plist 带有 RunAtLoad=true，macOS 会在下次登录时自动启动应用。
 	return nil
 }
 
@@ -99,14 +73,14 @@ func disableAutoStart() error {
 		return fmt.Errorf("resolve plist path: %w", err)
 	}
 
-	// Unload the job from the current session.
+	// 从当前会话卸载该 job。
 	unloadCmd := exec.Command("launchctl", "unload", plistPath)
 	if out, err := unloadCmd.CombinedOutput(); err != nil {
-		// It's OK if the job isn't currently loaded.
+		// job 当前未加载也没关系。
 		_ = string(out)
 	}
 
-	// Remove the plist file.
+	// 删除 plist 文件。
 	if err := os.Remove(plistPath); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("remove plist: %w", err)
 	}
@@ -125,8 +99,8 @@ func isAutoStartEnabled() bool {
 		return false
 	}
 
-	// Check that the plist references the current executable path.
-	exePath, err := executablePathForAutoStart()
+	// 检查 plist 是否引用当前可执行文件路径。
+	exePath, err := util.ExecutablePath()
 	if err != nil {
 		return false
 	}

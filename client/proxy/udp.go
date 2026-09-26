@@ -2,19 +2,13 @@ package proxy
 
 import (
 	"context"
-	"errors"
-	"io"
 	"net"
-	"strings"
 	"time"
 
 	"github.com/miekg/dns"
-	"github.com/nange/easyss/v3/client/config"
-	easydns "github.com/nange/easyss/v3/client/dns"
 	"github.com/nange/easyss/v3/client/router"
 	"github.com/nange/easyss/v3/log"
 	"github.com/nange/easyss/v3/protocol"
-	"github.com/nange/easyss/v3/stats"
 	"github.com/nange/easyss/v3/util"
 	"github.com/nange/easyss/v3/util/bytespool"
 	"github.com/txthinking/socks5"
@@ -26,8 +20,8 @@ func (s *Socks5Server) handleUDP(srv *socks5.Server, clientAddr *net.UDPAddr, d 
 
 	host, port, err := net.SplitHostPort(dst)
 	if err != nil {
-		// Malformed datagram target: drop it instead of opening an exchange
-		// with an empty target that the server would reject anyway.
+		// 畸形数据报目标：直接丢弃，而不是用一个服务器反正会拒绝的空目标
+		// 打开交换。
 		log.Debug("[UDP] malformed datagram target", "src", src, "target", dst, "err", err)
 		return nil
 	}
@@ -41,359 +35,43 @@ func (s *Socks5Server) handleUDP(srv *socks5.Server, clientAddr *net.UDPAddr, d 
 	}
 
 	msg := &dns.Msg{}
-	if err := msg.Unpack(d.Data); err == nil && util.IsDNSRequest(msg) {
+	if err := msg.Unpack(d.Data); err == nil && isDNSQueryMsg(msg) {
 		return s.handleDNS(srv, clientAddr, d, msg)
 	}
 
 	return s.handleRegularUDP(srv, clientAddr, d, dst)
 }
 
+// handleDNS 把一条 DNS 查询交给拦截器，并为它准备两条应答通道：同步分支用
+// msg 通道（直接写回一条应答），异步的代理分支用 raw 通道（应答由 receiveLoop
+// 在任意时刻送回）。两者的组帧都按客户端请求的目标地址进行——透明 NAT
+// （tun2socks）以该地址为 UDP 流建键，声称来自上游地址的数据报会被丢弃。
 func (s *Socks5Server) handleDNS(srv *socks5.Server, clientAddr *net.UDPAddr, d *socks5.Datagram, msg *dns.Msg) error {
-	question := msg.Question[0]
-	domain := strings.TrimSuffix(question.Name, ".")
-	qtype := dns.TypeToString[question.Qtype]
-
-	rule := s.router.MatchHostRule(domain)
-	if rule == router.HostRuleBlock {
-		log.Info("[DNS_BLOCK] blocked", "domain", domain, "qtype", qtype)
-		return responseBlockedDNSMsg(srv.UDPConn, clientAddr, msg, d.Address())
-	}
-
-	// Never take the proxied path for the proxy server's own domain:
-	// opening the tunnel to answer the query would require resolving the
-	// server domain again, a circular dependency. Fall back to the direct
-	// path (bound to the physical interface, bypassing the TUN).
-	isServerDomain := s.isServerDomain(domain)
-	if isServerDomain {
-		log.Info("[DNS_SERVER_DOMAIN] direct", "domain", domain, "qtype", qtype)
-	}
-	isDirect := isServerDomain || rule == router.HostRuleDirect
-
-	if cached := s.dnsCache.Get(question.Name, qtype, isDirect); cached != nil {
-		log.Info("[DNS_CACHE] hit", "domain", domain, "qtype", qtype, "direct", isDirect)
-		if s.router.ShouldIPV6Disable() && cached.Question[0].Qtype == dns.TypeAAAA {
-			cached.Answer = nil
-		}
-		cached.Id = msg.Id
-		return responseDNSMsg(srv.UDPConn, clientAddr, cached, d.Address())
-	}
-
-	if isDirect {
-		log.Info("[DNS_DIRECT]", "domain", domain, "qtype", qtype)
-		stats.RecordDNSDirectQuery()
-		return s.directDNSQuery(srv, clientAddr, d, msg, domain)
-	}
-
-	log.Info("[DNS_PROXY]", "domain", domain, "qtype", qtype)
-	stats.RecordDNSProxyQuery()
-	return s.proxyDNSQuery(srv, clientAddr, d, msg, domain)
+	return s.dns.handleUDPQuery(clientAddr, udpDNSQuery{
+		raw: d.Data,
+		msg: msg,
+		dst: d.Address(),
+		reply: udpReply{
+			msg: func(m *dns.Msg) error {
+				return responseDNSMsg(srv.UDPConn, clientAddr, m, d.Address())
+			},
+			raw: func(data []byte) {
+				s.sendToClient(srv, clientAddr, data, d.Address())
+			},
+		},
+	})
 }
 
-func (s *Socks5Server) directDNSQuery(srv *socks5.Server, clientAddr *net.UDPAddr, d *socks5.Datagram, msg *dns.Msg, domain string) error {
-	resp, err := s.exchangeDirectDNSWithFallback(msg, config.DirectDNSServers)
-	if err != nil {
-		log.Error("[DNS_DIRECT]", "domain", domain, "err", err)
-		return err
-	}
-	if s.router.ShouldIPV6Disable() && msg.Question[0].Qtype == dns.TypeAAAA {
-		resp.Answer = nil
-	}
-	_ = s.dnsCache.Set(resp, true)
-
-	qtype := dns.TypeToString[msg.Question[0].Qtype]
-	log.Info("[DNS_DIRECT] result", "domain", domain, "qtype", qtype, "answers", util.DNSAnswerStrings(resp))
-
-	if s.router.IsCustomDirectDomain(domain) {
-		for _, ans := range resp.Answer {
-			switch a := ans.(type) {
-			case *dns.A:
-				s.router.AddDirectIP(a.A.String())
-			case *dns.AAAA:
-				s.router.AddDirectIP(a.AAAA.String())
-			case *dns.CNAME:
-				s.router.AddDirectDomain(strings.TrimSuffix(a.Target, "."))
-			}
-		}
-	}
-
-	resp.Id = msg.Id
-	return responseDNSMsg(srv.UDPConn, clientAddr, resp, d.Address())
-}
-
-// exchangeDirectDNSWithFallback exchanges msg with each of the given dns
-// servers in order, falling back to the system dns servers when all of them
-// fail. The builtin servers are skipped entirely during the circuit breaker
-// cool-down after a failure.
-func (s *Socks5Server) exchangeDirectDNSWithFallback(msg *dns.Msg, servers []string) (*dns.Msg, error) {
-	try := func(servers []string) (*dns.Msg, error) {
-		return s.exchangeDirectDNSFromList(msg, servers)
-	}
-	return easydns.QueryWithBuiltinFirst(servers, easydns.SystemDNSServers(), try)
-}
-
-func (s *Socks5Server) exchangeDirectDNSFromList(msg *dns.Msg, servers []string) (*dns.Msg, error) {
-	var candidates []string
-	for _, addr := range servers {
-		if s.router.ShouldIPV6Disable() && util.IsIPV6Addr(addr) {
-			continue
-		}
-		candidates = append(candidates, addr)
-	}
-	if len(candidates) == 0 {
-		return nil, errors.New("no dns server available")
-	}
-
-	// Query every upstream concurrently and take the first success. A
-	// serial scan lets one hung upstream stall the query for the full
-	// per-server timeout — and every datagram's handler goroutine blocks for
-	// the whole wait — so a DNS outage would otherwise pile up goroutines.
-	// The whole query shares a single timeout budget.
-	ctx, cancel := context.WithTimeout(context.Background(), s.dialTimeout)
-	defer cancel()
-
-	type result struct {
-		resp *dns.Msg
-		err  error
-	}
-	ch := make(chan result, len(candidates))
-	for _, addr := range candidates {
-		go func(addr string) {
-			resp, err := s.exchangeDirectDNS(ctx, msg, addr)
-			ch <- result{resp: resp, err: err}
-		}(addr)
-	}
-
-	var lastErr error
-	for range candidates {
-		select {
-		case r := <-ch:
-			if r.err == nil {
-				return r.resp, nil
-			}
-			lastErr = r.err
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-	}
-	if lastErr == nil {
-		lastErr = errors.New("no dns server available")
-	}
-	return nil, lastErr
-}
-
-func (s *Socks5Server) exchangeDirectDNS(ctx context.Context, msg *dns.Msg, addr string) (*dns.Msg, error) {
-	conn, err := s.directDialContext(ctx, "udp", addr)
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Close() //nolint:errcheck
-
-	_ = conn.SetDeadline(time.Now().Add(s.dialTimeout))
-	dnsConn := &dns.Conn{Conn: conn, UDPSize: 8192}
-	if err := dnsConn.WriteMsg(msg); err != nil {
-		return nil, err
-	}
-	return dnsConn.ReadMsg()
-}
-
-func (s *Socks5Server) proxyDNSQuery(srv *socks5.Server, clientAddr *net.UDPAddr, d *socks5.Datagram, msg *dns.Msg, domain string) error {
-	dst := config.ProxyDNSServer
-	key := clientAddr.String() + "_" + dst
-
-	ue, created, err := s.getOrCreateUDPExchange(key, dst, d.Data)
-	if err != nil {
-		log.Error("[UDP_PROXY] open exchange", "dst", dst, "err", err)
-		return err
-	}
-	if created {
-		go s.receiveLoop(ue, srv, clientAddr, dst, key, s.dnsRespTimeout)
-		return nil // first payload already sent in handshake
-	}
-
-	if err := ue.Send(d.Data); err != nil {
-		log.Error("[UDP_PROXY] send", "err", err)
-		s.udpMu.Lock()
-		delete(s.udpExch, key)
-		s.udpMu.Unlock()
-		ue.Close() //nolint:errcheck
-		return err
-	}
-	return nil
-}
-
-// udpExchangeFactory deduplicates concurrent attempts to create a UDPExchange
-// for the same key. The first goroutine to need a key performs the (slow)
-// OpenUDPExchange call; concurrent waiters block on done and reuse the result.
-type udpExchangeFactory struct {
-	done chan struct{}
-	ue   *UDPExchange
-	err  error
-}
-
-// maxUDPExchanges bounds the number of concurrent proxied UDP exchanges.
-// Each exchange owns one HTTP/2 stream, one receiveLoop goroutine and one
-// shaper; keying by (client address, target) means a client that uses a
-// fresh ephemeral UDP source port per datagram (Go's net.Resolver, some
-// curl builds) would otherwise accumulate hundreds of them within the idle
-// window. When the cap is reached, the exchange idle the longest is evicted.
-const maxUDPExchanges = 128
-
-// getOrCreateUDPExchange returns the existing UDPExchange for key, or creates
-// one via OpenUDPExchange. firstPayload, if non-empty, is merged into the
-// bootstrap record when the exchange is newly created (saving one RTT). If
-// the exchange already existed, firstPayload is ignored. If this call created
-// the exchange, created is true and the caller MUST NOT call ue.Send for the
-// first payload (it was already sent in the handshake).
-func (s *Socks5Server) getOrCreateUDPExchange(key, dst string, firstPayload []byte) (ue *UDPExchange, created bool, err error) {
-	s.udpMu.Lock()
-	if existing, ok := s.udpExch[key]; ok {
-		s.udpMu.Unlock()
-		return existing, false, nil
-	}
-	if f, ok := s.udpInflight[key]; ok {
-		s.udpMu.Unlock()
-		<-f.done
-		if s.closing.Load() {
-			return nil, false, errSocksServerClosed
-		}
-		return f.ue, false, f.err
-	}
-	var evicted *UDPExchange
-	if len(s.udpExch)+len(s.udpInflight) >= maxUDPExchanges {
-		evicted = s.evictOldestExchangeLocked()
-	}
-	f := &udpExchangeFactory{done: make(chan struct{})}
-	s.udpInflight[key] = f
-	s.udpMu.Unlock()
-
-	// Close the evicted exchange outside the lock: Close flushes a FIN
-	// through the HTTP/2 stream (an io.Pipe write), which can block on
-	// transport backpressure — holding s.udpMu there would freeze all UDP
-	// handling. closeOnce makes this safe against the receiveLoop's own
-	// deferred Close.
-	if evicted != nil {
-		evicted.Close() //nolint:errcheck
-	}
-
-	ue, err = s.handler.OpenUDPExchange(context.Background(), dst, s.method, firstPayload)
-	f.ue, f.err = ue, err
-	close(f.done)
-
-	if err != nil {
-		s.udpMu.Lock()
-		delete(s.udpInflight, key)
-		s.udpMu.Unlock()
-		return nil, false, err
-	}
-	// The server was closed while the exchange was being created: close it
-	// immediately so the stream and its receiveLoop cannot leak past
-	// shutdown (the cleanup loop has already exited).
-	if s.closing.Load() {
-		ue.Close() //nolint:errcheck
-		s.udpMu.Lock()
-		delete(s.udpInflight, key)
-		s.udpMu.Unlock()
-		return nil, false, errSocksServerClosed
-	}
-	s.udpMu.Lock()
-	s.udpExch[key] = ue
-	delete(s.udpInflight, key)
-	s.udpMu.Unlock()
-	return ue, true, nil
-}
-
-var errSocksServerClosed = errors.New("socks5 udp server closed")
-
-// evictOldestExchangeLocked selects the exchange that has been idle the
-// longest and removes it from the map, bounding the live exchange count at
-// maxUDPExchanges. The evicted exchange is returned without being closed:
-// the caller must close it after releasing s.udpMu, since UDPExchange.Close
-// flushes a FIN through the HTTP/2 stream (an io.Pipe write) and can block
-// on transport backpressure — holding s.udpMu there would freeze all UDP
-// handling. closeOnce makes the deferred close safe against the
-// receiveLoop's own Close.
-func (s *Socks5Server) evictOldestExchangeLocked() *UDPExchange {
-	var oldestKey string
-	var oldestTime time.Time
-	for k, ue := range s.udpExch {
-		last := ue.LastSeen()
-		if oldestKey == "" || last.Before(oldestTime) {
-			oldestKey, oldestTime = k, last
-		}
-	}
-	if oldestKey == "" {
-		return nil
-	}
-	log.Debug("[UDP_PROXY] exchange cap reached, evicting oldest idle", "key", oldestKey)
-	evicted := s.udpExch[oldestKey]
-	delete(s.udpExch, oldestKey)
-	return evicted
-}
-
+// receiveLoop 把代理交换收到的数据报按 SOCKS5 帧发回客户端，直到交换失败或被
+// 回收。DNS 应答的后处理（AAAA 剥离、写缓存、学习）由拦截器在 dns_udp.go 的
+// onData 回调里完成，这里只做组帧。
+//
+// 会话生命周期（读空闲定时器、退出时的地图清理与关闭）由 udpPool.receiveLoop
+// 承担，本函数只提供「收到数据报之后做什么」。
 func (s *Socks5Server) receiveLoop(ue *UDPExchange, srv *socks5.Server, clientAddr *net.UDPAddr, target, key string, respTimeout time.Duration) {
-	// Read-idle timeout for proxied-DNS exchanges: the query was already
-	// sent (Send refreshes lastSeen, so the 60s idle reaper never fires for
-	// a client that keeps retrying while the upstream stays silent), so a
-	// long silence from the server means the upstream DNS is not answering.
-	// Close the exchange so the stream and goroutine cannot pile up; the
-	// next query transparently rebuilds it. Any received datagram resets
-	// the timer. respTimeout <= 0 disables the mechanism (non-DNS UDP).
-	var timer *time.Timer
-	if respTimeout > 0 {
-		timer = time.AfterFunc(respTimeout, func() {
-			log.Debug("[UDP_PROXY] dns response timeout, closing exchange", "key", key, "target", target)
-			ue.Close() //nolint:errcheck // closeOnce makes this safe against concurrent Close
-		})
-		defer timer.Stop()
-	}
-	defer func() {
-		s.udpMu.Lock()
-		delete(s.udpExch, key)
-		s.udpMu.Unlock()
-		ue.Close() //nolint:errcheck
-	}()
-
-	for {
-		data, err := ue.Receive()
-		if err != nil {
-			if !errors.Is(err, io.EOF) {
-				log.Debug("[UDP_PROXY] receive", "err", err)
-			}
-			return
-		}
-		if timer != nil {
-			timer.Reset(respTimeout)
-		}
-
-		msg := &dns.Msg{}
-		if err := msg.Unpack(data); err == nil && util.IsDNSResponse(msg) {
-			if s.router.ShouldIPV6Disable() && msg.Question[0].Qtype == dns.TypeAAAA {
-				msg.Answer = nil
-				if packed, packErr := msg.Pack(); packErr == nil {
-					data = packed
-				}
-			}
-			_ = s.dnsCache.Set(msg, false)
-
-			domain := strings.TrimSuffix(msg.Question[0].Name, ".")
-			qtype := dns.TypeToString[msg.Question[0].Qtype]
-			log.Info("[DNS_PROXY] result", "domain", domain, "qtype", qtype, "answers", util.DNSAnswerStrings(msg))
-
-			if s.router.IsCustomProxyDomain(domain) {
-				for _, ans := range msg.Answer {
-					switch a := ans.(type) {
-					case *dns.A:
-						s.router.AddProxyIP(a.A.String())
-					case *dns.AAAA:
-						s.router.AddProxyIP(a.AAAA.String())
-					case *dns.CNAME:
-						s.router.AddProxyDomain(strings.TrimSuffix(a.Target, "."))
-					}
-				}
-			}
-		}
+	s.udp.receiveLoop(ue, key, respTimeout, func(data []byte) {
 		s.sendToClient(srv, clientAddr, data, target)
-	}
+	})
 }
 
 func (s *Socks5Server) sendToClient(srv *socks5.Server, clientAddr *net.UDPAddr, data []byte, target string) {
@@ -416,8 +94,7 @@ func (s *Socks5Server) handleRegularUDP(srv *socks5.Server, clientAddr *net.UDPA
 		return err
 	}
 
-	rule := s.router.MatchHostRule(host)
-	switch rule {
+	switch s.router.ClassifyHost(host).Rule {
 	case router.HostRuleBlock:
 		log.Info("[UDP_BLOCK] blocked", "host", host, "target", dst)
 		return nil
@@ -434,80 +111,70 @@ func (s *Socks5Server) handleRegularUDP(srv *socks5.Server, clientAddr *net.UDPA
 func (s *Socks5Server) directUDPRelay(srv *socks5.Server, clientAddr *net.UDPAddr, d *socks5.Datagram, dst string) error {
 	key := "direct_" + clientAddr.String() + "_" + dst
 
-	s.udpMu.RLock()
-	dc, ok := s.directUDP[key]
-	s.udpMu.RUnlock()
-
-	if ok {
-		dc.lastSeen.Store(time.Now().UnixNano())
-		_, err := dc.conn.Write(d.Data)
-		return err
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), s.dialTimeout)
-	rc, err := s.directDialContext(ctx, "udp", dst)
-	cancel()
-	if err != nil {
-		return err
-	}
-	dc = &directUDPConn{conn: rc}
-	dc.lastSeen.Store(time.Now().UnixNano())
-
-	s.udpMu.Lock()
-	s.directUDP[key] = dc
-	s.udpMu.Unlock()
-
-	go func() {
-		defer func() {
-			rc.Close() //nolint:errcheck
-			s.udpMu.Lock()
-			delete(s.directUDP, key)
-			s.udpMu.Unlock()
-		}()
-		buf := bytespool.Get(protocol.MaxUDPDataSize)
-		defer bytespool.MustPut(buf)
-		for {
-			_ = rc.SetReadDeadline(time.Now().Add(2 * time.Minute))
-			n, err := rc.Read(buf)
-			if err != nil {
-				return
-			}
-			// Refresh the idle timestamp on receive as well as send, mirroring
-			// the proxied path (UDPExchange.Receive): a flow that keeps
-			// receiving but never writes again (a one-shot query with a long
-			// stream of responses) must not be reaped while it is still
-			// active.
-			dc.lastSeen.Store(time.Now().UnixNano())
-			s.sendToClient(srv, clientAddr, buf[:n], dst)
+	dc, ok := s.udp.directFor(key)
+	if !ok {
+		var err error
+		var created bool
+		dc, created, err = s.udp.acquireDirect(key, dst)
+		if err != nil {
+			return err
 		}
-	}()
+		// 读取循环由创建者启动：会话池只管理生命周期，不做任何 I/O。
+		if created {
+			go s.directUDPReadLoop(srv, clientAddr, dst, key, dc)
+		}
+	}
 
-	_, err = rc.Write(d.Data)
+	dc.lastSeen.Store(time.Now().UnixNano())
+	_, err := dc.conn.Write(d.Data)
 	return err
+}
+
+// directUDPReadLoop 把来自直连远端的数据库报中继回客户端，直到 socket 失败或
+// 读空闲截止时间在无数据的情况下触发。该截止时间与清理循环用于回收空闲会话的
+// udpIdleTimeout 相同（用户配置超时的 2 倍），镜像服务端 UDP 处理器——它同样以
+// 2 倍超时的空闲截止时间读取。退出时会关闭 socket 并从会话表中移除自己的条目，
+// 但仅在条目仍指向本会话时——绝不会移除指向替换它的新会话的条目。
+func (s *Socks5Server) directUDPReadLoop(srv *socks5.Server, clientAddr *net.UDPAddr, dst, key string, dc *directUDPConn) {
+	rc := dc.conn
+	defer func() {
+		rc.Close() //nolint:errcheck
+		s.udp.removeDirect(key, dc)
+	}()
+	buf := bytespool.Get(protocol.MaxUDPDataSize)
+	defer bytespool.MustPut(buf)
+	for {
+		_ = rc.SetReadDeadline(time.Now().Add(s.udpIdleTimeout))
+		n, err := rc.Read(buf)
+		if err != nil {
+			return
+		}
+		// 接收时也刷新空闲时间戳，与发送一致，镜像代理路径
+		// （UDPExchange.Receive）：一个只持续接收而不再写入的流（一次查询带来
+		// 一长串响应）在仍然活跃时不能被回收。
+		dc.lastSeen.Store(time.Now().UnixNano())
+		s.sendToClient(srv, clientAddr, buf[:n], dst)
+	}
 }
 
 func (s *Socks5Server) proxyUDPRelay(srv *socks5.Server, clientAddr *net.UDPAddr, d *socks5.Datagram, dst string) error {
 	key := clientAddr.String() + "_" + dst
 
-	ue, created, err := s.getOrCreateUDPExchange(key, dst, d.Data)
+	ue, created, err := s.udp.acquireExchange(context.Background(), key, dst, d.Data)
 	if err != nil {
 		log.Error("[UDP_PROXY] open exchange", "dst", dst, "err", err)
 		return err
 	}
 	if created {
-		// Non-DNS UDP must not use the short read-idle timeout: a session
-		// may legitimately stay silent for a long time (e.g. an upload-only
-		// flow), so it keeps the 60s bidirectional idle reaper only.
+		// 非 DNS 的 UDP 不能使用较短的读空闲超时：会话可能合法地长时间沉默
+		// （例如纯上传流），因此它只保留默认 60 秒的双向空闲回收器。
 		go s.receiveLoop(ue, srv, clientAddr, dst, key, 0)
-		return nil // first payload already sent in handshake
+		return nil // 第一个载荷已在握手中发送
 	}
 
 	if err := ue.Send(d.Data); err != nil {
 		log.Error("[UDP_PROXY] send", "err", err)
-		s.udpMu.Lock()
-		delete(s.udpExch, key)
-		s.udpMu.Unlock()
-		ue.Close() //nolint:errcheck
+		s.udp.removeExchange(key, ue)
 		return err
 	}
 	return nil
@@ -518,7 +185,7 @@ func responseDNSMsg(conn *net.UDPConn, addr *net.UDPAddr, msg *dns.Msg, dst stri
 	if err != nil {
 		return err
 	}
-	a, addrBytes, port, err := ParseAddress(dst)
+	a, addrBytes, port, err := socks5.ParseAddress(dst)
 	if err != nil {
 		return err
 	}
@@ -528,16 +195,4 @@ func responseDNSMsg(conn *net.UDPConn, addr *net.UDPAddr, msg *dns.Msg, dst stri
 	resp := socks5.NewDatagram(a, addrBytes, port, data)
 	_, err = conn.WriteToUDP(resp.Bytes(), addr)
 	return err
-}
-
-func responseBlockedDNSMsg(conn *net.UDPConn, addr *net.UDPAddr, msg *dns.Msg, dst string) error {
-	msg.Response = true
-	msg.Answer = nil
-	msg.Ns = nil
-	msg.Extra = nil
-	return responseDNSMsg(conn, addr, msg, dst)
-}
-
-func ParseAddress(address string) (a byte, addr []byte, port []byte, err error) {
-	return socks5.ParseAddress(address)
 }

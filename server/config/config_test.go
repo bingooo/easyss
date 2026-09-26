@@ -10,7 +10,9 @@ import (
 	"github.com/nange/easyss/v3/util"
 )
 
-func TestFileConfigEffectiveServerConfig(t *testing.T) {
+// TestFileConfigJSON 固定文档化的配置形态：顶层设置位于 FileConfig 上，
+// "server" 键映射到 ServerConfig，两者之间没有重复字段。
+func TestFileConfigJSON(t *testing.T) {
 	data := []byte(`{
 			"version": 3,
 		"server": {
@@ -18,23 +20,25 @@ func TestFileConfigEffectiveServerConfig(t *testing.T) {
 			"domain": "example.com",
 			"password": "secret",
 			"allowed_methods": ["aes-256-gcm"],
-				"fallback_target": "fallback.html",
 			"timeout": 99,
 			"next_proxy": {"url": "socks5://127.0.0.1:9999", "enable_udp": false}
 		},
+		"fallback": {"target": "fallback.html"},
 		"next_proxy": {"url": "socks5://127.0.0.1:1080", "enable_udp": true},
+		"pprof_enabled": true,
 		"timeout": 30
 	}`)
 
 	var fc FileConfig
 	require.NoError(t, json.Unmarshal(data, &fc))
-	cfg := fc.EffectiveServerConfig()
-	require.Equal(t, ":443", cfg.Listen)
-	require.Equal(t, "secret", cfg.Password)
-	require.Equal(t, "fallback.html", cfg.FallbackTarget)
-	require.Equal(t, 30, cfg.Timeout)
-	require.Equal(t, "socks5://127.0.0.1:1080", cfg.NextProxy.URL)
-	require.True(t, cfg.NextProxy.EnableUDP)
+	require.Equal(t, ":443", fc.Server.Listen)
+	require.Equal(t, "secret", fc.Server.Password)
+	require.Equal(t, []string{"aes-256-gcm"}, fc.Server.AllowedMethods)
+	require.Equal(t, "fallback.html", fc.Fallback.Target)
+	require.Equal(t, 30, fc.Timeout)
+	require.Equal(t, "socks5://127.0.0.1:1080", fc.NextProxy.URL)
+	require.True(t, fc.NextProxy.EnableUDP)
+	require.True(t, fc.PprofEnabled)
 }
 
 func TestResolveFilePaths(t *testing.T) {
@@ -77,7 +81,10 @@ func TestResolveFilePathsEmpty(t *testing.T) {
 	}
 }
 
-func TestEffectiveServerConfigCarriesResolvedPaths(t *testing.T) {
+// TestResolveFilePathsCarriesIntoResolvedPaths 固定 ResolveFilePaths 就地
+// 改写字段的行为：在移除 EffectiveServerConfig 合并之后，已不存在需要保持
+// 同步的第二份副本。
+func TestResolveFilePathsResolvedInPlace(t *testing.T) {
 	fc := &FileConfig{
 		Server: ServerConfig{
 			CertPath: "server.crt",
@@ -90,15 +97,14 @@ func TestEffectiveServerConfigCarriesResolvedPaths(t *testing.T) {
 	}
 
 	fc.ResolveFilePaths()
-	cfg := fc.EffectiveServerConfig()
 
-	if cfg.CertPath != fc.Server.CertPath {
-		t.Errorf("effective CertPath = %q, want %q", cfg.CertPath, fc.Server.CertPath)
+	if want := filepath.Join(util.CurrentDir(), "server.crt"); fc.Server.CertPath != want {
+		t.Errorf("CertPath = %q, want %q", fc.Server.CertPath, want)
 	}
-	if cfg.NextProxy.NextProxyFile != fc.NextProxy.NextProxyFile {
-		t.Errorf("effective NextProxyFile = %q, want %q", cfg.NextProxy.NextProxyFile, fc.NextProxy.NextProxyFile)
+	if want := filepath.Join(util.CurrentDir(), "next_proxy.txt"); fc.NextProxy.NextProxyFile != want {
+		t.Errorf("NextProxyFile = %q, want %q", fc.NextProxy.NextProxyFile, want)
 	}
-	if cfg.Timeout != 30 {
-		t.Errorf("Timeout = %d, want 30", cfg.Timeout)
+	if fc.Timeout != 30 {
+		t.Errorf("Timeout = %d, want 30", fc.Timeout)
 	}
 }

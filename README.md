@@ -10,11 +10,11 @@ Easyss是一款兼容socks5的安全代理上网工具，目标是使访问国�
 ## 特性
 
 * 简单稳定易用, 没有复杂的配置项；支持 IPv4/IPv6 双栈网络
-* 无流量特征，不易被嗅探；底层基于真实http2(tls)传输协议，并对请求进行流量整形、真实网页fallback、智能请求连接调度等手段，保证网络的稳定运行
+* 无流量特征，不易被嗅探：底层基于真实 HTTP/2 (TLS) 传输协议，并通过流量整形、真实网页 fallback、智能请求连接调度等手段，兼顾连接隐蔽性与运行稳定性
 * 全平台支持(Linux, MacOS, Windows, Android等)
 * 支持SOCKS5(TCP/UDP, thanks [socks5](https://github.com/txthinking/socks5))、HTTP 代理协议
 * 支持浏览器级别代理(设置系统代理), 和系统全局代理(thanks [tun2socks](https://github.com/xjasonlyu/tun2socks)); 全局代理支持`ping`命令(ICMP Echo协议)
-* 支持系统托盘图标管理客户端 (thanks [systray](https://github.com/fyne-io/systray))
+* 支持系统托盘图标管理客户端 (thanks [systray](https://github.com/gogpu/systray))
 * 可配置多服务器切换; 自定义直连、代理白名单(IP/域名)
 * 支持服务端链式代理
 
@@ -24,13 +24,15 @@ Easyss是一款兼容socks5的安全代理上网工具，目标是使访问国�
 
 [去下载](https://github.com/nange/easyss/releases)
 
-**MacOS 用户注意：** `Easyss.app` 未经 Apple 公证，从网上下载解压后首次双击会被 Gatekeeper 拦截（提示无法验证开发者/应用已损坏）。请先在终端执行以下命令解除隔离属性，然后即可正常双击运行：
+**MacOS 用户注意：** `Easyss.app` 未经 Apple 公证，从网上下载解压后首次双击会被 Gatekeeper 拦截（提示无法验证开发者/应用已损坏）。**仅首次下载后**需要先在终端执行以下命令解除隔离属性，然后即可正常双击运行：
 
 ```bash
 xattr -cr ./Easyss.app
 ```
 
-进入 `Easyss.app` 所在目录执行，将 `./Easyss.app` 替换为实际路径即可（配置文件需与程序同目录，建议将 app 保留在自选目录而非 `/Applications`）。
+命令行进入 `Easyss.app` 所在目录，并执行上述命令。（配置文件需与程序同目录，建议将 app 保留在自选目录而非 `/Applications`）。
+
+之后使用客户端内置的自更新功能升级时，新版本会自动清除隔离属性，无需再手动执行 `xattr` 命令。
 
 如果想通过源码编译，可查看`Makefile`中的内容。
 
@@ -104,6 +106,7 @@ Easyss v3 支持两种配置模式，自动识别：
 | `-log-level` | 日志级别 |
 | `-sn` | TLS SNI 覆盖 |
 | `-enable-quic` | 启用 QUIC 协议 |
+| `-disable-warmup` | 禁用启动预热（默认开启，见 `transport.disable_warm_up`） |
 | `-ipv6-rule` | IPv6 规则 |
 | `-direct-file` | 自定义直连文件路径 |
 | `-proxy-file` | 自定义代理文件路径 |
@@ -152,8 +155,9 @@ Easyss v3 支持两种配置模式，自动识别：
     "conn_count_max": 15,
     "stream_threshold": 4,
     "priority_slot_ratio": 0.4,
-    "conn_lifetime_sec": 420,
-    "conn_max_bytes": 268435456
+    "conn_lifetime_sec": 360,
+    "conn_max_bytes": 268435456,
+    "disable_warm_up": false
   },
   "shaper": {
     "batch_window_ms": 3,
@@ -185,8 +189,9 @@ Easyss v3 支持两种配置模式，自动识别：
 | `transport.conn_count_max` | 15 | 最大连接数，懒加载扩容的上限 |
 | `transport.stream_threshold` | 4 | 活跃流达到该阈值且连接数未达上限时，新建连接 |
 | `transport.priority_slot_ratio` | 0.4 | 优先（交互式）槽位占连接数的比例，其余为批量槽位 |
-| `transport.conn_lifetime_sec` | 420 | 单连接最大存活时间（秒），0 使用默认值；到期后停止接收新流并轮换连接 |
+| `transport.conn_lifetime_sec` | 360 | 单连接最大存活时间（秒），0 使用默认值；到期后停止接收新流并轮换连接 |
 | `transport.conn_max_bytes` | 268435456 | 单连接双向累计最大字节数（256MB），0 使用默认值；超限后轮换连接 |
+| `transport.disable_warm_up` | false | 是否禁用启动预热。默认开启：核心启动后在后台预热优先级/批量两个连接池（各发一次 `/v3/probe` 探测），使首次请求直接复用已建立的连接，避免冷启动（dial + TLS + HTTP/2）开销。预热完全异步，不增加启动耗时；约在启动 500ms 后发出探测，探测阶段最长 5s，失败只记日志（`[WARMUP] failed`）不影响服务 |
 
 **shaper 参数说明：**
 
@@ -216,6 +221,12 @@ Easyss 通过检测配置文件自动区分模式：
 ![托盘图标](assets/img/tray3.png)
 
 **注意：代理对象，选择系统全局流量时，需要管理员权限。**
+
+**开机自启动与网络尚未就绪：**
+
+Easyss 支持开机自启动。开机时 WiFi/网络往往还没有初始化完成，此时客户端**不会启动失败**：服务端域名解析失败只会变成一条启动警告（托盘会提示"网络尚未就绪、已在后台重试"），SOCKS5/HTTP 代理端口照常监听，后台按退避持续重试解析，网络恢复后代理自动可用（并会再提示一次"网络已就绪"）。
+
+如果配置了"系统全局流量(Tun2socks)"，网络未就绪时会**跳过 TUN**（此时启用会把系统 DNS 指向本机转发服务器却无法解析服务端域名）；托盘中的"系统全局流量"会保持未勾选，等网络恢复后在托盘菜单里重新开启即可。
 
 **自定义直连/代理白名单：**
 
@@ -305,34 +316,22 @@ regexp:^.*\.youtube\..*$ # 正则表达式：匹配包含 .youtube. 的域名
   "server": {
     "listen": ":443",
     "domain": "your-domain.com",
-    "password": "your-password",
-    "allowed_methods": ["aes-256-gcm", "chacha20-poly1305"],
-    "cert_path": "",
-    "key_path": "",
-    "email": "your-email@example.com",
-    "fallback_target": "",
-    "fallback_preserve_host": false,
-    "fallback_cdn_domains": [],
-    "batch_window_ms": 3,
-    "cover_budget_ratio": 0.03,
-    "cover_budget_cap": 16384,
-    "pprof_enabled": false
+    "password": "your-password"
   },
   "log": {
-      "level": "info",
-      "file_path": "easyss.log"
-  },
-  "transport": {
-      "protocol": "h2"
-  },
-  "next_proxy": {
-      "url": "",
-      "next_proxy_file": "",
-      "enable_udp": false,
-      "all_host": false
+    "level": "info",
+    "file_path": "easyss.log"
   },
   "timeout": 30
 }
+```
+
+> **注意**：`server.domain` 需要填**你自己的真实域名**（如 `example.com`），且该域名已解析到本服务器 IP。除非你配置了自定义证书（`cert_path` + `key_path` 都填写），否则此项**必填**——留空会导致启动时自动获取 Let's Encrypt 证书失败。
+
+以上为最简配置，其他所有可配置字段（fallback、shaper、transport、next_proxy、pprof 等）均有默认值，按需配置即可。执行以下命令可查看完整配置示例：
+
+```bash
+./easyss-server -show-config-example
 ```
 
 **参数说明：**
@@ -340,48 +339,55 @@ regexp:^.*\.youtube\..*$ # 正则表达式：匹配包含 .youtube. 的域名
 | 参数 | 必填 | 默认值 | 说明 |
 | --- | --- | --- | --- |
 | `server.listen` | 是 | - | 服务器监听地址，如 `:443` |
-| `server.domain` | 否 | - | 服务器域名（未使用自定义证书时必填，用于自动获取 Let's Encrypt 证书） |
+| `server.domain` | 条件必填 | - | 服务器域名。**默认必填**：需填写已解析到本服务器 IP 的真实域名，用于自动获取 Let's Encrypt 证书；仅当同时配置了 `cert_path` 和 `key_path`（自定义证书）时才可留空 |
 | `server.password` | 是 | - | 通信加密密钥 |
 | `server.allowed_methods` | 否 | aes-256-gcm, chacha20-poly1305 | 允许的加密方式列表 |
 | `server.cert_path` | 否 | - | 自定义证书文件路径（不为空则使用自定义证书） |
 | `server.key_path` | 否 | - | 自定义证书密钥文件路径 |
 | `server.email` | 否 | 随机生成 | 用于自动获取证书的邮箱地址 |
-| `server.fallback_target` | 否 | - | 回落目标，自动识别类型：<br>**空**: 使用内置主题页面<br>**URL** (`http://`或`https://`开头): 反向代理到上游 HTTP 服务<br>**目录**: 根据 URL path 匹配 HTML 文件（如 `/about` → `about.html`）<br>**文件**: 所有路径返回同一 HTML 页面 |
-| `server.fallback_preserve_host` | 否 | false | 仅对 `fallback_target` 为 URL 生效。<br>**false**: 转发给上游的 Host 头设为上游主机（默认，适合 GitHub 等会校验 Host 的公网站点）<br>**true**: 透传客户端原始 Host 给上游（适合本地 nginx 依赖 `server_name` 做虚拟主机路由的场景） |
-| `server.fallback_cdn_domains` | 否 | [] | 仅对 `fallback_target` 为 URL 生效。<br>配置需要通过代理中转的 CDN 域名列表（如 `["github.githubassets.com"]`）。HTML 和 CSP 中引用这些域名的绝对 URL 会被重写为 `/__cdn__/<host>/...` 路径前缀形式，浏览器请求时走代理转发到对应 CDN，避免直连 CDN 暴露真实 IP 或被 CSP 拦截 |
-| `server.batch_window_ms` | 否 | 3 | 流量整形批处理窗口，单位毫秒，范围 1-10 |
-| `server.cover_budget_ratio` | 否 | 0.03 | cover traffic 占真实流量的预算比例，设为 0 或负数使用默认值，范围 (0, 1] |
-| `server.cover_budget_cap` | 否 | 16384 | cover traffic 最大累积预算，单位字节，默认 16KB |
-| `server.pprof_enabled` | 否 | false | 是否启用 pprof 调试服务（127.0.0.1:6060） |
-| `transport.protocol` | 否 | h2 | 传输协议（目前仅支持 h2） |
+| `fallback.target` | 否 | - | 回落目标，自动识别类型：<br>**空**: 使用内置主题页面<br>**URL** (`http://`或`https://`开头): 反向代理到上游 HTTP 服务<br>**目录**: 根据 URL path 匹配 HTML 文件（如 `/about` → `about.html`）<br>**文件**: 所有路径返回同一 HTML 页面 |
+| `fallback.preserve_host` | 否 | false | 仅对 `fallback.target` 为 URL 生效。<br>**false**: 转发给上游的 Host 头设为上游主机（默认，适合 GitHub 等会校验 Host 的公网站点）<br>**true**: 透传客户端原始 Host 给上游（适合本地 nginx 依赖 `server_name` 做虚拟主机路由的场景） |
+| `fallback.cdn_domains` | 否 | [] | 仅对 `fallback.target` 为 URL 生效。<br>配置需要通过代理中转的 CDN 域名列表（如 `["github.githubassets.com"]`）。HTML 和 CSP 中引用这些域名的绝对 URL 会被重写为 `/__cdn__/<host>/...` 路径前缀形式，浏览器请求时走代理转发到对应 CDN，避免直连 CDN 暴露真实 IP 或被 CSP 拦截 |
+| `shaper.batch_window_ms` | 否 | 3 | 流量整形批处理窗口，单位毫秒，范围 1-10 |
+| `shaper.cover_budget_ratio` | 否 | 0.03 | cover traffic 占真实流量的预算比例，设为 0 或负数使用默认值，范围 (0, 1] |
+| `shaper.cover_budget_cap` | 否 | 16384 | cover traffic 最大累积预算，单位字节，默认 16KB |
+| `transport.protocols` | 否 | h2 | 支持的传输协议列表，目前仅支持 `h2`，配置其他值启动时报错；未来可同时启用多个（如 h2 + h3） |
+| `transport.h2_max_frame_size` | 否 | 16777215 | 服务端 HTTP/2 最大帧大小（16MB-1），0 使用默认值 |
+| `transport.h2_recv_buf_conn` | 否 | 4194304 | 服务端连接级上行窗口（4MB），0 使用默认值 |
+| `transport.h2_recv_buf_stream` | 否 | 1048576 | 服务端流级上行窗口（1MB），0 使用默认值 |
+| `pprof_enabled` | 否 | false | 是否启用 pprof 调试服务（127.0.0.1:6060） |
 | `timeout` | 否 | 30 | 超时时间，单位秒 |
 
-> **fallback_target 使用示例**：
+> **fallback 使用示例**：
 >
 > ```json
 > // 1. 空值 → 内置主题页面（默认）
-> "fallback_target": ""
+> "fallback": { "target": "" }
 >
 > // 2. 反向代理到本地 nginx（透传原始 Host，匹配 server_name 路由）
-> "fallback_target": "http://127.0.0.1:8080",
-> "fallback_preserve_host": true
+> "fallback": {
+>   "target": "http://127.0.0.1:8080",
+>   "preserve_host": true
+> }
 >
 > // 3. 反向代理到公网站点（如 GitHub）
 > //    自动重写 Host 头避免 301，并重写 HTML 中的绝对 URL，
 > //    修复 release assets 等动态加载的 CSP 问题
 > //    配置 CDN 域名让静态资源也走代理
-> "fallback_target": "https://github.com",
-> "fallback_cdn_domains": ["githubassets.com", "githubusercontent.com"]
-> // fallback_preserve_host 默认 false 即可
+> "fallback": {
+>   "target": "https://github.com",
+>   "cdn_domains": ["githubassets.com", "githubusercontent.com"]
+> }
+> // preserve_host 默认 false 即可
 >
 > // 4. 单文件 → 所有路径返回同一页面
-> "fallback_target": "/var/www/fallback.html"
+> "fallback": { "target": "/var/www/fallback.html" }
 >
 > // 5. 目录 → 按 URL path 匹配 HTML 文件
-> "fallback_target": "/var/www/fallback/"
+> "fallback": { "target": "/var/www/fallback/" }
 > ```
 >
-> **URL 模式行为说明**：当 `fallback_target` 为 URL 时，反向代理会自动执行以下处理，无需额外配置：
+> **URL 模式行为说明**：当 `fallback.target` 为 URL 时，反向代理会自动执行以下处理，无需额外配置：
 >
 > * 设置上游 Host 头（避免 GitHub 等站点返回 301 到规范主机）
 > * 重写 3xx `Location` 响应头中指向上游的绝对 URL 为客户端面向地址
@@ -389,7 +395,7 @@ regexp:^.*\.youtube\..*$ # 正则表达式：匹配包含 .youtube. 的域名
 > * 重写 `Set-Cookie` 的 `Domain` 属性，使浏览器接受 cookie（修复 CSRF 422）
 > * 重写请求 `Origin`/`Referer` 头为上游地址（修复 CSRF 422）
 > * 对上游请求 `Accept-Encoding` 与客户端取交集，gzip 响应自动解压后重写、再按客户端能力重新压缩
-> * 配置了 `fallback_cdn_domains` 时，HTML/CSP 中引用这些 CDN 域名的 URL 被重写为 `/__cdn__/<host>/...`，浏览器请求经代理转发到对应 CDN
+> * 配置了 `fallback.cdn_domains` 时，HTML/CSP 中引用这些 CDN 域名的 URL 被重写为 `/__cdn__/<host>/...`，浏览器请求经代理转发到对应 CDN
 >
 > **目录模式**：目录结构如下（优先级: 反向代理 > 目录 > 单文件 > 内置主题）：
 >
@@ -428,6 +434,36 @@ docker run -d --name easyss --network host nange/docker-easyss:latest -p yourpor
 可根据自己的需求，使用`openssl`等工具生成自定义证书。也可以参考： `./scripts/self_signed_certs` 目录示例，使用`cfssl`生成自定义证书。
 示例就是使用IP而不是域名生成自定义证书，这样就可以无域名使用Easyss了。
 
+### 自更新
+
+客户端（含 headless 无托盘版）与服务端均支持 `selfupdate` 子命令：从 GitHub 检查最新 release，并**原地替换当前二进制**。替换完成后不会自动重启，需要手动（或由 systemd/supervisor 等）重启进程使新版本生效。
+
+托盘版客户端（`easyss`）启动约 1 分钟后会自动检查一次更新，此后**每约 24 小时（带随机抖动）再检查一次**，只要进程在运行就会持续检查（macOS 上用户常常长时间不退出程序，仅靠启动时检查会错过后续发布的版本）。若检测到新版本，会**同时通过以下方式提醒一次**（每次启动都会重新提醒，直至升级完成）：
+
+* **托盘图标徽标**：图标右上角出现常驻绿色圆点，鼠标悬停显示「发现新版本 X，点击托盘菜单更新」。该通道不依赖系统通知开关，即使关闭系统通知或开启专注助手也依然可见；升级成功后徽标自动消失。
+* **托盘菜单项**：显示「发现新版本 X，点击更新」并常驻（不再自动消失），点击即开始下载安装。
+* **系统通知**：弹一次气泡/通知（尽力而为；若系统禁用了通知可能不显示，此时徽标与菜单项仍然可见）。
+
+已发现新版本但用户未升级时，徽标、菜单项与悬停提示会常驻；周期检查只会把它们刷新为**最新**发现的版本，同一个版本不会每 24 小时重复弹一次系统通知（若期间又发布了更新的版本，则会针对新版本再次提醒）。
+
+手动点击托盘菜单的「检查更新」时，结果**除了菜单项外还会弹一次系统通知**（「已是最新版本(X)」或「检查更新失败：…」），因为菜单项的提示文字会在 4 秒后自动复位，不弹通知的话用户需重新打开菜单才能确认结果。
+
+```sh
+# 仅检查是否有新版本
+./easyss selfupdate --check
+./easyss-server selfupdate --check
+
+# 下载并替换二进制（不重启）
+./easyss selfupdate
+./easyss-headless selfupdate
+./easyss-server selfupdate
+```
+
+* `--proxy-port <port>`：若本机同时运行了 easyss 客户端，可指定其 HTTP 代理端口，更新请求优先走本地代理，失败自动回退直连（默认直连）。
+* 运行 `<bin> --help`（或 `<bin> selfupdate --help`）可查看各命令的完整参数说明。
+* Windows 下替换时原二进制会保留为 `.old`，下次正常启动时自动清理；Linux/macOS 直接原子替换。
+* Windows 托盘版（`easyss.exe`）因编译时隐藏控制台窗口，CLI 输出不可见，可通过重定向或退出码判断结果；服务端 Windows 版不受影响。
+
 ## 高级用法
 
 ### 服务器部署在反向代理(或CDN)之后
@@ -447,11 +483,36 @@ Easyss v3 基于 HTTP/2 作为传输层协议，天然兼容反向代理和 CDN 
 
 ### 作为透明代理将Easyss部署在路由器或者软路由上
 
-直接将Easyss部署在路由器或这软路由上，可实现家里或公司网络自动透明代理，无需在终端设备上安装Easyss客户端。
+直接将Easyss部署在路由器或者软路由上，可实现家里或公司网络自动透明代理，无需在终端设备上安装Easyss客户端。
 
 在简化模式中设置 `enable_tun2socks: true` 和 `enable_forward_dns: true`。
 在完整模式中设置 `local.enable_tun2socks: true` 和 `local.enable_forward_dns: true`。
 也可通过命令行 `-enable-tun2socks=true` 开启全局代理。
+
+两个开关各自负责一件事，缺一不可：
+
+* `enable_tun2socks`：在本机建立全局透明代理（TUN 网卡 + 路由表），让**经过这台主机的流量**
+  按域名/GeoIP 分流后走代理。
+* `enable_forward_dns`：在本机**所有网卡的 53 端口**上提供 DNS 转发服务（UDP，双栈——
+  同时接受 IPv4 与 IPv6 查询），供 **LAN 设备**当解析器使用。它只做转发，不做屏蔽/缓存
+  策略；LAN 设备的解析结果由它代查后返回。
+
+因此还需要在路由器上完成两件事：
+
+1. **把 LAN 侧（DHCP 下发）的 DNS 指向这台路由器的 LAN IP**，例如 `192.168.1.1`。
+   只把 DNS 指过来而网关不指向它时，设备能正常解析域名，但**连接不会经过这台主机，
+   也就不会被代理**——透明代理的前提始终是流量本身经过它（网关指向它，或自行配置
+   NAT/透明重定向规则）。
+2. 放行 UDP 53（监听的 53 端口对所有网卡开放，**不要在公网侧放行**，否则就是一个开放解析器）。
+
+若 53 端口已被占用，Easyss 会启动失败并提示端口冲突，常见占用者是 `dnsmasq` 与
+`systemd-resolved`，需要先停用它们的 DNS 监听（例如 dnsmasq 设 `port=0` 只保留 DHCP）
+再启动 Easyss。
+
+已知限制：该转发服务只监听 UDP 53。LAN 客户端若收到截断应答（`TC` 置位，例如 DNSSEC
+或记录很多的域名）而改用 TCP 53 重试，这部分查询不会被应答——这是为了保持实现简单而
+有意留下的取舍；受影响的环境请让 LAN 客户端直连上游解析器，或另行用 dnsmasq 之类的
+工具承接 TCP 查询并转发到本服务。
 
 根据情况判断是否需要开启ip转发:
 

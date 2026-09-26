@@ -20,8 +20,8 @@ func TestNew(t *testing.T) {
 		if np == nil {
 			t.Fatal("expected non-nil NextProxy")
 		}
-		if u := np.URL(); u == nil || u.Host != "proxy.example.com:1080" {
-			t.Errorf("URL host = %v", u)
+		if got := np.Host(); got != "proxy.example.com:1080" {
+			t.Errorf("Host = %q", got)
 		}
 		if !np.EnableUDP() {
 			t.Error("EnableUDP should be true")
@@ -172,11 +172,11 @@ func TestShouldProxy(t *testing.T) {
 	})
 }
 
-func TestURL(t *testing.T) {
+func TestHost(t *testing.T) {
 	t.Run("nil receiver", func(t *testing.T) {
 		var np *NextProxy
-		if u := np.URL(); u != nil {
-			t.Errorf("expected nil, got %v", u)
+		if got := np.Host(); got != "" {
+			t.Errorf("expected empty, got %q", got)
 		}
 	})
 
@@ -185,9 +185,8 @@ func TestURL(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		u := np.URL()
-		if u == nil || u.Host != "proxy.example.com:1080" {
-			t.Errorf("URL = %v", u)
+		if got := np.Host(); got != "proxy.example.com:1080" {
+			t.Errorf("Host = %q", got)
 		}
 	})
 }
@@ -326,7 +325,7 @@ func TestIsCustomDomain(t *testing.T) {
 func TestAddIP(t *testing.T) {
 	t.Run("nil receiver", func(t *testing.T) {
 		var np *NextProxy
-		np.AddIP("1.2.3.4") // should not panic
+		np.AddIP("1.2.3.4") // 不应 panic
 	})
 
 	t.Run("添加 IP", func(t *testing.T) {
@@ -362,7 +361,7 @@ func TestAddIP(t *testing.T) {
 func TestAddDomain(t *testing.T) {
 	t.Run("nil receiver", func(t *testing.T) {
 		var np *NextProxy
-		np.AddDomain("example.com") // should not panic
+		np.AddDomain("example.com") // 不应 panic
 	})
 
 	t.Run("添加域名", func(t *testing.T) {
@@ -371,7 +370,7 @@ func TestAddDomain(t *testing.T) {
 		if !np.ShouldProxy("cdn.example.com") {
 			t.Error("should proxy after AddDomain")
 		}
-		// subdomain match should also work
+		// 子域名匹配也应生效
 		if !np.ShouldProxy("www.cdn.example.com") {
 			t.Error("subdomain should also proxy after AddDomain")
 		}
@@ -420,14 +419,14 @@ func TestConcurrentAddIP(t *testing.T) {
 	np := &NextProxy{ips: make(map[string]struct{})}
 	done := make(chan struct{})
 	go func() {
-		for i := 0; i < 100; i++ {
+		for range 100 {
 			np.AddIP("10.0.0.1")
 			np.ShouldProxy("10.0.0.1")
 		}
 		done <- struct{}{}
 	}()
 	go func() {
-		for i := 0; i < 100; i++ {
+		for range 100 {
 			np.AddIP("10.0.0.2")
 			np.ShouldProxy("10.0.0.2")
 		}

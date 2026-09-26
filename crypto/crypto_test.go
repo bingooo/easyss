@@ -73,14 +73,14 @@ func TestCounterNonce(t *testing.T) {
 	require.Equal(t, prefix[1], n1[1])
 
 	var val1 uint64
-	for i := 0; i < 8; i++ {
+	for i := range 8 {
 		val1 = (val1 << 8) | uint64(n1[4+i])
 	}
 	require.Equal(t, uint64(0), val1)
 
 	n2 := cn.Next()
 	var val2 uint64
-	for i := 0; i < 8; i++ {
+	for i := range 8 {
 		val2 = (val2 << 8) | uint64(n2[4+i])
 	}
 	require.Equal(t, uint64(1), val2)
@@ -169,10 +169,10 @@ func TestStreamKeysAndRecords(t *testing.T) {
 	require.NoError(t, err)
 
 	plaintext := []byte("test record data")
-	enc, counter, err := sk.Encryptor("c2s", "bootstrap", protocol.MethodAES256GCM)
+	enc, counter, err := sk.newEncryptor(bootstrapPhase, DirC2S, protocol.MethodAES256GCM)
 	require.NoError(t, err)
 
-	aad := BuildAAD(endpoint, salt, "c2s", "bootstrap", protocol.MethodAES256GCM)
+	aad := buildAAD(endpoint, salt, "c2s", "bootstrap", protocol.MethodAES256GCM)
 	require.NotNil(t, aad)
 
 	var buf bytes.Buffer
@@ -181,7 +181,7 @@ func TestStreamKeysAndRecords(t *testing.T) {
 	require.NoError(t, err)
 	require.Greater(t, buf.Len(), 0)
 
-	readerEnc, readerCounter, err := sk.Encryptor("c2s", "bootstrap", protocol.MethodAES256GCM)
+	readerEnc, readerCounter, err := sk.newEncryptor(bootstrapPhase, DirC2S, protocol.MethodAES256GCM)
 	require.NoError(t, err)
 	_ = readerEnc
 	_ = readerCounter
@@ -189,7 +189,7 @@ func TestStreamKeysAndRecords(t *testing.T) {
 
 func TestBuildAAD(t *testing.T) {
 	salt := []byte("1234567890123456")
-	aad := BuildAAD("/v3/tcp", salt, "c2s", "bootstrap", protocol.MethodAES256GCM)
+	aad := buildAAD("/v3/tcp", salt, "c2s", "bootstrap", protocol.MethodAES256GCM)
 	require.NotNil(t, aad)
 	require.Contains(t, string(aad), "easyss-v3/v3/tcp")
 }

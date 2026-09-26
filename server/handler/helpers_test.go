@@ -1,12 +1,29 @@
 package handler
 
 import (
+	"context"
+	"net"
+	"net/netip"
 	"testing"
 	"time"
 
 	sharedconfig "github.com/nange/easyss/v3/config"
 	"github.com/nange/easyss/v3/protocol"
+	"github.com/nange/easyss/v3/shaper"
 )
+
+// newTestFallback 返回一个隔离的 fallback 实例：每个测试用自己的实例与缓存，
+// 因此不再需要重置任何包级状态。身份用固定种子派生，使同一测试内的多次渲染
+// 可复现。
+func newTestFallback(t *testing.T) *Fallback {
+	t.Helper()
+	fb, err := NewFallback(FallbackConfig{},
+		WithSeed([]byte("handler-test-seed")), WithTheme(""))
+	if err != nil {
+		t.Fatalf("NewFallback: %v", err)
+	}
+	return fb
+}
 
 func TestIsIPv6Target(t *testing.T) {
 	tests := []struct {
@@ -36,14 +53,78 @@ func TestIsIPv6Target(t *testing.T) {
 	}
 }
 
+// TestClientPreferredFamily 固定"客户端到服务端的地址族"推导：只有能确定
+// 客户端用哪个族接入时才会有偏好，IPv4-mapped 形式折叠为 IPv4
+// （v4 客户端经双栈监听接入时 Go 报告的就是这种形式）。
+func TestClientPreferredFamily(t *testing.T) {
+	tests := []struct {
+		name       string
+		remoteAddr string
+		want       string
+	}{
+		{"ipv4", "1.2.3.4:5678", "1.2.3.4"},
+		{"ipv6", "[2606:50c0:8002::154]:443", "2606:50c0:8002::154"},
+		{"ipv4-mapped folds to ipv4", "[::ffff:1.2.3.4]:443", "1.2.3.4"},
+		{"loopback ipv4", "127.0.0.1:1234", "127.0.0.1"},
+		{"no port", "1.2.3.4", ""},
+		{"garbage", "not-an-address", ""},
+		{"empty", "", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := clientPreferredFamily(tt.remoteAddr)
+			if tt.want == "" {
+				if got.IsValid() {
+					t.Fatalf("clientPreferredFamily(%q) = %v, want the zero value", tt.remoteAddr, got)
+				}
+				return
+			}
+			if got.String() != tt.want {
+				t.Fatalf("clientPreferredFamily(%q) = %v, want %v", tt.remoteAddr, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestPreferredFamilyContext 覆盖两处 context 载体的往返：零值/空切片不写入，
+// 没有提示的 context 读出「无偏好 + 无已校验地址」，拨号因此退化为自行解析并按
+// 系统默认顺序拨号。
+func TestPreferredFamilyContext(t *testing.T) {
+	if _, ok := preferredFamily(t.Context()); ok {
+		t.Fatal("a bare context should report no preference")
+	}
+	if _, ok := resolvedAddrs(t.Context()); ok {
+		t.Fatal("a bare context should report no resolved addresses")
+	}
+
+	want := netip.MustParseAddr("93.184.216.34")
+	ctx := withPreferredFamily(t.Context(), want)
+	got, ok := preferredFamily(ctx)
+	if !ok || got != want {
+		t.Fatalf("preferredFamily = (%v, %v), want (%v, true)", got, ok, want)
+	}
+
+	if got := withPreferredFamily(t.Context(), netip.Addr{}); got.Value(ctxPreferredFamily) != nil {
+		t.Fatal("an invalid address must not be stored as a preference")
+	}
+
+	ctx = withResolvedAddrs(ctx, []netip.Addr{want})
+	addrs, ok := resolvedAddrs(ctx)
+	if !ok || len(addrs) != 1 || addrs[0] != want {
+		t.Fatalf("resolvedAddrs = (%v, %v), want ([%v], true)", addrs, ok, want)
+	}
+	if got := withResolvedAddrs(t.Context(), nil); got.Value(ctxResolvedAddrs) != nil {
+		t.Fatal("an empty address list must not be stored")
+	}
+}
+
 func TestNewProxyHandler(t *testing.T) {
 	t.Run("空 allowedMethods 使用默认", func(t *testing.T) {
 		cfg := ProxyHandlerConfig{
-			MasterKey:         []byte("test-key-32-bytes-long!!!!!!!"),
-			AllowedMethods:    nil,
-			HandshakeTimeout:  5 * time.Second,
-			StreamIdleTimeout: 300 * time.Second,
-			UDPIdleTimeout:    30 * time.Second,
+			MasterKey:      []byte("test-key-32-bytes-long!!!!!!!"),
+			AllowedMethods: nil,
+			Timeouts:       sharedconfig.NewTimeouts(5 * time.Second),
 		}
 		h := NewProxyHandler(cfg)
 		if h == nil {
@@ -62,11 +143,9 @@ func TestNewProxyHandler(t *testing.T) {
 
 	t.Run("指定 allowedMethods", func(t *testing.T) {
 		cfg := ProxyHandlerConfig{
-			MasterKey:         []byte("test-key-32-bytes-long!!!!!!!"),
-			AllowedMethods:    []string{"aes-256-gcm"},
-			HandshakeTimeout:  5 * time.Second,
-			StreamIdleTimeout: 300 * time.Second,
-			UDPIdleTimeout:    30 * time.Second,
+			MasterKey:      []byte("test-key-32-bytes-long!!!!!!!"),
+			AllowedMethods: []string{"aes-256-gcm"},
+			Timeouts:       sharedconfig.NewTimeouts(5 * time.Second),
 		}
 		h := NewProxyHandler(cfg)
 		if len(h.allowedMethods) != 1 {
@@ -82,11 +161,9 @@ func TestNewProxyHandler(t *testing.T) {
 
 	t.Run("无效 method 名称被忽略", func(t *testing.T) {
 		cfg := ProxyHandlerConfig{
-			MasterKey:         []byte("test-key-32-bytes-long!!!!!!!"),
-			AllowedMethods:    []string{"invalid-method", "aes-256-gcm"},
-			HandshakeTimeout:  5 * time.Second,
-			StreamIdleTimeout: 300 * time.Second,
-			UDPIdleTimeout:    30 * time.Second,
+			MasterKey:      []byte("test-key-32-bytes-long!!!!!!!"),
+			AllowedMethods: []string{"invalid-method", "aes-256-gcm"},
+			Timeouts:       sharedconfig.NewTimeouts(5 * time.Second),
 		}
 		h := NewProxyHandler(cfg)
 		if len(h.allowedMethods) != 1 {
@@ -96,109 +173,131 @@ func TestNewProxyHandler(t *testing.T) {
 
 	t.Run("BatchWindowMS 默认值", func(t *testing.T) {
 		cfg := ProxyHandlerConfig{
-			MasterKey:         []byte("test-key-32-bytes-long!!!!!!!"),
-			HandshakeTimeout:  5 * time.Second,
-			StreamIdleTimeout: 300 * time.Second,
-			UDPIdleTimeout:    30 * time.Second,
+			MasterKey: []byte("test-key-32-bytes-long!!!!!!!"),
+			Timeouts:  sharedconfig.NewTimeouts(5 * time.Second),
 		}
 		h := NewProxyHandler(cfg)
-		if h.batchWindowMS != sharedconfig.DefaultBatchWindowMS {
-			t.Errorf("batchWindowMS = %d, want %d", h.batchWindowMS, sharedconfig.DefaultBatchWindowMS)
+		if h.shaperCfg.BatchWindowMS != sharedconfig.DefaultBatchWindowMS {
+			t.Errorf("BatchWindowMS = %d, want %d", h.shaperCfg.BatchWindowMS, sharedconfig.DefaultBatchWindowMS)
+		}
+		if h.shaperCfg.Cover.BudgetRatio != sharedconfig.DefaultCoverBudgetRatio {
+			t.Errorf("CoverBudgetRatio = %v, want %v", h.shaperCfg.Cover.BudgetRatio, sharedconfig.DefaultCoverBudgetRatio)
+		}
+		if h.shaperCfg.Cover.BudgetCap != sharedconfig.DefaultCoverBudgetCap {
+			t.Errorf("CoverBudgetCap = %d, want %d", h.shaperCfg.Cover.BudgetCap, sharedconfig.DefaultCoverBudgetCap)
 		}
 	})
 
 	t.Run("BatchWindowMS 上限 10", func(t *testing.T) {
 		cfg := ProxyHandlerConfig{
-			MasterKey:         []byte("test-key-32-bytes-long!!!!!!!"),
-			BatchWindowMS:     100,
-			HandshakeTimeout:  5 * time.Second,
-			StreamIdleTimeout: 300 * time.Second,
-			UDPIdleTimeout:    30 * time.Second,
+			MasterKey: []byte("test-key-32-bytes-long!!!!!!!"),
+			Shaper:    shaper.Config{BatchWindowMS: 100},
+			Timeouts:  sharedconfig.NewTimeouts(5 * time.Second),
 		}
 		h := NewProxyHandler(cfg)
-		if h.batchWindowMS != 10 {
-			t.Errorf("batchWindowMS = %d, want 10 (capped)", h.batchWindowMS)
+		if h.shaperCfg.BatchWindowMS != 10 {
+			t.Errorf("BatchWindowMS = %d, want 10 (capped)", h.shaperCfg.BatchWindowMS)
 		}
 	})
 
 	t.Run("子 handler 非 nil", func(t *testing.T) {
 		cfg := ProxyHandlerConfig{
-			MasterKey:         []byte("test-key-32-bytes-long!!!!!!!"),
-			HandshakeTimeout:  5 * time.Second,
-			StreamIdleTimeout: 300 * time.Second,
-			UDPIdleTimeout:    30 * time.Second,
+			MasterKey: []byte("test-key-32-bytes-long!!!!!!!"),
+			Timeouts:  sharedconfig.NewTimeouts(5 * time.Second),
 		}
 		h := NewProxyHandler(cfg)
-		if h.tcpHandler == nil {
-			t.Error("tcpHandler should not be nil")
+		if h.tcp == nil {
+			t.Error("tcp handler should not be nil")
 		}
-		if h.udpHandler == nil {
-			t.Error("udpHandler should not be nil")
+		if h.udp == nil {
+			t.Error("udp handler should not be nil")
 		}
-		if h.icmpHandler == nil {
-			t.Error("icmpHandler should not be nil")
+		if h.icmp == nil {
+			t.Error("icmp handler should not be nil")
 		}
 	})
 }
 
-func TestDialTimeout(t *testing.T) {
-	tests := []struct {
-		name    string
-		timeout time.Duration
-		want    time.Duration
-	}{
-		{"默认值 30s", 30 * time.Second, 10 * time.Second},
-		{"最小值保底：0s", 0, 3 * time.Second},
-		{"最小值保底：9s", 9 * time.Second, 3 * time.Second},
-		{"正常值：15s", 15 * time.Second, 5 * time.Second},
-		{"正常值：45s", 45 * time.Second, 15 * time.Second},
-		{"最大值封顶：60s", 60 * time.Second, 15 * time.Second},
-		{"最大值封顶：120s", 120 * time.Second, 15 * time.Second},
+// TestOutboundDialer 固定直连拨号器的参数：Timeout 必须显式设置，否则
+// dialOutbound（它自己不设截止时间）会在 SYN 黑洞上一直挂着；KeepAlive 保留
+// 完整的基础超时，使长连接流由内核回收而不是半开地悬留。
+func TestOutboundDialer(t *testing.T) {
+	d := outboundDialer(10*time.Second, 30*time.Second)
+	if d.Timeout != 10*time.Second {
+		t.Errorf("Timeout = %v, want 10s", d.Timeout)
 	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := DialTimeout(tt.timeout)
-			if got != tt.want {
-				t.Errorf("DialTimeout(%v) = %v, want %v", tt.timeout, got, tt.want)
-			}
-		})
-	}
-}
-
-func TestNewTCPHandler_DialTimeout(t *testing.T) {
-	h := NewTCPHandler(120*time.Second, 30*time.Second, nil)
-	if h == nil {
-		t.Fatal("NewTCPHandler returned nil")
-	}
-	if h.dialTimeout != 10*time.Second {
-		t.Errorf("dialTimeout = %v, want 10s", h.dialTimeout)
-	}
-	if h.dialer.Timeout != 10*time.Second {
-		t.Errorf("dialer.Timeout = %v, want 10s", h.dialer.Timeout)
-	}
-	if h.dialer.KeepAlive != 30*time.Second {
-		t.Errorf("dialer.KeepAlive = %v, want 30s", h.dialer.KeepAlive)
+	if d.KeepAlive != 30*time.Second {
+		t.Errorf("KeepAlive = %v, want the base timeout 30s", d.KeepAlive)
 	}
 }
 
 func TestNewTCPHandler(t *testing.T) {
-	h := NewTCPHandler(120*time.Second, 30*time.Second, nil)
+	h := newTCPHandler(120*time.Second, 30*time.Second, nil)
 	if h == nil {
-		t.Fatal("NewTCPHandler returned nil")
+		t.Fatal("newTCPHandler returned nil")
 	}
+	if h.idleTimeout != 120*time.Second {
+		t.Errorf("idleTimeout = %v, want 120s", h.idleTimeout)
+	}
+}
+
+// TestTCPHandlerDialTarget 覆盖 TCP handler 共享的拨号部分：直连拨号把网络名
+// 与目标原样下传（地址族由 dialOutbound 决定），拨号后的 SSRF 防护会拒绝 LAN
+// 远端地址。拨号超时和 keepalive 都无法从已建立的连接上观测到，因此它们由
+// TestOutboundDialer 覆盖。
+func TestTCPHandlerDialTarget(t *testing.T) {
+	t.Run("网络名与目标原样下传", func(t *testing.T) {
+		h := newTCPHandler(120*time.Second, 30*time.Second, nil)
+		var gotNetwork, gotTarget string
+		h.dialContext = func(_ context.Context, network, target string) (net.Conn, error) {
+			gotNetwork, gotTarget = network, target
+			return newStubConn(&net.TCPAddr{IP: net.ParseIP("8.8.8.8"), Port: 53}), nil
+		}
+
+		if _, _, err := h.dial.dialTarget(t.Context(), "tcp", "8.8.8.8:53"); err != nil {
+			t.Fatalf("dialTarget: %v", err)
+		}
+		if gotNetwork != "tcp" || gotTarget != "8.8.8.8:53" {
+			t.Errorf("dialed %q %q, want \"tcp\" \"8.8.8.8:53\"", gotNetwork, gotTarget)
+		}
+	})
+
+	t.Run("拨号后拒绝 LAN 目标", func(t *testing.T) {
+		h := newTCPHandler(120*time.Second, 30*time.Second, nil)
+		stub := newStubConn(&net.TCPAddr{IP: net.ParseIP("192.168.7.7"), Port: 80})
+		h.dialContext = func(context.Context, string, string) (net.Conn, error) { return stub, nil }
+
+		if _, _, err := h.dial.dialTarget(t.Context(), "tcp", "192.168.7.7:80"); err == nil {
+			t.Fatal("dialTarget accepted a LAN remote address")
+		}
+		if !stub.isClosed() {
+			t.Error("rejected connection was not closed")
+		}
+	})
 }
 
 func TestNewUDPHandler(t *testing.T) {
-	h := NewUDPHandler(30*time.Second, nil)
+	h := newUDPHandler(30*time.Second, 30*time.Second, nil)
 	if h == nil {
-		t.Fatal("NewUDPHandler returned nil")
+		t.Fatal("newUDPHandler returned nil")
+	}
+	if h.idleTimeout != 30*time.Second {
+		t.Errorf("idleTimeout = %v, want 30s", h.idleTimeout)
+	}
+	if h.nextProxy != nil {
+		t.Error("nextProxy should stay nil when none is configured")
 	}
 }
 
+// TestNewICMPHandler 只检查构造：所有 ICMP 拨号失败路径都走共享的 dialer
+// （由 TestTCPHandlerDialTarget 覆盖），而真正进行 ICMP 交换需要原始套接字权限。
+// 拨号超时通过 config.DialTimeout 派生，由 config.TestDialTimeout 固定。
 func TestNewICMPHandler(t *testing.T) {
-	h := NewICMPHandler()
+	h := newICMPHandler(30 * time.Second)
 	if h == nil {
-		t.Fatal("NewICMPHandler returned nil")
+		t.Fatal("newICMPHandler returned nil")
+	}
+	if h.dial.nextProxy != nil || h.dial.shouldProxy != nil {
+		t.Error("ICMP must not route through a next proxy")
 	}
 }

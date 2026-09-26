@@ -1,0 +1,58 @@
+[
+  {
+    "Name": "Ocean Blue",
+    "Mode": "light",
+    "CSS": "body{font-family:{{font_body}};margin:0;padding:0;background:{{bg}};color:{{text}};line-height:{{line_height}}}\nheader{background:{{header_bg}};color:{{header_fg}};padding:32px 20px;text-align:center}\nheader h1{font-size:{{heading_size}}rem;margin:0 0 8px 0;font-weight:700}\nheader p{font-size:1rem;margin:0}\nheader p span{opacity:{{tagline_opacity}}}\nnav{background:{{nav_bg}};padding:12px 20px;text-align:center}\nnav a{color:{{nav_fg}};text-decoration:none;margin:0 18px;font-size:.95rem;font-weight:500;transition:color .2s}\nnav a:hover{color:{{nav_fg_hover}}}\nmain{max-width:{{max_width}}px;margin:40px auto;padding:32px;background:{{surface}};border-radius:{{radius}}px;box-shadow:0 2px 8px {{shadow}}}\nmain h2{font-size:1.5rem;margin-top:0;color:{{heading_color}}}\nmain a{color:{{accent_text}}}\nmain p{margin:16px 0;font-size:1rem}\nfooter{text-align:center;padding:24px;color:{{text_muted}};font-size:.85rem;border-top:1px solid {{border}}}\nfooter a{color:{{accent_text}}}",
+    "SiteName": "Acme Solutions",
+    "Tagline": "Innovation delivered with integrity",
+    "NavHome": "Home",
+    "NavAbout": "About",
+    "NavServices": "Services",
+    "NavContact": "Contact"
+  },
+  {
+    "Name": "Forest Green",
+    "Mode": "light",
+    "CSS": "body{font-family:{{font_body}};margin:0;padding:0;background:{{bg}};color:{{text}};line-height:{{line_height}}}\nheader{background:{{header_bg}};color:{{header_fg}};padding:36px 24px;text-align:center}\nheader h1{font-size:{{heading_size}}rem;margin:0 0 6px 0;letter-spacing:-0.5px}\nheader p{font-size:1.05rem;margin:0;font-style:italic}\nheader p span{opacity:{{tagline_opacity}}}\nnav{background:{{nav_bg}};padding:14px 20px;text-align:center;border-bottom:3px solid {{accent}}}\nnav a{color:{{nav_fg}};text-decoration:none;margin:0 20px;font-size:.95rem;text-transform:uppercase;letter-spacing:.5px}\nnav a:hover{text-decoration:underline;color:{{accent_text}}}\nmain{max-width:{{max_width}}px;margin:36px auto;padding:28px 32px;background:{{surface}};border-radius:{{radius}}px;border-left:6px solid {{accent}};box-shadow:0 1px 4px {{shadow}}}\nmain h2{font-size:1.5rem;margin-top:0;color:{{heading_color}}}\nmain a{color:{{accent_text}}}\nmain p{margin:14px 0;font-size:.98rem}\nfooter{text-align:center;padding:20px;color:{{text_muted}};font-size:.8rem;border-top:1px solid {{border}}}\nfooter a{color:{{accent_text}}}",
+    "SiteName": "Greenfield Partners",
+    "Tagline": "Rooted in values, growing together",
+    "NavHome": "Home",
+    "NavAbout": "About Us",
+    "NavServices": "Solutions",
+    "NavContact": "Get in Touch"
+  },
+  {
+    "Name": "Dark Modern",
+    "Mode": "dark",
+    "CSS": "body{font-family:{{font_body}};margin:0;padding:0;background:{{bg}};color:{{text}};line-height:{{line_height}}}\nheader{background:{{header_bg}};padding:28px 24px;border-bottom:1px solid {{border}};text-align:center}\nheader h1{font-size:{{heading_size}}rem;margin:0;color:{{heading_color}};font-weight:600}\nheader p{font-size:.9rem;margin:6px 0 0 0;color:{{text_muted}}}\nheader p span{opacity:{{tagline_opacity}}}\nnav{background:{{nav_bg}};padding:10px 20px;text-align:center;border-bottom:1px solid {{border}}}\nnav a{color:{{nav_fg}};text-decoration:none;margin:0 16px;font-size:.88rem}\nnav a:hover{color:{{nav_fg_hover}}}\nmain{max-width:{{max_width}}px;margin:36px auto;padding:28px;background:{{surface}};border:1px solid {{border}};border-radius:{{radius}}px}\nmain h2{font-size:1.4rem;margin-top:0;color:{{heading_color}}}\nmain a{color:{{accent_text}}}\nmain p{margin:14px 0;font-size:.92rem;color:{{text_muted}}}\nfooter{text-align:center;padding:20px;color:{{text_muted}};font-size:.78rem;border-top:1px solid {{border}}}\nfooter a{color:{{accent_text}}}",
+    "SiteName": "NexusCode",
+    "Tagline": "Engineering the future, one line at a time",
+    "NavHome": "Home",
+    "NavAbout": "About",
+    "NavServices": "Platform",
+    "NavContact": "Contact"
+  },
+  {
+    "Name": "Sunset Amber",
+    "Mode": "light",
+    "CSS": "body{font-family:{{font_body}};margin:0;padding:0;background:{{bg}};color:{{text}};line-height:{{line_height}}}\nheader{background:{{accent}};color:{{header_fg}};padding:38px 20px 28px;text-align:center;border-bottom:4px solid {{accent_dark}}}\nheader h1{color:{{header_fg}};font-size:{{heading_size}}rem;margin:0;font-weight:400;text-shadow:1px 1px 2px {{shadow}}}\nheader p{font-size:1rem;margin:8px 0 0;font-style:italic}\nheader p span{opacity:{{tagline_opacity}}}\nnav{background:{{nav_bg}};padding:16px 20px;text-align:center}\nnav a{color:{{nav_fg}};text-decoration:none;margin:0 22px;font-size:.95rem;font-variant:small-caps}\nnav a:hover{color:{{nav_fg_hover}};border-bottom:2px solid {{accent_dark}}}\nmain{max-width:{{max_width}}px;margin:42px auto;padding:30px 36px;background:{{surface}};border:1px solid {{border}};box-shadow:0 2px 6px {{shadow}}}\nmain h2{font-size:1.6rem;margin-top:0;color:{{heading_color}};font-weight:400}\nmain a{color:{{accent_text}}}\nmain p{margin:16px 0;font-size:1rem}\nfooter{text-align:center;padding:22px;color:{{text_muted}};font-size:.82rem;font-style:italic}\nfooter a{color:{{accent_text}}}",
+    "SiteName": "Crestwood Advisory",
+    "Tagline": "Wisdom, trust, and the human touch",
+    "NavHome": "Home",
+    "NavAbout": "About",
+    "NavServices": "Expertise",
+    "NavContact": "Contact"
+  },
+  {
+    "Name": "Minimal Mono",
+    "Mode": "light",
+    "MinimalNav": true,
+    "CSS": "body{font-family:{{font_body}};margin:0;padding:0;background:{{bg}};color:{{text}};line-height:{{line_height}}}\nheader{background:transparent;padding:40px 20px 20px;text-align:center;border-bottom:1px solid {{border}}}\nheader h1{font-size:{{heading_size}}rem;margin:0;font-weight:300;color:{{heading_color}};text-transform:uppercase;letter-spacing:2px}\nheader p{font-size:.85rem;margin:8px 0 0;color:{{text_muted}}}\nheader p span{opacity:{{tagline_opacity}}}\nnav{padding:16px 20px;text-align:center;border-bottom:1px solid {{border}}}\nnav a{color:{{nav_fg}};text-decoration:none;margin:0 24px;font-size:.8rem;text-transform:uppercase;letter-spacing:1.5px;font-weight:500}\nnav a:hover{color:{{nav_fg_hover}}}\nmain{max-width:{{max_width}}px;margin:48px auto;padding:0 24px}\nmain h2{font-size:{{heading_size}}rem;margin:0 0 24px;font-weight:400;color:{{heading_color}}}\nmain a{color:{{accent_text}}}\nmain p{margin:0 0 20px;font-size:.95rem;color:{{text_muted}}}\nfooter{text-align:center;padding:28px 20px;color:{{text_muted}};font-size:.75rem;border-top:1px solid {{border}}}\nfooter a{color:{{accent_text}}}",
+    "SiteName": "Mode Studio",
+    "Tagline": "Crafting clarity through design",
+    "NavHome": "Work",
+    "NavAbout": "Studio",
+    "NavServices": "Capabilities",
+    "NavContact": "Contact"
+  }
+]

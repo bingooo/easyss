@@ -23,11 +23,12 @@ import (
 	"github.com/nange/easyss/v3/server/config"
 	"github.com/nange/easyss/v3/server/handler"
 	"github.com/nange/easyss/v3/server/nextproxy"
+	"github.com/nange/easyss/v3/shaper"
 	"github.com/nange/easyss/v3/stats"
 )
 
 type Server struct {
-	cfg        *config.ServerConfig
+	cfg        *config.FileConfig
 	httpServer *http.Server
 	mux        *http.ServeMux
 	certCache  *certmagic.Cache
@@ -35,7 +36,13 @@ type Server struct {
 	statsOnce  sync.Once
 }
 
-func New(cfg *config.ServerConfig) (*Server, error) {
+func New(cfg *config.FileConfig) (*Server, error) {
+	for _, p := range cfg.Transport.Protocols {
+		if p != "h2" {
+			return nil, fmt.Errorf("unsupported transport protocol %q (only h2 is supported)", p)
+		}
+	}
+
 	s := &Server{
 		cfg: cfg,
 	}
@@ -45,9 +52,10 @@ func New(cfg *config.ServerConfig) (*Server, error) {
 
 func (s *Server) initTLS() (*tls.Config, error) {
 	cfg := s.cfg
+	srvCfg := cfg.Server
 
-	if cfg.CertPath != "" && cfg.KeyPath != "" {
-		cert, err := tls.LoadX509KeyPair(cfg.CertPath, cfg.KeyPath)
+	if srvCfg.CertPath != "" && srvCfg.KeyPath != "" {
+		cert, err := tls.LoadX509KeyPair(srvCfg.CertPath, srvCfg.KeyPath)
 		if err != nil {
 			return nil, fmt.Errorf("load cert: %w", err)
 		}
@@ -75,7 +83,7 @@ func (s *Server) initTLS() (*tls.Config, error) {
 		if cache != nil {
 			cache.Stop()
 		}
-		_ = cleanCertmagicDomainAssets(context.Background(), storage, cfg.Domain)
+		_ = cleanCertmagicDomainAssets(context.Background(), storage, srvCfg.Domain)
 		tlsConfig, cache, err = s.manageCert(storage, true)
 	}
 	if err != nil {
@@ -105,12 +113,12 @@ func (s *Server) manageCert(storage certmagic.Storage, disableARI bool) (*tls.Co
 
 	acmeCfg := certmagic.DefaultACME
 	acmeCfg.Agreed = true
-	acmeCfg.Email = s.cfg.Email
+	acmeCfg.Email = s.cfg.Server.Email
 	acmeCfg.DisableHTTPChallenge = true
 	cmCfg.Issuers = []certmagic.Issuer{certmagic.NewACMEIssuer(cmCfg, acmeCfg)}
 
 	tlsConfig := cmCfg.TLSConfig()
-	err := cmCfg.ManageSync(context.Background(), []string{s.cfg.Domain})
+	err := cmCfg.ManageSync(context.Background(), []string{s.cfg.Server.Domain})
 	if err != nil {
 		return nil, cache, err
 	}
@@ -118,16 +126,16 @@ func (s *Server) manageCert(storage certmagic.Storage, disableARI bool) (*tls.Co
 }
 
 func (s *Server) resolveEmail(storagePath string) {
-	if s.cfg.Email != "" {
+	if s.cfg.Server.Email != "" {
 		return
 	}
 	if existing := findExistingACMEEmail(storagePath); existing != "" {
-		s.cfg.Email = existing
+		s.cfg.Server.Email = existing
 		log.Info("[SERVER] reused existing ACME email", "email", existing)
 		return
 	}
-	s.cfg.Email = randomEmail()
-	log.Info("[SERVER] generated random ACME email", "email", s.cfg.Email)
+	s.cfg.Server.Email = randomEmail()
+	log.Info("[SERVER] generated random ACME email", "email", s.cfg.Server.Email)
 }
 
 func (s *Server) statsLoop() {
@@ -145,6 +153,7 @@ func (s *Server) statsLoop() {
 				"udp", snap.ServerUDPStreams,
 				"icmp", snap.ServerICMPStreams,
 				"hserr", snap.ServerHandshakeErrors,
+				"scancel", snap.ServerStreamCancels,
 				"fallback", snap.ServerFallbackPages,
 				"probe", snap.ServerProbes,
 				"padding", stats.HumanBytes(snap.PaddingBytes),
@@ -209,7 +218,7 @@ func findExistingACMEEmail(storagePath string) string {
 func randomEmail() string {
 	b := make([]byte, 8)
 	_, _ = rand.Read(b)
-	return "admin-" + hex.EncodeToString(b) + "@example.com"
+	return "admin_" + hex.EncodeToString(b) + "@gmail.com"
 }
 
 func shouldRetryFreshCertificate(err error) bool {
@@ -241,77 +250,87 @@ func cleanCertmagicDomainAssets(ctx context.Context, storage certmagic.Storage, 
 
 func (s *Server) Start() error {
 	cfg := s.cfg
-	log.Info("[SERVER] starting", "listen", cfg.Listen, "domain", cfg.Domain, "timeout", cfg.Timeout)
+	srvCfg := cfg.Server
+	log.Info("[SERVER] starting", "listen", srvCfg.Listen, "domain", srvCfg.Domain, "timeout", cfg.Timeout)
 
 	tlsConfig, err := s.initTLS()
 	if err != nil {
 		log.Error("[SERVER] init TLS failed", "err", err)
 		return err
 	}
-	if cfg.CertPath != "" && cfg.KeyPath != "" {
-		log.Info("[SERVER] TLS mode: cert files", "cert", cfg.CertPath, "key", cfg.KeyPath)
+	if srvCfg.CertPath != "" && srvCfg.KeyPath != "" {
+		log.Info("[SERVER] TLS mode: cert files", "cert", srvCfg.CertPath, "key", srvCfg.KeyPath)
 	} else {
-		log.Info("[SERVER] TLS mode: certmagic (Let's Encrypt)", "domain", cfg.Domain, "email", cfg.Email)
+		log.Info("[SERVER] TLS mode: certmagic (Let's Encrypt)", "domain", srvCfg.Domain, "email", srvCfg.Email)
 	}
 
-	timeout := time.Duration(s.cfg.Timeout) * time.Second
+	timeout := time.Duration(cfg.Timeout) * time.Second
 	if timeout <= 0 {
 		timeout = time.Duration(sharedconfig.DefaultTimeout) * time.Second
 	}
+	timeouts := sharedconfig.NewTimeouts(timeout)
 
-	if s.cfg.FallbackTarget != "" {
-		if err := handler.SetFallbackTarget(s.cfg.FallbackTarget, s.cfg.FallbackPreserveHost, s.cfg.FallbackCDNDomains); err != nil {
-			return fmt.Errorf("fallback target: %w", err)
-		}
-		log.Info("[SERVER] fallback target configured", "target", s.cfg.FallbackTarget, "preserve_host", s.cfg.FallbackPreserveHost, "cdn_domains", s.cfg.FallbackCDNDomains)
+	// 构造本次部署唯一的回退实例：模式配置与部署级身份都在这里一次性确定，
+	// 随后由各个 handler 共享。构造失败会直接让服务器启动失败，不会留下
+	// 部分改写的可见状态。
+	fallback, err := handler.NewFallback(handler.FallbackConfig{
+		Target:       cfg.Fallback.Target,
+		PreserveHost: cfg.Fallback.PreserveHost,
+		CDNDomains:   cfg.Fallback.CDNDomains,
+	})
+	if err != nil {
+		return fmt.Errorf("fallback target: %w", err)
+	}
+	if cfg.Fallback.Target != "" {
+		log.Info("[SERVER] fallback target configured", "target", cfg.Fallback.Target, "preserve_host", cfg.Fallback.PreserveHost, "cdn_domains", cfg.Fallback.CDNDomains)
 	}
 
-	masterKey, err := crypto.DeriveMasterKey(s.cfg.Password)
+	masterKey, err := crypto.DeriveMasterKey(srvCfg.Password)
 	if err != nil {
 		return fmt.Errorf("derive master key: %w", err)
 	}
 
-	np, err := nextproxy.New(s.cfg.NextProxy.URL, s.cfg.NextProxy.EnableUDP, s.cfg.NextProxy.AllHost)
+	np, err := nextproxy.New(cfg.NextProxy.URL, cfg.NextProxy.EnableUDP, cfg.NextProxy.AllHost)
 	if err != nil {
 		log.Error("[SERVER] next proxy init failed", "err", err)
 		return fmt.Errorf("next proxy: %w", err)
 	}
 	if np != nil {
-		if err := np.LoadProxyFile(s.cfg.NextProxy.NextProxyFile); err != nil {
+		if err := np.LoadProxyFile(cfg.NextProxy.NextProxyFile); err != nil {
 			log.Error("[SERVER] next proxy load file failed", "err", err)
 			return fmt.Errorf("next proxy load file: %w", err)
 		}
-		np.SetDialTimeout(handler.DialTimeout(timeout))
-		log.Info("[SERVER] next proxy configured", "url", s.cfg.NextProxy.URL, "udp", s.cfg.NextProxy.EnableUDP, "all_host", s.cfg.NextProxy.AllHost)
+		np.SetDialTimeout(timeouts.Dial)
+		log.Info("[SERVER] next proxy configured", "url", cfg.NextProxy.URL, "udp", cfg.NextProxy.EnableUDP, "all_host", cfg.NextProxy.AllHost)
 	}
 
-	streamIdleTimeout := 10 * timeout
-
 	proxyHandler := handler.NewProxyHandler(handler.ProxyHandlerConfig{
-		MasterKey:         masterKey,
-		AllowedMethods:    s.cfg.GetAllowedMethods(),
-		HandshakeTimeout:  timeout,
-		Timeout:           timeout,
-		StreamIdleTimeout: streamIdleTimeout,
-		UDPIdleTimeout:    2 * timeout,
-		BatchWindowMS:     s.cfg.BatchWindowMS,
-		CoverBudgetRatio:  s.cfg.CoverBudgetRatio,
-		CoverBudgetCap:    s.cfg.CoverBudgetCap,
-		NextProxy:         np,
+		MasterKey:      masterKey,
+		AllowedMethods: srvCfg.GetAllowedMethods(),
+		Timeouts:       timeouts,
+		Shaper: shaper.Config{
+			BatchWindowMS: cfg.Shaper.BatchWindowMS,
+			Cover: shaper.CoverConfig{
+				BudgetRatio: cfg.Shaper.CoverBudgetRatio,
+				BudgetCap:   cfg.Shaper.CoverBudgetCap,
+			},
+		},
+		NextProxy: np,
+		Fallback:  fallback,
 	})
 
 	probePayload := make([]byte, sharedconfig.ProbePayloadSize)
 	if _, err := io.ReadFull(rand.Reader, probePayload); err != nil {
 		return fmt.Errorf("generate probe payload: %w", err)
 	}
-	probeHandler, err := handler.NewProbeHandler(masterKey, probePayload)
+	probeHandler, err := handler.NewProbeHandler(masterKey, probePayload, fallback)
 	if err != nil {
 		return fmt.Errorf("probe handler: %w", err)
 	}
 
 	s.mux = http.NewServeMux()
 	s.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		handler.ServeFallback(w, r)
+		fallback.Serve(w, r)
 	})
 	s.mux.Handle(sharedconfig.EndpointTCP, proxyHandler)
 	s.mux.Handle(sharedconfig.EndpointUDP, proxyHandler)
@@ -320,28 +339,38 @@ func (s *Server) Start() error {
 
 	s.httpServer = buildHTTPServer(cfg, tlsConfig, s.mux, timeout)
 
-	log.Info("[SERVER] listening", "addr", s.cfg.Listen, "routes", []string{"/", sharedconfig.EndpointTCP, sharedconfig.EndpointUDP, sharedconfig.EndpointICMP, sharedconfig.EndpointProbe})
+	log.Info("[SERVER] listening", "addr", srvCfg.Listen, "routes", []string{"/", sharedconfig.EndpointTCP, sharedconfig.EndpointUDP, sharedconfig.EndpointICMP, sharedconfig.EndpointProbe})
 	s.statsDone = make(chan struct{})
 	go s.statsLoop()
 	return s.httpServer.ListenAndServeTLS("", "")
 }
 
-// buildHTTPServer assembles the HTTP server with HTTP/2 flow-control windows
-// sized for upload throughput: the per-stream receive window bounds a single
-// upload stream's in-flight data (throughput ≈ window/RTT), so both windows
-// must be generous enough for high-RTT links.
-func buildHTTPServer(cfg *config.ServerConfig, tlsConfig *tls.Config, mux *http.ServeMux, timeout time.Duration) *http.Server {
+// buildHTTPServer 组装 HTTP 服务器，其 HTTP/2 流控窗口按上传吞吐量来定尺寸：
+// 每流接收窗口限制了单个上传流的在途数据量（吞吐 ≈ 窗口/RTT），因此两个窗口
+// 都必须足够大，以适配高 RTT 链路。
+func buildHTTPServer(cfg *config.FileConfig, tlsConfig *tls.Config, mux *http.ServeMux, timeout time.Duration) *http.Server {
+	http2Cfg := &http.HTTP2Config{
+		MaxReadFrameSize:              sharedconfig.HTTP2ServerMaxReadFrameSize,
+		MaxReceiveBufferPerConnection: sharedconfig.HTTP2ServerReceiveBufferPerConnection,
+		MaxReceiveBufferPerStream:     sharedconfig.HTTP2ServerReceiveBufferPerStream,
+	}
+	if cfg.Transport.H2MaxFrameSize > 0 {
+		http2Cfg.MaxReadFrameSize = cfg.Transport.H2MaxFrameSize
+	}
+	if cfg.Transport.H2RecvBufConn > 0 {
+		http2Cfg.MaxReceiveBufferPerConnection = cfg.Transport.H2RecvBufConn
+	}
+	if cfg.Transport.H2RecvBufStream > 0 {
+		http2Cfg.MaxReceiveBufferPerStream = cfg.Transport.H2RecvBufStream
+	}
+
 	srv := &http.Server{
-		Addr:      cfg.Listen,
-		TLSConfig: tlsConfig,
-		Handler:   mux,
-		ErrorLog:  stdErrorLog(),
-		Protocols: &http.Protocols{},
-		HTTP2: &http.HTTP2Config{
-			MaxReadFrameSize:              sharedconfig.HTTP2ServerMaxReadFrameSize,
-			MaxReceiveBufferPerConnection: sharedconfig.HTTP2ServerReceiveBufferPerConnection,
-			MaxReceiveBufferPerStream:     sharedconfig.HTTP2ServerReceiveBufferPerStream,
-		},
+		Addr:              cfg.Server.Listen,
+		TLSConfig:         tlsConfig,
+		Handler:           mux,
+		ErrorLog:          stdErrorLog(),
+		Protocols:         &http.Protocols{},
+		HTTP2:             http2Cfg,
 		IdleTimeout:       8 * timeout,
 		ReadHeaderTimeout: min(timeout/2, 10*time.Second),
 	}
@@ -353,7 +382,7 @@ func buildHTTPServer(cfg *config.ServerConfig, tlsConfig *tls.Config, mux *http.
 func (s *Server) Shutdown(ctx context.Context) error {
 	log.Info("[SERVER] shutting down")
 
-	// Stop the stats loop goroutine so it doesn't leak past shutdown.
+	// 停止 stats 循环 goroutine，使其不会在关闭后泄漏。
 	s.statsOnce.Do(func() {
 		if s.statsDone != nil {
 			close(s.statsDone)
@@ -370,10 +399,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return nil
 }
 
-// stdErrorLog routes Go's internal http.Server/HTTP2 logs (connection-level
-// errors, PING timeouts, protocol errors, TLS handshake errors, etc.) through
-// easyss's slog logger. Handler panics are handled separately by the recover
-// in ProxyHandler.ServeHTTP.
+// stdErrorLog 将 Go 内部 http.Server/HTTP2 的日志（连接级错误、PING 超时、
+// 协议错误、TLS 握手错误等）转接到 easyss 的 slog 日志器。handler 的 panic
+// 由 ProxyHandler.ServeHTTP 中的 recover 单独处理。
 func stdErrorLog() *stdlog.Logger {
 	return stdlog.New(slogErrorWriter{}, "", 0)
 }

@@ -208,6 +208,33 @@ func TestNewRouter(t *testing.T) {
 	}
 }
 
+// TestCustomFileError 验证自定义直连/代理规则文件缺失不会导致路由器构造失败
+// （内置规则仍可正常工作），但会通过 CustomFileError 记录为启动警告。
+func TestCustomFileError(t *testing.T) {
+	r, err := New(Config{
+		ProxyRule:  ProxyRuleAuto,
+		IPV6Rule:   IPV6RuleAuto,
+		DirectFile: "missing-direct.txt",
+	})
+	if err != nil {
+		t.Fatalf("New() with a missing direct file should stay non-fatal, got error: %v", err)
+	}
+	if r.CustomFileError() == nil {
+		t.Fatal("expected a custom-file warning for a missing direct file")
+	}
+
+	r2, err := New(Config{
+		ProxyRule: ProxyRuleAuto,
+		IPV6Rule:  IPV6RuleAuto,
+	})
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	if r2.CustomFileError() != nil {
+		t.Fatalf("unexpected custom-file warning: %v", r2.CustomFileError())
+	}
+}
+
 func TestRouter_ShouldIPV6Disable(t *testing.T) {
 	tests := []struct {
 		name           string
@@ -225,14 +252,9 @@ func TestRouter_ShouldIPV6Disable(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			r := &Router{
-				cfg: Config{
-					IPV6Rule:       tt.ipv6Rule,
-					IPV6NetWorking: tt.ipv6Networking,
-					ServerIPV6:     tt.serverIPV6,
-				},
-			}
+			r := &Router{}
 			r.ipv6Rule.Store(int32(tt.ipv6Rule))
+			r.SetIPV6Info(tt.ipv6Networking, tt.serverIPV6)
 
 			got := r.ShouldIPV6Disable()
 			if got != tt.want {
@@ -256,14 +278,21 @@ func TestRouter_SetIPV6Info(t *testing.T) {
 	r := &Router{}
 	r.SetIPV6Info(true, "2001:db8::1")
 
-	if !r.cfg.IPV6NetWorking {
-		t.Error("IPV6NetWorking should be true")
-	}
-	if r.cfg.ServerIPV6 != "2001:db8::1" {
-		t.Errorf("ServerIPV6 = %q", r.cfg.ServerIPV6)
+	if !r.ipv6Networking.Load() {
+		t.Error("ipv6Networking should be true")
 	}
 	if r.ServerIPV6() != "2001:db8::1" {
 		t.Errorf("ServerIPV6() = %q", r.ServerIPV6())
+	}
+
+	// Auto 规则：只有网络和服务器地址都可用时 IPv6 才启用。
+	r.ipv6Rule.Store(int32(IPV6RuleAuto))
+	if r.ShouldIPV6Disable() {
+		t.Error("IPV6RuleAuto with networking and server ipv6 should not disable ipv6")
+	}
+	r.SetIPV6Info(true, "")
+	if !r.ShouldIPV6Disable() {
+		t.Error("IPV6RuleAuto without a server ipv6 should disable ipv6")
 	}
 }
 
@@ -561,10 +590,10 @@ func TestRouter_RegexpAndGlobCustomDomain(t *testing.T) {
 
 	// 手动添加 regexp 和 glob 规则（模拟 loadCustomIPDomains 的行为）
 	directRe1, _ := regexp.Compile(`^.*\.baidu\.com$`) // regexp: 前缀
-	directRe2, _ := util.GlobToRegexp("*taobao*")           // glob 通配符
+	directRe2, _ := util.GlobToRegexp("*taobao*")      // glob 通配符
 	r.customDirectRegexps = append(r.customDirectRegexps, directRe1, directRe2)
 
-	proxyRe1, _ := util.GlobToRegexp("*google*")            // glob 通配符
+	proxyRe1, _ := util.GlobToRegexp("*google*")       // glob 通配符
 	proxyRe2, _ := regexp.Compile(`^.*\.youtube\..*$`) // regexp: 前缀
 	r.customProxyRegexps = append(r.customProxyRegexps, proxyRe1, proxyRe2)
 

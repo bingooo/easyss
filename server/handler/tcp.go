@@ -16,130 +16,68 @@ import (
 	"github.com/nange/easyss/v3/server/nextproxy"
 	"github.com/nange/easyss/v3/shaper"
 	"github.com/nange/easyss/v3/stats"
-	"github.com/nange/easyss/v3/util"
 	"github.com/nange/easyss/v3/util/bytespool"
 )
 
-type TCPHandler struct {
-	dialer      *net.Dialer
-	dialContext func(context.Context, string, string) (net.Conn, error)
-	nextProxy   *nextproxy.NextProxy
+type tcpHandler struct {
 	idleTimeout time.Duration
-	dialTimeout time.Duration
+	// dialContext 是仅供测试的直接拨号注入点；生产环境为 nil。
+	dialContext func(context.Context, string, string) (net.Conn, error)
+	dial        dialer
 }
 
-// DialTimeout computes the dial timeout for outbound connections.
-// It is derived from the base timeout: timeout/3, clamped to [3s, 15s].
-func DialTimeout(timeout time.Duration) time.Duration {
-	d := timeout / 3
-	if d < 3*time.Second {
-		d = 3 * time.Second
-	}
-	if d > 15*time.Second {
-		d = 15 * time.Second
-	}
-	return d
-}
-
-func NewTCPHandler(idleTimeout, timeout time.Duration, np *nextproxy.NextProxy) *TCPHandler {
+// newTCPHandler 用给定的空闲超时和基础超时创建 tcpHandler。
+// 拨号超时通过 config.DialTimeout 派生（base/3，限制在 [3s, 15s]），与客户端
+// 共用；KeepAlive 取完整的基础超时，这样长连接流由内核回收，而不会在对端
+// 消失后一直半开残留。
+func newTCPHandler(idleTimeout, timeout time.Duration, np *nextproxy.NextProxy) *tcpHandler {
 	if idleTimeout <= 0 {
 		idleTimeout = config.DefaultStreamIdleTimeout
 	}
 	if timeout <= 0 {
 		timeout = time.Duration(config.DefaultTimeout) * time.Second
 	}
-	dialTimeout := DialTimeout(timeout)
-	return &TCPHandler{
-		dialer:      &net.Dialer{Timeout: dialTimeout, KeepAlive: timeout},
+	directDialer := outboundDialer(config.DialTimeout(timeout), timeout)
+	h := &tcpHandler{idleTimeout: idleTimeout}
+	h.dial = dialer{
 		nextProxy:   np,
-		idleTimeout: idleTimeout,
-		dialTimeout: dialTimeout,
+		shouldProxy: np.ShouldProxy,
+		direct: func(ctx context.Context, network, target string) (net.Conn, error) {
+			// 测试注入点：生产环境为 nil。
+			if h.dialContext != nil {
+				return h.dialContext(ctx, network, target)
+			}
+			return dialOutbound(ctx, directDialer, network, target)
+		},
 	}
+	return h
 }
 
-func (h *TCPHandler) dialTarget(ctx context.Context, network, addr string) (net.Conn, error) {
-	if h.nextProxy != nil && h.nextProxy.ShouldProxy(addr) {
-		// Re-run the SSRF check at dial time: the handshake-time check may
-		// be long past, and a DNS-rebinding name can resolve differently
-		// now. The post-dial check below cannot run here — the SOCKS5
-		// connection reports the proxy's address, not the target's — so the
-		// proxy's own resolver remains a (trusted, admin-configured)
-		// residual risk.
-		if util.IsLANHostResolved(ctx, addr) {
-			return nil, fmt.Errorf("ssrf: rejected lan destination %s", addr)
-		}
-		log.Info("[TCP_HANDLE] dialing via next proxy", "target", addr, "proxy", h.nextProxy.URL().String())
-		return h.nextProxy.DialContext(ctx, network, addr)
-	}
-	// Test-only injection point; nil in production.
-	if h.dialContext != nil {
-		return h.dialContext(ctx, network, addr)
-	}
-	d := h.dialer
-	conn, err := d.DialContext(ctx, outboundTCPNetwork(addr), addr)
-	if err != nil {
-		return nil, err
-	}
-	// Post-dial SSRF guard: verify the actual remote IP is not a LAN address.
-	// This defends against DNS rebinding attacks where a domain resolves to a
-	// safe public IP during the handshake validation but to a LAN IP on dial.
-	if ra := conn.RemoteAddr(); ra != nil {
-		if host, _, e := net.SplitHostPort(ra.String()); e == nil && util.IsLANIP(host) {
-			_ = conn.Close()
-			return nil, fmt.Errorf("ssrf: rejected lan destination %s", host)
-		}
-	}
-	return conn, nil
-}
-
-func outboundTCPNetwork(addr string) string {
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		return "tcp"
-	}
-	ip := net.ParseIP(host)
-	if ip == nil {
-		return "tcp"
-	}
-	if ip.To4() == nil {
-		return "tcp6"
-	}
-	return "tcp4"
-}
-
-// Handle relays a TCP stream between the client and the target.
-// cancelRead is invoked when the relay terminates (timeout/error/completion);
-// it unblocks a copy goroutine that may be stuck reading from the client
-// (e.g. the HTTP/2 request body), so no goroutine lingers after the handler
-// returns.
-func (h *TCPHandler) Handle(ctx context.Context, dr *crypto.DecryptedReader, s2c shaper.Shaper, target string, cancelRead func()) error {
-	log.Info("[TCP_HANDLE] dialing target", "target", target, "timeout", h.dialTimeout)
-	targetConn, err := h.dialTarget(ctx, "tcp", target)
+// Handle 在客户端与目标之间中继 TCP 流，并以结构化结果返回中继字节数与退出
+// 原因（由 serveSession 统一记录，handler 自己不再打印"流已结束"）。
+// cancelRead 在中继终止（超时/错误/完成）时被调用；
+// 它会解除可能正阻塞在读取客户端数据（如 HTTP/2 请求体）上的拷贝 goroutine，
+// 从而在 handler 返回后不会有 goroutine 残留。
+func (h *tcpHandler) Handle(ctx context.Context, dr *crypto.DecryptedReader, s2c shaper.Shaper, target string, cancelRead func()) (out streamResult) {
+	log.Info("[TCP_HANDLE] dialing target", "target", target)
+	targetConn, remote, err := h.dial.dialTarget(ctx, "tcp", target)
 	if err != nil {
 		log.Error("[TCP_HANDLE] dial failed", "target", target, "err", err)
-		_ = s2c.PushFrame(protocol.NewFrameRST())
-		_ = s2c.Flush()
-		return err
+		sendRST(s2c)
+		return streamResult{Err: err}
 	}
 	defer targetConn.Close() //nolint:errcheck
-	// When dialing via the next proxy, the socks5 client connection reports a
-	// nil RemoteAddr (the library's RemoteAddr() returns an unset field), so
-	// fall back to the configured proxy address for observability.
-	remote := ""
-	if h.nextProxy != nil && h.nextProxy.ShouldProxy(target) {
-		remote = h.nextProxy.URL().Host
-	} else if ra := targetConn.RemoteAddr(); ra != nil {
-		remote = ra.String()
-	}
 	log.Info("[TCP_HANDLE] target connected", "target", target, "remote", remote)
 	m := stats.NewStreamMeter("tcp_handle", target)
-	defer m.Close()
+	// 先取字节数再关闭 meter，使 handler 返回时 out.Bytes 已经是最终值
+	// （defer 按后进先出执行，这里注册的清理在返回前完成）。
+	defer func() {
+		out.Bytes = m.Bytes()
+		m.Close()
+	}()
 
-	sendRST := func() {
-		_ = s2c.PushFrame(protocol.NewFrameRST())
-		_ = s2c.Flush()
-	}
-
+	// 中继的 onClose 既要解除客户端读取器阻塞（cancelRead），
+	// 也要关闭目标连接，因此这里把通用的 CloseBoth 与该回调组合在一起。
 	result := relay.Bidirectional(h.idleTimeout, func() {
 		if cancelRead != nil {
 			cancelRead()
@@ -149,61 +87,50 @@ func (h *TCPHandler) Handle(ctx context.Context, dr *crypto.DecryptedReader, s2c
 		func(signal func()) error { return h.copyFromClient(dr, targetConn, signal) },
 		func(signal func()) error { return h.copyFromTarget(targetConn, s2c, signal, m) },
 	)
-	// Log the stream outcome (bytes relayed and exit reason) at INFO level so
-	// targets whose connection was established but later stalled, reset or
-	// carried no data are directly visible when diagnosing blocked hosts.
-	attrs := []any{"target", target, "remote", remote, "bytes", m.Bytes(), "timed_out", result.TimedOut}
-	if result.Err != nil {
-		attrs = append(attrs, "err", result.Err.Error())
-	}
-	log.Info("[TCP_HANDLE] stream closed", attrs...)
+	out.Remote = remote
+	out.TimedOut = result.TimedOut
 	if result.TimedOut {
-		log.Debug("[TCP_HANDLE] idle timeout", "target", target, "timeout", h.idleTimeout)
-		sendRST()
-		return fmt.Errorf("tcp stream %s", result.IdleMsg)
+		out.Err = fmt.Errorf("tcp stream idle timeout after %v", h.idleTimeout)
+	} else {
+		out.Err = result.Err
 	}
-	if result.Err != nil {
-		sendRST()
+	if out.needsRST() {
+		sendRST(s2c)
 	}
-	return result.Err
+	return out
 }
 
-func (h *TCPHandler) copyFromClient(dr *crypto.DecryptedReader, dst net.Conn, signalActivity func()) error {
+func (h *tcpHandler) copyFromClient(dr *crypto.DecryptedReader, dst net.Conn, signalActivity func()) error {
 	for {
-		frame, err := dr.ReadFrame()
+		frame, done, err := nextClientFrame(dr)
 		if err != nil {
 			return err
 		}
-
-		switch frame.Type {
-		case protocol.FrameDATA:
-			signalActivity()
-			if len(frame.Payload) > 0 {
-				if _, wErr := dst.Write(frame.Payload); wErr != nil {
-					return wErr
-				}
+		if done {
+			if frame.Type == protocol.FrameRST {
+				return io.EOF
 			}
-		case protocol.FrameFIN:
 			signalActivity()
 			if cw, ok := dst.(interface{ CloseWrite() error }); ok {
 				_ = cw.CloseWrite()
 			}
-			// FIN is a terminal frame: the client sends no further frames
-			// after it (its copyLocalToRemote returns right after flushing
-			// FIN), so stop reading instead of blocking on ReadFrame until
-			// the relay idle timeout. The relay keeps waiting for the
-			// target->client direction and its idle timer still bounds the
-			// stream's lifetime.
+			// FIN 是终止帧：客户端在它之后不会再发送任何帧
+			// （客户端的 copyLocalToRemote 在 flush FIN 后立即返回），
+			// 因此停止读取，而不是一直阻塞在 ReadFrame 上直到中继空闲超时。
+			// 中继仍会等待 target->client 方向，其空闲计时器仍然限定
+			// 流的生命周期。
 			return nil
-		case protocol.FrameRST:
-			return io.EOF
-		case protocol.FramePADDING, protocol.FrameCOVER:
-			continue
+		}
+		signalActivity()
+		if len(frame.Payload) > 0 {
+			if _, wErr := dst.Write(frame.Payload); wErr != nil {
+				return wErr
+			}
 		}
 	}
 }
 
-func (h *TCPHandler) copyFromTarget(src net.Conn, s2c shaper.Shaper, signalActivity func(), m *stats.StreamMeter) error {
+func (h *tcpHandler) copyFromTarget(src net.Conn, s2c shaper.Shaper, signalActivity func(), m *stats.StreamMeter) error {
 	buf := bytespool.Get(config.ServerTCPStreamBufferSize)
 	defer bytespool.MustPut(buf)
 	for {

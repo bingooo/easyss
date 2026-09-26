@@ -3,46 +3,62 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"syscall"
 
 	"github.com/nange/easyss/v3/log"
+	"github.com/nange/easyss/v3/util"
 )
 
 var singletonLockFile *os.File
 
-// acquireSingletonLock acquires an exclusive file lock to ensure only one
-// instance of the app runs at a time. If another instance is already running,
-// it exits gracefully. Must be called after daemonization.
-func acquireSingletonLock() {
+// tryAcquireSingletonLock 尝试获取确保同一时刻只运行一个应用实例的
+// 排他文件锁。当另一个进程持有该锁时返回 errAnotherInstance，
+// 否则返回底层错误（例如无法创建锁文件）。
+func tryAcquireSingletonLock() error {
 	lockPath := filepath.Join(os.TempDir(), fmt.Sprintf("easyss-%d.lock", os.Getuid()))
 
 	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
-		log.Error("[EASYSS-V3] failed to open lock file", "err", err)
-		os.Exit(1)
+		return fmt.Errorf("open lock file: %w", err)
 	}
 
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		log.Warn("[EASYSS-V3] another instance is already running, exiting")
+	if err := util.FlockTry(f); err != nil {
 		_ = f.Close()
-		os.Exit(0)
+		return errAnotherInstance
 	}
 
-	// Write PID for diagnostic purposes.
+	// 写入 PID 供诊断使用。
 	_ = f.Truncate(0)
 	_, _ = f.Seek(0, 0)
 	_, _ = fmt.Fprintf(f, "%d\n", os.Getpid())
 
 	singletonLockFile = f
+	return nil
 }
 
-// releaseSingletonLock releases the file lock and cleans up the lock file.
+// acquireSingletonLock 获取单实例锁，锁不可用时退出进程。
+// 必须在守护化之后调用。
+func acquireSingletonLock() {
+	err := tryAcquireSingletonLock()
+	switch {
+	case err == nil:
+		return
+	case errors.Is(err, errAnotherInstance):
+		log.Warn("[EASYSS-V3] another instance is already running, exiting")
+		os.Exit(0)
+	default:
+		log.Error("[EASYSS-V3] failed to open lock file", "err", err)
+		os.Exit(1)
+	}
+}
+
+// releaseSingletonLock 释放文件锁并清理锁文件。
 func releaseSingletonLock() {
 	if singletonLockFile != nil {
-		_ = syscall.Flock(int(singletonLockFile.Fd()), syscall.LOCK_UN)
+		_ = util.Unflock(singletonLockFile)
 		_ = singletonLockFile.Close()
 		_ = os.Remove(singletonLockFile.Name())
 		singletonLockFile = nil

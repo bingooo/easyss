@@ -11,6 +11,7 @@ import (
 	"syscall"
 
 	"github.com/nange/easyss/v3/log"
+	"github.com/nange/easyss/v3/util"
 )
 
 func runDaemon() {
@@ -20,18 +21,18 @@ func runDaemon() {
 		log.Error("[EASYSS-V3] daemon lock check failed", "err", err)
 		os.Exit(1)
 	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+	if err := util.FlockTry(f); err != nil {
 		log.Info("[EASYSS-V3] daemon already running, exiting")
 		_ = f.Close()
 		os.Exit(0)
 	}
-	_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	_ = util.Unflock(f)
 	_ = f.Close()
 
-	exe, _ := os.Executable()
+	exe, _ := util.ExecutablePath()
 
-	// Build args for child process, stripping -daemon/--daemon flags and appending
-	// --daemon=false to prevent infinite daemonization loops.
+	// 构建子进程参数：剔除 -daemon/--daemon 标志并追加
+	// --daemon=false，防止无限守护化循环。
 	var args []string
 	for _, arg := range os.Args[1:] {
 		if arg == "-daemon" || arg == "--daemon" {
@@ -46,9 +47,9 @@ func runDaemon() {
 
 	cmd := exec.Command(exe, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Setsid: true, // Create a new session, detach from controlling terminal
+		Setsid: true, // 创建新会话，脱离控制终端
 	}
-	// Stdin/Stdout/Stderr nil -> /dev/null, prevents binding to the terminal
+	// Stdin/Stdout/Stderr 为 nil -> /dev/null，避免绑定到终端
 
 	if err := cmd.Start(); err != nil {
 		log.Error("[EASYSS-V3] daemon start", "err", err)

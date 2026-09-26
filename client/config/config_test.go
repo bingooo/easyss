@@ -404,8 +404,8 @@ func TestOutboundProtoToProtocol(t *testing.T) {
 		want    string
 		wantErr bool
 	}{
-		{"", "", false},
-		{"native", "", false},
+		{"", "h2", false},
+		{"native", "h2", false},
 		{"h2", "h2", false},
 		{"invalid", "", true},
 		{"H2", "", true}, // 大小写敏感
@@ -413,7 +413,7 @@ func TestOutboundProtoToProtocol(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.proto, func(t *testing.T) {
-			got, err := outboundProtoToProtocol(tt.proto)
+			got, err := OutboundProtoToProtocol(tt.proto)
 			if tt.wantErr {
 				if err == nil {
 					t.Error("expected error, got nil")
@@ -580,8 +580,10 @@ func TestApplyDefaults(t *testing.T) {
 		if cfg.Transport.ConnMaxBytes != config.DefaultConnMaxBytes {
 			t.Errorf("ConnMaxBytes = %d", cfg.Transport.ConnMaxBytes)
 		}
-		if cfg.Shaper.BatchWindowMS != config.DefaultBatchWindowMS {
-			t.Errorf("BatchWindowMS = %d", cfg.Shaper.BatchWindowMS)
+		// 此处保持 shaper 取值原样：其默认值与边界由 shaper.Config.Normalize
+		// 负责（在 shaper/shaper_test.go 中固定）。
+		if cfg.Shaper.BatchWindowMS != 0 {
+			t.Errorf("BatchWindowMS = %d, want 0 (normalized at the shaper)", cfg.Shaper.BatchWindowMS)
 		}
 		if cfg.Routing.ProxyRule != "auto" {
 			t.Errorf("ProxyRule = %q", cfg.Routing.ProxyRule)
@@ -602,11 +604,11 @@ func TestApplyDefaults(t *testing.T) {
 		}
 	})
 
-	t.Run("BatchWindowMS 上限", func(t *testing.T) {
+	t.Run("Shaper 取值原样保留，归一化在 shaper 层", func(t *testing.T) {
 		cfg := &ClientConfig{Shaper: ShaperConfig{BatchWindowMS: 100}}
 		applyDefaults(cfg)
-		if cfg.Shaper.BatchWindowMS != 10 {
-			t.Errorf("BatchWindowMS = %d, want 10 (capped)", cfg.Shaper.BatchWindowMS)
+		if cfg.Shaper.BatchWindowMS != 100 {
+			t.Errorf("BatchWindowMS = %d, want 100 (untouched)", cfg.Shaper.BatchWindowMS)
 		}
 	})
 
@@ -647,8 +649,8 @@ func TestApplyDefaults(t *testing.T) {
 				{Address: "example.com"},
 			},
 			Transport: TransportConfig{
-				// conn_count_max=1 would panic the scheduler (empty bulk pool);
-				// oversized values must not trigger huge upfront allocations.
+				// conn_count_max=1 会让调度器 panic（空的 bulk 池）；
+				// 过大的值则绝不能触发巨大的前置分配。
 				ConnCountMax:    1,
 				StreamThreshold: 1 << 30,
 			},
@@ -675,6 +677,89 @@ func TestApplyDefaults(t *testing.T) {
 		}
 		if cfg2.Transport.StreamThreshold != config.MaxStreamThreshold {
 			t.Errorf("StreamThreshold = %d, want clamped to %d", cfg2.Transport.StreamThreshold, config.MaxStreamThreshold)
+		}
+	})
+}
+
+// TestDisableWarmUpConfig 固定 transport.disable_warm_up 的向后兼容契约：
+// 该选项出现之前写入的所有配置文件都不含此键，其 false 零值会在这些配置中
+// 保持启动预热开启。只有显式设置为 true 才会关闭预热。
+func TestDisableWarmUpConfig(t *testing.T) {
+	write := func(t *testing.T, transportJSON string) *ClientConfig {
+		t.Helper()
+
+		dir := t.TempDir()
+		path := filepath.Join(dir, "config.json")
+
+		doc := `{
+			"version": 3,
+			"servers": [{"address": "example.com", "port": 443, "password": "secret", "default": true}],
+			"local": {"socks_port": 1080},
+			"transport": ` + transportJSON + `
+		}`
+		if err := os.WriteFile(path, []byte(doc), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		cfg, err := LoadConfig(path)
+		if err != nil {
+			t.Fatalf("LoadConfig: %v", err)
+		}
+		return cfg
+	}
+
+	t.Run("缺省键开启预热", func(t *testing.T) {
+		// 空的 transport 对象代表选项出现之前的配置文件；未知键代表更新版本
+		// 可能新增的字段。
+		cfg := write(t, `{"conn_count_max": 15, "future_option": true}`)
+		if cfg.Transport.DisableWarmUp {
+			t.Error("DisableWarmUp = true, want false when the key is absent")
+		}
+	})
+
+	t.Run("显式 false 开启预热", func(t *testing.T) {
+		cfg := write(t, `{"disable_warm_up": false}`)
+		if cfg.Transport.DisableWarmUp {
+			t.Error("DisableWarmUp = true, want false")
+		}
+	})
+
+	t.Run("显式 true 关闭预热", func(t *testing.T) {
+		cfg := write(t, `{"disable_warm_up": true}`)
+		if !cfg.Transport.DisableWarmUp {
+			t.Error("DisableWarmUp = false, want true")
+		}
+	})
+
+	t.Run("简化模式传递关闭", func(t *testing.T) {
+		cfg, err := BuildSimpleConfig(&config.SimpleConfig{
+			Server:        "example.com",
+			Password:      "secret",
+			DisableWarmUp: true,
+		})
+		if err != nil {
+			t.Fatalf("BuildSimpleConfig: %v", err)
+		}
+		if !cfg.Transport.DisableWarmUp {
+			t.Error("DisableWarmUp = false, want true from the simple config")
+		}
+
+		ApplySimpleOverrides(cfg, &config.SimpleConfig{})
+		if !cfg.Transport.DisableWarmUp {
+			t.Error("DisableWarmUp = false, want it preserved when the override is unset")
+		}
+	})
+
+	t.Run("简化模式默认开启", func(t *testing.T) {
+		cfg, err := BuildSimpleConfig(&config.SimpleConfig{
+			Server:   "example.com",
+			Password: "secret",
+		})
+		if err != nil {
+			t.Fatalf("BuildSimpleConfig: %v", err)
+		}
+		if cfg.Transport.DisableWarmUp {
+			t.Error("DisableWarmUp = true, want false by default")
 		}
 	})
 }

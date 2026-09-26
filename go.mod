@@ -1,26 +1,33 @@
 module github.com/nange/easyss/v3
 
-go 1.27
+go 1.27.1
+
+// nange/systray 是 gogpu/systray 的分支：修复了上游 issue #39
+//（上下文菜单打开期间 SetMenu 重建菜单会把点击派发到另一个菜单项的回调）。
+// 详见 https://github.com/gogpu/systray/issues/39。
+replace github.com/gogpu/systray => github.com/nange/systray v0.3.0-easyss.1
 
 require (
-	github.com/caddyserver/certmagic v0.25.2
+	github.com/Masterminds/semver/v3 v3.5.0
+	github.com/caddyserver/certmagic v0.25.4
 	github.com/coocood/freecache v1.2.7
-	github.com/gogpu/systray v0.2.9-0.20260811123705-f7b37e2d956c
+	github.com/gogpu/systray v0.3.0
 	github.com/libp2p/go-netroute v0.4.0
-	github.com/miekg/dns v1.1.72
+	github.com/miekg/dns v1.1.73
 	github.com/oschwald/geoip2-golang v1.13.0
 	github.com/refraction-networking/utls v1.8.2
 	github.com/samber/slog-formatter v1.3.0
 	github.com/stretchr/testify v1.12.1
 	github.com/txthinking/socks5 v0.0.0-20260601051520-339b044ab0eb
 	github.com/wzshiming/sysproxy v0.2.2
-	github.com/xjasonlyu/tun2socks/v2 v2.6.1-0.20260808015004-d24a73449e3a
-	golang.org/x/crypto v0.55.0
+	github.com/xjasonlyu/tun2socks/v2 v2.7.1-0.20260913205830-5d9fac67bb10
+	golang.org/x/crypto v0.56.0
 	golang.org/x/net v0.58.0
+	golang.org/x/sync v0.22.0
 	golang.org/x/sys v0.47.0
 	golang.org/x/time v0.15.0
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
-	gvisor.dev/gvisor v0.0.0-20260701204157-69c2d17aea96
+	gvisor.dev/gvisor v0.0.0-20260906120324-45bde0d1defa
 	tailscale.com v1.102.3
 )
 
@@ -44,10 +51,9 @@ require (
 	github.com/BurntSushi/toml v1.6.0 // indirect
 	github.com/ClickHouse/clickhouse-go-linter v1.2.1 // indirect
 	github.com/Djarvur/go-err113 v0.1.1 // indirect
-	github.com/Masterminds/semver/v3 v3.5.0 // indirect
 	github.com/MirrexOne/unqueryvet v1.5.4 // indirect
 	github.com/OpenPeeDeeP/depguard/v2 v2.2.1 // indirect
-	github.com/ajg/form v1.7.1 // indirect
+	github.com/ajg/form v1.9.0 // indirect
 	github.com/akutz/memconn v0.1.0 // indirect
 	github.com/alecthomas/chroma/v2 v2.27.0 // indirect
 	github.com/alecthomas/go-check-sumtype v0.3.1 // indirect
@@ -101,11 +107,11 @@ require (
 	github.com/fzipp/gocyclo v0.6.0 // indirect
 	github.com/gaissmai/bart v0.26.1 // indirect
 	github.com/ghostiam/protogetter v0.3.21 // indirect
-	github.com/go-chi/chi/v5 v5.3.0 // indirect
+	github.com/go-chi/chi/v5 v5.3.2 // indirect
 	github.com/go-chi/cors v1.2.2 // indirect
 	github.com/go-chi/render v1.0.3 // indirect
 	github.com/go-critic/go-critic v0.14.4 // indirect
-	github.com/go-gost/relay v0.6.1 // indirect
+	github.com/go-gost/relay v0.7.0 // indirect
 	github.com/go-json-experiment/json v0.0.0-20260214004413-d219187c3433 // indirect
 	github.com/go-toolsmith/astcast v1.1.0 // indirect
 	github.com/go-toolsmith/astcopy v1.1.0 // indirect
@@ -272,12 +278,11 @@ require (
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	go4.org/mem v0.0.0-20240501181205-ae6ca9944745 // indirect
 	go4.org/netipx v0.0.0-20231129151722-fdeea329fbba // indirect
-	golang.org/x/exp v0.0.0-20260611194520-c48552f49976 // indirect
+	golang.org/x/exp v0.0.0-20260824195058-e88cd73687aa // indirect
 	golang.org/x/exp/typeparams v0.0.0-20260820142414-ca536658362e // indirect
 	golang.org/x/mobile v0.0.0-20260820023541-8e8303b9da6c // indirect
 	golang.org/x/mod v0.40.0 // indirect
 	golang.org/x/oauth2 v0.36.0 // indirect
-	golang.org/x/sync v0.22.0 // indirect
 	golang.org/x/term v0.45.0 // indirect
 	golang.org/x/text v0.41.0 // indirect
 	golang.org/x/tools v0.49.0 // indirect
