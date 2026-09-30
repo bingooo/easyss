@@ -130,6 +130,7 @@ make lint   # 等价: go tool golangci-lint run --timeout 10m --verbose
 
 - `headless`：用于 headless/Android 构建，编译 `cmd/easyss/start_headless.go` 而非 `start.go`+`tray.go`
 - 注意 `cmd/easyss/start.go` 和 `tray.go` 头部有 `//go:build !headless`
+- 系统代理（`sysproxy*.go`）不是托盘专属：三条启动路径共用 `App.setupSysProxy`/`teardownSysProxy`（`main.go`），headless 在核心启动成功后同样设置系统代理、退出信号到达时撤销，`disable_sys_proxy` 是统一开关（设置失败只记警告，因为 root/systemd 下 gsettings 与用户会话总线常常不可达）
 
 ## 配置相关
 
@@ -137,6 +138,7 @@ make lint   # 等价: go tool golangci-lint run --timeout 10m --verbose
 - v2 配置自动迁移到 v3：`client/config/migrate.go` 中的 `MigrateV2Config()` 处理转换
 - v3 客户端配置入口：`client/config/config.go` 中的 `ClientConfig` 结构体
 - v3 服务端配置入口：`server/config/config.go` 中的 `FileConfig`/`ServerConfig`
+- `timeout` 是全部派生超时（TCP/UDP 空闲、拨号、DNS 响应、连接轮换、服务端 h2 连接空闲）的唯一旋钮，取值范围 **[15, 60]** 秒：非正值取默认值 30，越界取最近的边界；归一化统一由 `config.NormalizeTimeout`/`config.TimeoutDuration` 负责（客户端 `applyDefaults`/`TimeoutDuration`、简单模式覆盖 `ApplySimpleOverrides`、服务端 `server.Start` 都必须经过它，不要各自判断）
 - 显示完整配置示例：`./easyss -show-config-example`
 
 ## 关键架构要点
@@ -155,7 +157,7 @@ make lint   # 等价: go tool golangci-lint run --timeout 10m --verbose
 10. **统计与监控**：`stats` 包维护全局原子计数器（streams、bytes、RTT、DNS 缓存命中/未命中、fallback 页面等）；通过 HTTP 代理端口的 `/stats` 端点暴露 JSON 快照；`StreamMeter` 提供 per-stream 吞吐量监控
 11. **NextProxy 动态学习**：`server/nextproxy` 从 DNS 响应中自动提取 CNAME 目标域名和解析 IP，动态加入代理列表，无需预配置完整域名
 12. **v2→v3 配置迁移**：`client/config/migrate.go` 自动检测 v2 格式配置文件并通过 `MigrateV2Config()` 转换为 v3 格式，迁移后备份原文件为 `.bak`
-13. **开机网络未就绪时的启动韧性**：`runner.Run` 里服务端域名预解析（`resolveServerDomain`，有界单次尝试）失败**不再是致命错误**——开机自启动时 WiFi 常常还没初始化完，此时进程照常启动并监听本地端口，解析失败降级为启动警告（`runner.ErrServerDomainUnresolved`，托盘给出"网络尚未就绪、已在后台重试"提示）。预解析的三层超时集中在 `client/dns/timeouts.go`：单次往返 `dnsQueryTimeout`、每个 DNS 条目 `dns.ResolveItemTimeout`（条目的 A/AAAA 并发共享它，保证黑洞服务器不会独吞预算）、一次完整预解析 `dns.PreResolveTimeout`（runner/client.New/TUN helper 三条路径共用，并预留一个条目预算给系统 DNS 兜底，见 `dns.WithSystemDNSFallbackReserve`）。后台 `retryServerDomain` 按指数退避（1s→15s，带 ±20% 抖动）持续重试直到成功或 `Core.Stop`；每次尝试前调用 `dns.ResetResolveState()` 清掉内置 DNS 熔断（3 分钟冷却）与系统 DNS 发现缓存（空结果缓存 5 分钟），否则"网络已恢复"会被这两处状态拖后数分钟。成功后关闭 `Core.ServerDomainReady()` 通道并补派一次连接池预热，同时把预解析到的地址交给客户端（`Core.publishServerIPs` → `client.Client.SetServerIPs`）：传输层拨服务端域名时优先拨这些字面 IP（客户端侧 DNS pinning，TLS 的 SNI/证书校验仍用原域名），单次尝试有界，失败即丢弃缓存并回退到操作系统解析器，因此系统 DNS 坏掉/被污染（例如家用路由器返回"OPT 在 ANSWER 段"的畸形 EDNS0 应答，见 `dns.normalizeEDNS0Answer`）也能连上，而服务端换 IP 后又能自愈。TUN 的启用以该通道为前提（`canStartTunNow`）：未就绪时不启动 TUN（避免把系统 DNS 指向本机转发服务器后陷入解析递归，或缺默认网关导致脚本失败），启动路径与托盘点击都给出提示，网络恢复后由用户手动开启；`client.RefreshServerIPV6` 在启用 TUN 前补齐降级启动期间为空的服务器 IPv6，保证 TUN 脚本安装 IPv6 默认路由。所有依赖与调参在派发 goroutine 之前捕获（`serverDomainRetry`、`warmUpSeams`），避免与测试替换包级变量产生数据竞争
+13. **开机网络未就绪时的启动韧性**：`runner.Run` 里服务端域名预解析（`resolveServerDomain`，有界单次尝试）失败**不再是致命错误**——开机自启动时 WiFi 常常还没初始化完，此时进程照常启动并监听本地端口，解析失败降级为启动警告（`runner.ErrServerDomainUnresolved`，托盘给出"网络尚未就绪、已在后台重试"提示）。预解析的三层超时集中在 `client/dns/timeouts.go`：单次往返 `dnsQueryTimeout`、每个 DNS 条目 `dns.ResolveItemTimeout`（条目的 A/AAAA 并发共享它，保证黑洞服务器不会独吞预算）、一次完整预解析 `dns.PreResolveTimeout`（runner/client.New/TUN helper 三条路径共用，并预留一个条目预算给系统 DNS 兜底，见 `dns.WithSystemDNSFallbackReserve`）。后台 `retryServerDomain` 按指数退避（1s→15s，带 ±20% 抖动）持续重试直到成功或 `Core.Stop`；每次尝试前调用 `dns.ResetResolveState()` 清掉内置 DNS 熔断（3 分钟冷却）与系统 DNS 发现缓存（空结果缓存 5 分钟），否则"网络已恢复"会被这两处状态拖后数分钟。成功后关闭 `Core.ServerDomainReady()` 通道，同时把预解析到的地址交给客户端（`Core.publishServerIPs` → `client.Client.SetServerIPs`）：传输层拨服务端域名时优先拨这些字面 IP（客户端侧 DNS pinning，TLS 的 SNI/证书校验仍用原域名），单次尝试有界，失败即丢弃缓存并回退到操作系统解析器，因此系统 DNS 坏掉/被污染（例如家用路由器返回"OPT 在 ANSWER 段"的畸形 EDNS0 应答，见 `dns.normalizeEDNS0Answer`）也能连上，而服务端换 IP 后又能自愈。TUN 的启用以该通道为前提（`canStartTunNow`）：未就绪时不启动 TUN（避免把系统 DNS 指向本机转发服务器后陷入解析递归，或缺默认网关导致脚本失败），启动路径与托盘点击都给出提示，网络恢复后由用户手动开启；`client.RefreshServerIPV6` 在启用 TUN 前补齐降级启动期间为空的服务器 IPv6，保证 TUN 脚本安装 IPv6 默认路由。所有依赖与调参在派发 goroutine 之前捕获（`serverDomainRetry`），避免与测试替换包级变量产生数据竞争
 
 ## 版本信息注入
 

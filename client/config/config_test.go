@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/nange/easyss/v3/config"
 	"github.com/nange/easyss/v3/util"
@@ -162,6 +163,48 @@ func TestTimeoutDuration(t *testing.T) {
 		cfg := &ClientConfig{Timeout: -1}
 		if d := cfg.TimeoutDuration(); d.Seconds() != float64(config.DefaultTimeout) {
 			t.Errorf("TimeoutDuration = %v, want %ds", d, config.DefaultTimeout)
+		}
+	})
+
+	t.Run("低于下限钳制", func(t *testing.T) {
+		cfg := &ClientConfig{Timeout: 1}
+		if d := cfg.TimeoutDuration(); d.Seconds() != float64(config.MinTimeout) {
+			t.Errorf("TimeoutDuration = %v, want %ds", d, config.MinTimeout)
+		}
+	})
+
+	t.Run("高于上限钳制", func(t *testing.T) {
+		cfg := &ClientConfig{Timeout: 3600}
+		if d := cfg.TimeoutDuration(); d.Seconds() != float64(config.MaxTimeout) {
+			t.Errorf("TimeoutDuration = %v, want %ds", d, config.MaxTimeout)
+		}
+	})
+}
+
+// TestConnLifetimeDuration 固定连接轮换生命周期的派生：它不再可配置，
+// 完全跟随基础超时（12 倍 timeout）。
+func TestConnLifetimeDuration(t *testing.T) {
+	t.Run("默认基础超时", func(t *testing.T) {
+		cfg := &ClientConfig{Timeout: 30}
+		if d := cfg.ConnLifetimeDuration(); d != 6*time.Minute {
+			t.Errorf("ConnLifetimeDuration = %v, want 6m", d)
+		}
+	})
+
+	t.Run("随 timeout 缩放", func(t *testing.T) {
+		cfg := &ClientConfig{Timeout: 60}
+		if d := cfg.ConnLifetimeDuration(); d != 12*time.Minute {
+			t.Errorf("ConnLifetimeDuration = %v, want 12m", d)
+		}
+	})
+
+	t.Run("timeout 非法时用默认基础超时", func(t *testing.T) {
+		want := config.ConnLifetime(time.Duration(config.DefaultTimeout) * time.Second)
+		for _, timeout := range []int{0, -1} {
+			cfg := &ClientConfig{Timeout: timeout}
+			if d := cfg.ConnLifetimeDuration(); d != want {
+				t.Errorf("ConnLifetimeDuration(timeout=%d) = %v, want %v", timeout, d, want)
+			}
 		}
 	})
 }
@@ -574,9 +617,6 @@ func TestApplyDefaults(t *testing.T) {
 		if cfg.Transport.StreamThreshold != config.DefaultStreamThreshold {
 			t.Errorf("StreamThreshold = %d", cfg.Transport.StreamThreshold)
 		}
-		if cfg.Transport.ConnLifetimeSec != config.DefaultConnLifetimeSec {
-			t.Errorf("ConnLifetimeSec = %d", cfg.Transport.ConnLifetimeSec)
-		}
 		if cfg.Transport.ConnMaxBytes != config.DefaultConnMaxBytes {
 			t.Errorf("ConnMaxBytes = %d", cfg.Transport.ConnMaxBytes)
 		}
@@ -614,7 +654,7 @@ func TestApplyDefaults(t *testing.T) {
 
 	t.Run("已有值不被覆盖", func(t *testing.T) {
 		cfg := &ClientConfig{
-			Timeout: 120,
+			Timeout: 45,
 			Transport: TransportConfig{
 				Protocol: "h3",
 			},
@@ -626,8 +666,8 @@ func TestApplyDefaults(t *testing.T) {
 		}
 		applyDefaults(cfg)
 
-		if cfg.Timeout != 120 {
-			t.Errorf("Timeout = %d, want 120 (not overwritten)", cfg.Timeout)
+		if cfg.Timeout != 45 {
+			t.Errorf("Timeout = %d, want 45 (not overwritten)", cfg.Timeout)
 		}
 		if cfg.Transport.Protocol != "h3" {
 			t.Errorf("Protocol = %q, want h3 (not overwritten)", cfg.Transport.Protocol)
@@ -679,87 +719,64 @@ func TestApplyDefaults(t *testing.T) {
 			t.Errorf("StreamThreshold = %d, want clamped to %d", cfg2.Transport.StreamThreshold, config.MaxStreamThreshold)
 		}
 	})
+
+	t.Run("timeout 越界钳制到合法区间", func(t *testing.T) {
+		// timeout 派生出流空闲、UDP 空闲、拨号、DNS 响应与连接轮换，
+		// 因此它必须落在 [MinTimeout, MaxTimeout] 内；非正值仍是"取默认值"。
+		tests := []struct {
+			name string
+			in   int
+			want int
+		}{
+			{"低于下限", 1, config.MinTimeout},
+			{"上限内保持", 45, 45},
+			{"高于上限", 3600, config.MaxTimeout},
+			{"未配置", 0, config.DefaultTimeout},
+			{"负值", -3, config.DefaultTimeout},
+		}
+		for _, tt := range tests {
+			cfg := &ClientConfig{Timeout: tt.in}
+			applyDefaults(cfg)
+			if cfg.Timeout != tt.want {
+				t.Errorf("%s: Timeout = %d, want %d", tt.name, cfg.Timeout, tt.want)
+			}
+		}
+	})
 }
 
-// TestDisableWarmUpConfig 固定 transport.disable_warm_up 的向后兼容契约：
-// 该选项出现之前写入的所有配置文件都不含此键，其 false 零值会在这些配置中
-// 保持启动预热开启。只有显式设置为 true 才会关闭预热。
-func TestDisableWarmUpConfig(t *testing.T) {
-	write := func(t *testing.T, transportJSON string) *ClientConfig {
-		t.Helper()
-
-		dir := t.TempDir()
-		path := filepath.Join(dir, "config.json")
-
-		doc := `{
-			"version": 3,
-			"servers": [{"address": "example.com", "port": 443, "password": "secret", "default": true}],
-			"local": {"socks_port": 1080},
-			"transport": ` + transportJSON + `
-		}`
-		if err := os.WriteFile(path, []byte(doc), 0644); err != nil {
+// TestTimeoutClampedOnEveryEntry 覆盖 timeout 的三条入口都做同一套归一化：
+// 简化模式构建（含 v2 迁移）、命令行/简单模式覆盖、以及 JSON 加载后的 applyDefaults
+// （后者由 TestApplyDefaults 覆盖）。任何一条漏掉钳制，派生超时就会越界。
+func TestTimeoutClampedOnEveryEntry(t *testing.T) {
+	t.Run("简化模式构建", func(t *testing.T) {
+		cfg, err := BuildSimpleConfig(&config.SimpleConfig{Server: "example.com", Password: "secret", Timeout: 600})
+		if err != nil {
 			t.Fatal(err)
 		}
+		if cfg.Timeout != config.MaxTimeout {
+			t.Errorf("Timeout = %d, want clamped to %d", cfg.Timeout, config.MaxTimeout)
+		}
 
-		cfg, err := LoadConfig(path)
+		cfg, err = BuildSimpleConfig(&config.SimpleConfig{Server: "example.com", Password: "secret"})
 		if err != nil {
-			t.Fatalf("LoadConfig: %v", err)
+			t.Fatal(err)
 		}
-		return cfg
-	}
-
-	t.Run("缺省键开启预热", func(t *testing.T) {
-		// 空的 transport 对象代表选项出现之前的配置文件；未知键代表更新版本
-		// 可能新增的字段。
-		cfg := write(t, `{"conn_count_max": 15, "future_option": true}`)
-		if cfg.Transport.DisableWarmUp {
-			t.Error("DisableWarmUp = true, want false when the key is absent")
+		if cfg.Timeout != config.DefaultTimeout {
+			t.Errorf("Timeout = %d, want default %d", cfg.Timeout, config.DefaultTimeout)
 		}
 	})
 
-	t.Run("显式 false 开启预热", func(t *testing.T) {
-		cfg := write(t, `{"disable_warm_up": false}`)
-		if cfg.Transport.DisableWarmUp {
-			t.Error("DisableWarmUp = true, want false")
-		}
-	})
-
-	t.Run("显式 true 关闭预热", func(t *testing.T) {
-		cfg := write(t, `{"disable_warm_up": true}`)
-		if !cfg.Transport.DisableWarmUp {
-			t.Error("DisableWarmUp = false, want true")
-		}
-	})
-
-	t.Run("简化模式传递关闭", func(t *testing.T) {
-		cfg, err := BuildSimpleConfig(&config.SimpleConfig{
-			Server:        "example.com",
-			Password:      "secret",
-			DisableWarmUp: true,
-		})
-		if err != nil {
-			t.Fatalf("BuildSimpleConfig: %v", err)
-		}
-		if !cfg.Transport.DisableWarmUp {
-			t.Error("DisableWarmUp = false, want true from the simple config")
+	t.Run("简单模式覆盖", func(t *testing.T) {
+		cfg := &ClientConfig{Timeout: config.DefaultTimeout}
+		ApplySimpleOverrides(cfg, &config.SimpleConfig{Timeout: 1})
+		if cfg.Timeout != config.MinTimeout {
+			t.Errorf("Timeout = %d, want clamped to %d", cfg.Timeout, config.MinTimeout)
 		}
 
+		// 未提供覆盖（0）时保持配置中的值，不会被当成"钳制到下限"。
 		ApplySimpleOverrides(cfg, &config.SimpleConfig{})
-		if !cfg.Transport.DisableWarmUp {
-			t.Error("DisableWarmUp = false, want it preserved when the override is unset")
-		}
-	})
-
-	t.Run("简化模式默认开启", func(t *testing.T) {
-		cfg, err := BuildSimpleConfig(&config.SimpleConfig{
-			Server:   "example.com",
-			Password: "secret",
-		})
-		if err != nil {
-			t.Fatalf("BuildSimpleConfig: %v", err)
-		}
-		if cfg.Transport.DisableWarmUp {
-			t.Error("DisableWarmUp = true, want false by default")
+		if cfg.Timeout != config.MinTimeout {
+			t.Errorf("Timeout = %d, want unchanged %d", cfg.Timeout, config.MinTimeout)
 		}
 	})
 }

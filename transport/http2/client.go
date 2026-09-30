@@ -59,7 +59,7 @@ type Config struct {
 	MaxSlotCount      int
 	StreamThreshold   int
 	PrioritySlotRatio float64
-	ConnLifetime      time.Duration // 连接轮换前的最大存活时长（0：使用默认值）
+	ConnLifetime      time.Duration // 连接轮换前的最大存活时长（0：回退 DefaultConnLifetime）
 	ConnMaxBytes      int64         // 轮换前连接在任一方向承载的最大字节数（0：使用默认值）
 	Timeout           time.Duration
 	DialContext       func(ctx context.Context, network, addr string) (net.Conn, error)
@@ -108,7 +108,7 @@ func New(cfg Config) (transport.Transport, error) {
 
 	connLifetime := cfg.ConnLifetime
 	if connLifetime <= 0 {
-		connLifetime = time.Duration(sharedconfig.DefaultConnLifetimeSec) * time.Second
+		connLifetime = sharedconfig.DefaultConnLifetime
 	}
 	connMaxBytes := cfg.ConnMaxBytes
 	if connMaxBytes <= 0 {
@@ -359,51 +359,6 @@ func (t *http2Transport) Open(ctx context.Context, req transport.OpenRequest) (t
 	return stream, nil
 }
 
-// WarmUp 预热两个调度池各自的第一个连接，使每一类的第一条真实流能复用已建立的
-// 连接，而不用付出冷启动代价（拨号 + TLS + HTTP/2）：交互式流（443/80/8080/
-// 8443/22 端口上的浏览）位于 priority 池，其他一切（53 端口的 DNS、任意端口）
-// 位于 bulk 池。每个池都通过其某个槽位上的一次真实探测请求来预热——槽位的
-// http.Transport 会把请求固定到该槽位自己的连接上，因此这次同步往返就能
-// 建立连接。任何应答都算数：探测载荷、fallback 页面（不支持 /v3/probe 的
-// 服务器）或拒绝都能证明路径可用；只有无法确认连接的探测才会被报告，
-// 调用方记录日志后吞掉它：启动绝不能依赖预热。
-func (t *http2Transport) WarmUp(ctx context.Context) error {
-	if t.lifecycle.probeFunc == nil {
-		return errors.New("probe not configured")
-	}
-
-	var firstErr error
-	for _, highPriority := range []bool{true, false} {
-		if err := t.warmPool(ctx, highPriority); err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-	return firstErr
-}
-
-// warmPool 激活一个调度池（首次激活会新增 2 个槽位），并通过该池某个槽位上的
-// 一次探测请求建立它的第一个连接。与 Open 一样，pick 必须在调度器读锁下执行。
-// 无法确认连接的探测会以 errProbeNotConfirmed 报告，并包裹池名，以便调用方
-// 知道哪个流量类别仍然处于冷状态。
-func (t *http2Transport) warmPool(ctx context.Context, highPriority bool) error {
-	t.sched.grow(highPriority)
-	t.sched.mu.RLock()
-	slot := t.sched.pick(highPriority)
-	t.sched.mu.RUnlock()
-
-	poolName := "bulk"
-	if highPriority {
-		poolName = "priority"
-	}
-
-	if _, verdict := t.lifecycle.probeFunc(ctx, slot); verdict == probeInconclusive {
-		// 探测未能确认连接：拨号/TLS 失败（池保持冷状态）或服务端返回了
-		// 临时性拒绝。无论哪种情况，都是尽力而为：报告并让调用方决定。
-		return fmt.Errorf("warm up %s pool: %w", poolName, errProbeNotConfirmed)
-	}
-	return nil
-}
-
 // protoOfEndpoint 把代理端点路径映射为简短协议名，用于增长事件日志；
 // 未知路径原样返回。
 func protoOfEndpoint(endpoint string) string {
@@ -498,7 +453,7 @@ func (t *http2Transport) Stats() transport.TransportStats {
 // slotStatus 根据槽位的健康标记以及当前承载的流数量推导其连接状态。
 // 多个标记用 "+" 连接，以免隐藏任何状态（跨越连接生命周期的重下载既是
 // heavy 又是 expiring）。无标记且承载至少一条流的槽位是 "active"；
-// 无标记且无流的槽位是空闲的预热连接，渲染为 "idle"，这样满是连接槽位
+// 无标记且无流的槽位是空闲连接，渲染为 "idle"，这样满是连接槽位
 // 但流很少的池不会被误认为是活跃流量。
 func slotStatus(s *transportSlot, active int) string {
 	var parts []string
@@ -522,7 +477,7 @@ func slotStatus(s *transportSlot, active int) string {
 
 // slotStatusString 把一个池的活跃槽位渲染为 "<index>:<active streams>:<status>"，
 // 外面包上括号，例如 "[0:3:degraded, 1:2:expiring, 2:1:active, 3:1:heavy]"。
-// 无流承载的健康槽位渲染为 "0:idle"（预热连接），这样因突发流量而扩大的池
+// 无流承载的健康槽位渲染为 "0:idle"（空闲连接），这样因突发流量而扩大的池
 // 与真正的活跃流量可以区分。条目按稳定的槽位身份排序（retire 的交换删除会
 // 打乱活跃顺序），然后从 0 重新编号，因此渲染出的索引始终连续、无跳号。
 // 活跃集合为空时渲染为 "[]"。live 必须是调用方在调度器锁下快照的池

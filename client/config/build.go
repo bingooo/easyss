@@ -50,9 +50,8 @@ func BuildSimpleConfig(s *sharedconfig.SimpleConfig) (*ClientConfig, error) {
 			ProxyFile:  s.ProxyFile,
 		},
 		Transport: TransportConfig{
-			Protocol:      proto,
-			ConnCountMax:  sharedconfig.DefaultConnCountMax,
-			DisableWarmUp: s.DisableWarmUp,
+			Protocol:     proto,
+			ConnCountMax: sharedconfig.DefaultConnCountMax,
 		},
 		Shaper: ShaperConfig{
 			BatchWindowMS: sharedconfig.DefaultBatchWindowMS,
@@ -77,9 +76,6 @@ func BuildSimpleConfig(s *sharedconfig.SimpleConfig) (*ClientConfig, error) {
 	}
 	if cfg.Servers[0].Method == "" {
 		cfg.Servers[0].Method = sharedconfig.DefaultMethod
-	}
-	if cfg.Timeout <= 0 {
-		cfg.Timeout = sharedconfig.DefaultTimeout
 	}
 	if cfg.Log.Level == "" {
 		cfg.Log.Level = sharedconfig.DefaultLogLevel
@@ -142,7 +138,8 @@ func ApplySimpleOverrides(cfg *ClientConfig, s *sharedconfig.SimpleConfig) {
 		cfg.Routing.ProxyFile = s.ProxyFile
 	}
 	if s.Timeout > 0 {
-		cfg.Timeout = s.Timeout
+		// 命令行/简单模式覆盖同样要过归一化：它是全部派生超时的唯一旋钮。
+		cfg.Timeout = sharedconfig.NormalizeTimeout(s.Timeout)
 	}
 	if s.LogLevel != "" {
 		cfg.Log.Level = s.LogLevel
@@ -152,9 +149,6 @@ func ApplySimpleOverrides(cfg *ClientConfig, s *sharedconfig.SimpleConfig) {
 	}
 	if s.DisableSysProxy {
 		cfg.Local.DisableSysProxy = true
-	}
-	if s.DisableWarmUp {
-		cfg.Transport.DisableWarmUp = true
 	}
 	if s.EnableForwardDNS {
 		cfg.Local.EnableForwardDNS = true

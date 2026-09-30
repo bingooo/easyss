@@ -57,11 +57,10 @@ func main() {
 	flag.StringVar(&sc.ProxyRule, "proxy-rule", "", "proxy rule (auto, reverse_auto, proxy, direct, auto_block)")
 	flag.StringVar(&cmdOutboundProto, "outbound-proto", "", "outbound protocol (native, h2)")
 	flag.IntVar(&sc.LocalPort, "l", 0, "local socks5 port")
-	flag.IntVar(&sc.Timeout, "t", 0, "timeout in seconds")
+	flag.IntVar(&sc.Timeout, "t", 0, "timeout in seconds (clamped to 15-60, the base of all derived timeouts)")
 	flag.StringVar(&sc.LogLevel, "log-level", "", "log level (debug, info, warn, error)")
 	flag.StringVar(&logFile, "log-file", "", "log file path")
 	flag.BoolVar(&sc.EnableQUIC, "enable-quic", false, "enable QUIC protocol")
-	flag.BoolVar(&sc.DisableWarmUp, "disable-warmup", false, "disable the background warm-up of the transport connection pools")
 	flag.StringVar(&sc.SN, "sn", "", "TLS SNI override")
 	flag.StringVar(&configFile, "c", "config.json", "specify config file")
 	flag.BoolVar(&daemon, "daemon", runtime.GOOS != "windows", "run app as daemon")
@@ -87,7 +86,8 @@ func main() {
 子命令:
   selfupdate    从 GitHub 检查最新 release，并原地替换当前二进制（不自动重启）。
                 更新完成后请手动重启进程使新版本生效。支持 --check（仅检查）、
-                --proxy-port（走本地代理下载）。
+                --version <tag>（安装指定版本，可重装当前版本或回退，tag 需与
+                release tag 完全一致）、--proxy-port（走本地代理下载）。
   tun-helper    内部子命令：打开 TUN 设备、配置路由/DNS 并把 fd 传回主进程，
                 由主程序在提权场景下自动拉起，请勿手动使用。支持
                 --tun-http-addr/--tun-fd-socket/--log-file/--log-level。
@@ -187,6 +187,7 @@ Flags:
 		"proxy_rule", cfg.Routing.ProxyRule,
 		"ipv6_rule", cfg.Routing.IPV6Rule,
 		"timeout", cfg.Timeout,
+		"conn_lifetime", cfg.ConnLifetimeDuration(),
 		"direct_file", cfg.Routing.DirectFile,
 		"proxy_file", cfg.Routing.ProxyFile,
 	)
@@ -222,6 +223,12 @@ type App struct {
 	// 而且 Start 失败时会保持未设置：关闭 nil channel 会 panic。
 	statsMu     sync.Mutex
 	statsCloser chan struct{}
+
+	// stopOnce 使 Stop 幂等。托盘的关闭流程与更新重启路径会各自调用一次
+	// （见 TrayApp.closeService / restartService），若重复执行就会把同一个
+	// 核心与 pprof 服务器关两次。App 在 restartService 中被整体重建
+	// （*a.App = App{...}），once 随之重置，正是所需语义。
+	stopOnce sync.Once
 }
 
 // coreGen 为每次 App.Start 启动的核心分配单调递增的序号，供后台 goroutine
@@ -455,17 +462,56 @@ func (a *App) setStartupWarn(err error) {
 	log.Warn("[EASYSS-V3] startup warning", "err", err)
 }
 
+// Stop 停止核心、TUN 引擎与 pprof 服务器。顺序是硬约束：TUN 依赖核心的本地
+// 代理入口，必须先停。它幂等，并且在停止后清空持有者字段——否则后续的
+// closeService/restartService 会再次 Stop 同一个已停止的对象。
 func (a *App) Stop() {
-	a.stopStatsLoop()
+	a.stopOnce.Do(func() {
+		a.stopStatsLoop()
 
-	if a.tunMgr != nil {
-		a.tunMgr.Stop()
+		if a.tunMgr != nil {
+			a.tunMgr.Stop()
+			a.tunMgr = nil
+		}
+		if a.core != nil {
+			a.core.Stop()
+			a.core = nil
+		}
+		if a.pprofSrv != nil {
+			pprof.StopPprof(a.pprofSrv)
+			a.pprofSrv = nil
+		}
+	})
+}
+
+// setupSysProxy 按配置把系统代理指向本地 HTTP 代理（见 setSysProxy）。
+// 返回 true 表示系统代理已被改动，调用方在退出前必须用 teardownSysProxy 撤销它。
+//
+// 配置禁用（disable_sys_proxy）或本地 HTTP 端口无效时它什么都不做；设置失败
+// 也只记一条警告：用户仍可手动配置代理，启动不应因此失败——这条降级逻辑
+// 对 Linux 上的 root/systemd 场景尤其重要，那里 gsettings 与用户会话总线
+// 常常不可达（托盘、--disable-tray 与 headless 三条启动路径共用本函数，
+// 避免对 disable_sys_proxy 的处理分叉）。
+func (a *App) setupSysProxy() bool {
+	if a.cfg.Local.DisableSysProxy || a.cfg.Local.HTTPPort <= 0 {
+		return false
 	}
-	if a.core != nil {
-		a.core.Stop()
+	if err := sysProxyApply(a.cfg.Local.HTTPPort); err != nil {
+		log.Warn("[EASYSS-V3] set system proxy failed, you may need to configure it manually", "err", err)
+		return false
 	}
-	if a.pprofSrv != nil {
-		pprof.StopPprof(a.pprofSrv)
+	return true
+}
+
+// teardownSysProxy 撤销 setupSysProxy 的改动；applied 为 false 时是空操作。
+// 是否应用由调用方传入而不是用 defer 表达，因为无托盘的启动路径最后用
+// os.Exit 退出，defer 不会执行。
+func teardownSysProxy(applied bool) {
+	if !applied {
+		return
+	}
+	if err := sysProxyRevert(); err != nil {
+		log.Warn("[EASYSS-V3] unset system proxy failed, you may need to restore it manually", "err", err)
 	}
 }
 
@@ -629,9 +675,7 @@ func exampleV3Config() string {
 			ConnCountMax:      sharedconfig.DefaultConnCountMax,
 			StreamThreshold:   sharedconfig.DefaultStreamThreshold,
 			PrioritySlotRatio: sharedconfig.DefaultPrioritySlotRatio,
-			ConnLifetimeSec:   sharedconfig.DefaultConnLifetimeSec,
 			ConnMaxBytes:      sharedconfig.DefaultConnMaxBytes,
-			DisableWarmUp:     false,
 		},
 		Shaper: config.ShaperConfig{
 			BatchWindowMS:    sharedconfig.DefaultBatchWindowMS,
@@ -661,7 +705,6 @@ func exampleSimpleConfig() string {
 		ProxyRule:     sharedconfig.DefaultProxyRule,
 		Timeout:       sharedconfig.DefaultTimeout,
 		BindAll:       false,
-		DisableWarmUp: false,
 		OutboundProto: "native",
 		DirectFile:    "",
 		ProxyFile:     "",
