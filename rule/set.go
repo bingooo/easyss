@@ -217,6 +217,26 @@ func (s *Set) AddDomain(domain string) bool {
 	return s.addDomainLocked(key)
 }
 
+func (s *Set) AddCIDR(cidr string) bool {
+	if s == nil {
+		return false
+	}
+	_, ipnet, err := net.ParseCIDR(cidr)
+	if err != nil || ipnet == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, existing := range s.cidrs {
+		if existing.String() == ipnet.String() {
+			return false
+		}
+	}
+	s.cidrs = append(s.cidrs, ipnet)
+	s.counts[KindCIDR]++
+	return true
+}
+
 func (s *Set) addIPLocked(key string) bool {
 	if s.ips == nil {
 		s.ips = make(map[string]struct{})

@@ -14,6 +14,7 @@ import (
 
 	utls "github.com/refraction-networking/utls"
 
+	"github.com/nange/easyss/v3/client/tsnet"
 	"github.com/nange/easyss/v3/config"
 	"github.com/nange/easyss/v3/log"
 	"github.com/nange/easyss/v3/shaper"
@@ -117,6 +118,7 @@ type ClientConfig struct {
 	Transport     TransportConfig  `json:"transport"`
 	Shaper        shaper.Config    `json:"shaper"`
 	Log           log.Config       `json:"log"`
+	Tsnet         tsnet.Config     `json:"tsnet"`
 	Timeout       int              `json:"timeout"`
 	AuthUsername  string           `json:"auth_username"`
 	AuthPassword  string           `json:"auth_password"`
@@ -310,6 +312,9 @@ func (c *ClientConfig) ResolveFilePaths() {
 func (c *ClientConfig) Clone() *ClientConfig {
 	clone := *c
 	clone.Local.TunConfig = bytes.Clone(c.Local.TunConfig)
+	if c.Tsnet.ExtraSubnets != nil {
+		clone.Tsnet.ExtraSubnets = append([]string(nil), c.Tsnet.ExtraSubnets...)
+	}
 	if c.Servers != nil {
 		clone.Servers = make([]*ServerProfile, len(c.Servers))
 		for i, srv := range c.Servers {

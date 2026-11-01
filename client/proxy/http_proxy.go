@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/nange/easyss/v3/client/router"
+	"github.com/nange/easyss/v3/client/tsnet"
 	"github.com/nange/easyss/v3/config"
 	"github.com/nange/easyss/v3/log"
 	"github.com/nange/easyss/v3/protocol"
@@ -186,9 +187,15 @@ func (s *HTTPProxyServer) Serve(listener net.Listener) error {
 }
 
 func (s *HTTPProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// 控制端点（/tun、/stats）即使代理监听所有接口也只从本机可达。
-	if r.URL.Host == "" && (r.URL.Path == "/tun" || r.URL.Path == "/stats") && !isLoopbackRequest(r) {
+	// 控制端点（/tun、/stats、/tsnet）即使代理监听所有接口也只从本机可达。
+	if r.URL.Host == "" && (r.URL.Path == "/tun" || r.URL.Path == "/stats" || r.URL.Path == "/tsnet") && !isLoopbackRequest(r) {
 		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
+
+	// Serve /tsnet for direct requests to the proxy (Tailscale status).
+	if r.URL.Host == "" && r.URL.Path == "/tsnet" {
+		s.serveTsnetStatus(w)
 		return
 	}
 
@@ -235,6 +242,14 @@ func (s *HTTPProxyServer) serveStats(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(snap); err != nil {
 		log.Warn("[HTTP-PROXY] encode stats", "err", err)
+	}
+}
+
+func (s *HTTPProxyServer) serveTsnetStatus(w http.ResponseWriter) {
+	status := tsnet.Status()
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	if _, err := w.Write([]byte(status)); err != nil {
+		log.Warn("[HTTP-PROXY] write tsnet status", "err", err)
 	}
 }
 

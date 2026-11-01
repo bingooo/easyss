@@ -285,6 +285,12 @@ func (r *Router) AddDirectIP(ip string) {
 	}
 }
 
+func (r *Router) AddDirectCIDR(cidr string) {
+	if r.customDirect.AddCIDR(cidr) {
+		r.ruleGeneration.Add(1)
+	}
+}
+
 func (r *Router) AddProxyIP(ip string) {
 	if r.customProxy.AddIP(ip) {
 		r.ruleGeneration.Add(1)

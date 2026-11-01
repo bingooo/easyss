@@ -16,6 +16,7 @@ import (
 	clientconfig "github.com/nange/easyss/v3/client/config"
 	"github.com/nange/easyss/v3/client/dns"
 	"github.com/nange/easyss/v3/client/router"
+	"github.com/nange/easyss/v3/client/tsnet"
 	"github.com/nange/easyss/v3/config"
 	"github.com/nange/easyss/v3/crypto"
 	"github.com/nange/easyss/v3/log"
@@ -283,6 +284,13 @@ func New(cfg *clientconfig.ClientConfig) (*Client, error) {
 
 	tlsCfg := cfg.UTLSConfig()
 
+	if cfg.Tsnet.Enable {
+		tsnet.Configure(cfg.Tsnet)
+		if err := tsnet.Start(rt); err != nil {
+			log.Error("[CLIENT] start tsnet failed", "err", err)
+		}
+	}
+
 	serverDomain := cfg.DefaultServer().Host
 	if util.IsIP(serverDomain) {
 		serverDomain = ""
@@ -337,6 +345,10 @@ func New(cfg *clientconfig.ClientConfig) (*Client, error) {
 
 // 有预解析地址时优先拨字面 IP（DNS pinning），TLS 校验仍用原域名；TUN 模式走绑定接口的拨号器。
 func (c *Client) dialWithConfig(ctx context.Context, network, addr string) (net.Conn, error) {
+	if tsnet.IsEnabled() && tsnet.IsTailscaleTarget(addr) {
+		return tsnet.DialContext(ctx, network, addr)
+	}
+
 	if c.router.ShouldIPV6Disable() {
 		switch network {
 		case "tcp":
@@ -697,6 +709,7 @@ func (c *Client) Close() error {
 	if c.closed.Swap(true) {
 		return nil
 	}
+	_ = tsnet.Close()
 	return c.transport.Close()
 }
 
