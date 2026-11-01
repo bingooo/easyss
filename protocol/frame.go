@@ -81,9 +81,29 @@ func (m Method) String() string {
 }
 
 const (
-	MaxUDPDataSize     = 65507
-	MaxPlainRecordSize = 64 * 1024
-	MaxCipherLenSize   = 3
+	// UDPPoolClassSize 是 UDP 数据报链路承诺使用的 bytespool 档位，也是 MaxUDPDataSize 的来源。
+	// 导出是为了让 crypto 的测试对着它断言。
+	UDPPoolClassSize = 16 * 1024
+
+	// MaxReadRecordPlaintext 是解码侧接受的明文上限，留 64KB 是为了继续接受对端发来的大记录。
+	MaxReadRecordPlaintext = 64 * 1024
+
+	MaxCipherLenSize = 3
+
+	// MaxTagOverhead 是两种 AEAD 认证标签的上界。它是常量而非读 Encryptor.Overhead()，
+	// 因为 protocol 是格式定义方、不应依赖 crypto；标签变长时这里必须同步上调。
+	MaxTagOverhead = 16
+
+	// MaxWriteRecordPlaintext 由解码侧上限减去长度前缀与 AEAD 标签反推：65,517 + 3 + 16 = 64KB。
+	// crypto.RecordWriter 与 shaper 必须共用它，否则整形器能攒出 WriteRecord 拒绝的明文。
+	MaxWriteRecordPlaintext = MaxReadRecordPlaintext - MaxCipherLenSize - MaxTagOverhead // 65,517
+
+	// MaxUDPDataSize 是单个 UDP 数据报的载荷上限与 UDP 读缓冲容量：socket 读缓冲 P、整形器明文
+	// 缓冲 P+3、记录密文缓冲 P+3+16 必须落在同一档，由密文缓冲解出 P+19 <= 16KB。
+	MaxUDPDataSize = UDPPoolClassSize - MaxCipherLenSize - MaxTagOverhead - FrameHeaderSize // 16,362
+
+	// MinRecordBufferSize 是每条流明文缓冲区的初始大小，缓冲按需增长，空闲流终生只占这么多。
+	MinRecordBufferSize = 4 * 1024
 )
 
 type Handshake struct {
@@ -142,9 +162,8 @@ func (f Frame) EncodedLen() int {
 	return FrameHeaderSize + int(f.Length)
 }
 
-// DecodeFrame 从 data 头部解码一个帧。它是记录层的非流式对应物：解密的
-// CryptoRecord 在内存中切分，因此不涉及 io.Reader。返回帧、其占用的字节数
-// 以及错误。帧的 payload 别名自 data，其生命周期由调用方负责。
+// DecodeFrame 从 data 头部解码一个帧，返回帧与它占用的字节数。
+// 帧的 payload 别名自 data，生命周期由调用方负责。
 func DecodeFrame(data []byte) (Frame, int, error) {
 	if len(data) < FrameHeaderSize {
 		return Frame{}, 0, io.ErrUnexpectedEOF
@@ -163,15 +182,13 @@ func DecodeFrame(data []byte) (Frame, int, error) {
 	return f, encoded, nil
 }
 
-// NewFrame 构建给定类型的帧，并复制 payload，使调用方可以复用其缓冲区
-// （shaper 交出的是 bytespool 缓冲区）。Length 始终由 payload 推导，
-// 因此线上的头部永远不可能与随后写入的字节不一致。
+// NewFrame 构建帧并复制 payload，使调用方可以复用其缓冲区。
 func NewFrame(typ FrameType, payload []byte) Frame {
 	return NewFrameWithPayload(typ, append([]byte(nil), payload...))
 }
 
-// NewFrameWithPayload 包装现有 payload 缓冲区而不复制，供持有池化缓冲区
-// （cover 流量）的调用方使用：必须原样交给 shaper，以便归还池中。
+// NewFrameWithPayload 包装现有 payload 而不复制，供持有池化缓冲区的调用方（cover 流量）使用：
+// 必须原样交给 shaper，以便归还池中。
 func NewFrameWithPayload(typ FrameType, payload []byte) Frame {
 	checkPayloadLen(payload)
 	return Frame{
@@ -181,8 +198,7 @@ func NewFrameWithPayload(typ FrameType, payload []byte) Frame {
 	}
 }
 
-// NewZeroFrame 构建给定类型的帧，payload 为 length 字节的零值缓冲区，
-// 供随后再填充缓冲区的调用方使用（padding）。
+// NewZeroFrame 构建 payload 为 length 字节零值的帧，供随后再填充的调用方（padding）使用。
 func NewZeroFrame(typ FrameType, length uint16) Frame {
 	return Frame{
 		Type:    typ,
@@ -221,10 +237,8 @@ func checkPayloadLen(payload []byte) {
 	}
 }
 
-// AppendFrame 把单个帧（头部 + payload）追加到 buf，不重置已有内容。
-// 这是唯一的帧编码路径：头部由 len(f.Payload) 推导而非 f.Length，
-// 因此两个字段不一致的 Frame（例如刚从线上解码出来的）永远不会产生
-// 损坏的记录。
+// AppendFrame 是唯一的帧编码路径：头部由 len(f.Payload) 推导而非 f.Length，
+// 因此两个字段不一致的 Frame（例如刚从线上解码出来的）不会产生损坏的记录。
 func AppendFrame(buf []byte, f Frame) []byte {
 	var header [FrameHeaderSize]byte
 	header[0] = byte(f.Type)

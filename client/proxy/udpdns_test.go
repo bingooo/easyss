@@ -10,7 +10,9 @@ import (
 	clientconfig "github.com/nange/easyss/v3/client/config"
 	easydns "github.com/nange/easyss/v3/client/dns"
 	"github.com/nange/easyss/v3/client/router"
-	"github.com/txthinking/socks5"
+	"github.com/nange/easyss/v3/config"
+	"github.com/nange/easyss/v3/protocol"
+	"github.com/nange/easyss/v3/transport"
 )
 
 // startUDPDNSResponderAny 启动一个本地 UDP DNS 应答器：无论 qtype 一律回一条 A
@@ -49,31 +51,6 @@ func startUDPDNSResponderAny(t *testing.T, answerIP string) string {
 	return pc.LocalAddr().String()
 }
 
-// buildUDPDatagram 按 SOCKS5 UDP 请求格式组帧：RSV(2) + FRAG(1) + ATYP(1) +
-// 目标地址 + 目标端口 + 数据。
-func buildUDPDatagram(t *testing.T, target string, data []byte) *socks5.Datagram {
-	t.Helper()
-	addr, port, err := net.SplitHostPort(target)
-	if err != nil {
-		t.Fatalf("split target: %v", err)
-	}
-	ip := net.ParseIP(addr).To4()
-	if ip == nil {
-		t.Fatalf("target %q is not an IPv4 address", target)
-	}
-	portNum, err := net.LookupPort("udp", port)
-	if err != nil {
-		t.Fatalf("parse port: %v", err)
-	}
-	raw := []byte{0, 0, 0, socks5.ATYPIPv4, ip[0], ip[1], ip[2], ip[3], byte(portNum >> 8), byte(portNum)}
-	raw = append(raw, data...)
-	d, err := socks5.NewDatagramFromBytes(raw)
-	if err != nil {
-		t.Fatalf("build datagram: %v", err)
-	}
-	return d
-}
-
 // newUDPDNSTestServer 构造一个可用于 UDP DNS 拦截测试的 Socks5Server，并返回一个
 // 同时充当客户端来源地址与 SOCKS5 UDPConn 的 socket（应答会发回查询来源地址，
 // 因此可直接读回断言），以及记录每次直连拨号地址的通道。
@@ -100,13 +77,14 @@ func newUDPDNSTestServer(t *testing.T, rt *router.Router) (*Socks5Server, *net.U
 	})
 	// 拦截器在构造时持有 router 指针：测试直接注入的两个使用方必须同时更新。
 	srv.router, srv.dns.router = rt, rt
+	// 把这个 socket 注册为当前 UDP 中继：应答（sendToClient/responseDNSMsg）会
+	// 经它写回查询的来源地址，因此可以直接从这里读回断言。
+	srv.registerTestUDPRelay(sock, sock.LocalAddr().(*net.UDPAddr))
 	return srv, sock, dialed
 }
 
-// TestHandleUDPInterceptsNonAddressQtype 覆盖 UDP/TCP 判定统一后的行为：MX/TXT/
-// HTTPS 等非 A/AAAA 查询过去会因为 util.IsDNSRequest 只认 A/AAAA 而落入普通 UDP
-// 分流（按目标 IP 直连出网），现在必须同样按查询域名走 DNS 拦截。用例同时验证
-// 直连分支拨的是客户端请求的解析器地址，而不是内置列表。
+// TestHandleUDPInterceptsNonAddressQtype 守住 MX/TXT/HTTPS 等非 A/AAAA 查询同样按查询
+// 域名走 DNS 拦截，而不是落入普通 UDP 分流按目标 IP 直连出网。
 func TestHandleUDPInterceptsNonAddressQtype(t *testing.T) {
 	easydns.ResetResolveState()
 	responder := startUDPDNSResponderAny(t, "1.2.3.4")
@@ -131,14 +109,11 @@ func TestHandleUDPInterceptsNonAddressQtype(t *testing.T) {
 	if err != nil {
 		t.Fatalf("pack query: %v", err)
 	}
-	// 客户端显式请求的解析器就是本地应答器本身：它必须被真正拨到。
-	//
-	// 这里走 handleDNS 而不是 handleUDP：handleUDP 只把 53 端口的数据报交给 DNS
-	// 拦截，而本用例要验证"客户端请求的解析器被真正拨到"，需要应答器监听一个可绑定的
-	// 高位端口（CI 上无法绑定 53）。入口门控本身由
-	// TestHandleUDPDNSInterceptionRequiresPort53 与 TestHandleUDPDropsLinkLocalTargets 覆盖。
+	// 这里走 handleDNS 而不是 handleUDP：handleUDP 只把 53 端口的数据报交给 DNS 拦截，
+	// 而本用例需要应答器监听可绑定的高位端口（CI 上无法绑定 53）。
 	requested := responder
-	if err := srv.handleDNS(&socks5.Server{UDPConn: sock}, clientAddr, buildUDPDatagram(t, requested, data), query); err != nil {
+	frame, _ := buildUDPFrame(t, requested, data)
+	if err := srv.handleDNS(srv.registerTestUDPRelay(sock, clientAddr), frame, query, data, clientAddr, clientAddr.String()); err != nil {
 		t.Fatalf("handleDNS: %v", err)
 	}
 
@@ -150,15 +125,12 @@ func TestHandleUDPInterceptsNonAddressQtype(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read udp reply: %v", err)
 	}
-	reply, err := socks5.NewDatagramFromBytes(buf[:n])
-	if err != nil {
-		t.Fatalf("parse datagram: %v", err)
-	}
-	if got := reply.Address(); got != requested {
-		t.Errorf("reply source = %s, want the client's target %s", got, requested)
+	gotTarget, gotData := parseUDPFrame(t, buf[:n])
+	if gotTarget != requested {
+		t.Errorf("reply source = %s, want the client's target %s", gotTarget, requested)
 	}
 	resp := new(dns.Msg)
-	if err := resp.Unpack(reply.Data); err != nil {
+	if err := resp.Unpack(gotData); err != nil {
 		t.Fatalf("unpack reply: %v", err)
 	}
 	if resp.Id != 0x4321 {
@@ -188,4 +160,174 @@ func TestHandleUDPInterceptsNonAddressQtype(t *testing.T) {
 	if !sawRequested {
 		t.Errorf("requested resolver %s was never dialed", requested)
 	}
+}
+
+// newDNSMultiplexTestServer 的 DNSResp 取生产量级而不是短超时：交换空闲回收是独立机制，
+// 短窗口会让"两条查询复用同一个交换"的断言与回收时机赛跑。
+func newDNSMultiplexTestServer(t *testing.T) (*Socks5Server, *mockTransport) {
+	t.Helper()
+	tr := &mockTransport{streams: []transport.Stream{newBlockingStream(), newBlockingStream()}}
+	srv, err := NewSocks5Server(Socks5Options{
+		ListenAddr: "127.0.0.1:0",
+		Handler:    newTestStreamHandler(tr),
+		Method:     protocol.MethodAES256GCM,
+		Timeouts: config.Timeouts{
+			Base:       30 * time.Second,
+			Dial:       10 * time.Second,
+			StreamIdle: 30 * time.Second,
+			DNSResp:    60 * time.Second,
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewSocks5Server: %v", err)
+	}
+	return srv, tr
+}
+
+// newDNSProxyTestServer 建一个只走代理分支的服务与一个客户端源地址：直连列表指向
+// 拨不通的地址，proxy_rule=proxy 把域名都判为走代理。
+func newDNSProxyTestServer(t *testing.T) (*Socks5Server, *mockTransport, *net.UDPAddr) {
+	t.Helper()
+	oldDNS := clientconfig.DirectDNSServers
+	clientconfig.DirectDNSServers = []string{"127.0.0.1:1"}
+	t.Cleanup(func() { clientconfig.DirectDNSServers = oldDNS })
+
+	rt, err := router.New(router.Config{ProxyRule: router.ProxyRuleProxy, IPV6Rule: router.IPV6RuleDisable})
+	if err != nil {
+		t.Fatalf("router.New: %v", err)
+	}
+	srv, tr := newDNSMultiplexTestServer(t)
+	srv.router, srv.dns.router = rt, rt
+
+	sock, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("listen udp socket: %v", err)
+	}
+	t.Cleanup(func() { sock.Close() }) //nolint:errcheck
+	return srv, tr, sock.LocalAddr().(*net.UDPAddr)
+}
+
+// TestProxyDNSQueriesShareOneTunnelExchange 守住同一个 socket、同一个解析器上的查询
+// （键是来源地址 + 上游 + 应答目标，与域名无关）只开一条隧道流——这是服务端"一条会话
+// 里可能看到不同域名"的前提。
+func TestProxyDNSQueriesShareOneTunnelExchange(t *testing.T) {
+	srv, tr, clientAddr := newDNSProxyTestServer(t)
+
+	for _, domain := range []string{"mtalk.google.com", "www.example.com"} {
+		msg := mustUnpackDNS(t, mustPackDNSQuery(t, domain))
+		if err := srv.dns.handleUDPQuery(clientAddr, udpDNSQuery{
+			raw:   mustPackDNSQuery(t, domain),
+			msg:   msg,
+			src:   clientAddr.String(),
+			dst:   clientconfig.ProxyDNSServer,
+			reply: udpReply{msg: func(*dns.Msg) error { return nil }, raw: func([]byte) {}},
+		}); err != nil {
+			t.Fatalf("handleUDPQuery(%s): %v", domain, err)
+		}
+	}
+
+	tr.mu.Lock()
+	opens := tr.openCount
+	tr.mu.Unlock()
+	if opens != 1 {
+		t.Fatalf("transport opens = %d, want 1 (both domains must share one tunnel stream)", opens)
+	}
+	key := dnsExchangeKey(clientAddr, clientconfig.ProxyDNSServer)
+	if _, ok := srv.udp.exchangeFor(key); !ok {
+		t.Fatalf("the shared exchange must be registered under %q", key)
+	}
+}
+
+// TestProxyDNSDifferentResolversUseSeparateExchanges 固定交换键含应答目标：同一源端口
+// 向两个解析器查询时若共用交换，第二条的应答会被封成第一条的目标并被 tun2socks 丢弃。
+func TestProxyDNSDifferentResolversUseSeparateExchanges(t *testing.T) {
+	srv, tr, clientAddr := newDNSProxyTestServer(t)
+
+	queries := []struct{ domain, dst string }{
+		{"one.example.com", clientconfig.ProxyDNSServer},
+		{"two.example.com", "223.5.5.5:53"},
+	}
+	for _, q := range queries {
+		msg := mustUnpackDNS(t, mustPackDNSQuery(t, q.domain))
+		if err := srv.dns.handleUDPQuery(clientAddr, udpDNSQuery{
+			raw:   mustPackDNSQuery(t, q.domain),
+			msg:   msg,
+			src:   clientAddr.String(),
+			dst:   q.dst,
+			reply: udpReply{msg: func(*dns.Msg) error { return nil }, raw: func([]byte) {}},
+		}); err != nil {
+			t.Fatalf("handleUDPQuery(%s): %v", q.domain, err)
+		}
+	}
+
+	tr.mu.Lock()
+	opens := tr.openCount
+	tr.mu.Unlock()
+	if opens != len(queries) {
+		t.Fatalf("transport opens = %d, want %d (one exchange per resolver)", opens, len(queries))
+	}
+	for _, q := range queries {
+		key := dnsExchangeKey(clientAddr, q.dst)
+		if _, ok := srv.udp.exchangeFor(key); !ok {
+			t.Errorf("missing exchange for resolver %s", q.dst)
+		}
+	}
+}
+
+// TestDirectClassifiedQueryOpensNoTunnelExchange 补全上面那条的另一半：被判定为
+// **直连**的域名根本不建立隧道交换（它在本地解析），因此服务端会话里出现的每个
+// 域名都属于"走代理"这一支——服务端无法从客户端行为预判它的 next_proxy 规则会不会命中。
+func TestDirectClassifiedQueryOpensNoTunnelExchange(t *testing.T) {
+	rt, err := router.New(router.Config{ProxyRule: router.ProxyRuleAuto, IPV6Rule: router.IPV6RuleDisable})
+	if err != nil {
+		t.Fatalf("router.New: %v", err)
+	}
+	rt.AddDirectDomain("direct.example.com")
+
+	srv, tr := newDNSMultiplexTestServer(t)
+	srv.router, srv.dns.router = rt, rt
+
+	sock, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("listen udp socket: %v", err)
+	}
+	t.Cleanup(func() { sock.Close() }) //nolint:errcheck
+
+	// 直连解析在这一步真的去拨解析器（测试环境必然失败），但它绝不该打开隧道流。
+	query := mustPackDNSQuery(t, "direct.example.com")
+	_ = srv.dns.handleUDPQuery(sock.LocalAddr().(*net.UDPAddr), udpDNSQuery{
+		raw:   query,
+		msg:   mustUnpackDNS(t, query),
+		src:   sock.LocalAddr().String(),
+		dst:   clientconfig.ProxyDNSServer,
+		reply: udpReply{msg: func(*dns.Msg) error { return nil }, raw: func([]byte) {}},
+	})
+
+	tr.mu.Lock()
+	opens := tr.openCount
+	tr.mu.Unlock()
+	if opens != 0 {
+		t.Fatalf("transport opens = %d, want 0 (a direct-classified domain must not open a tunnel stream)", opens)
+	}
+}
+
+// mustPackDNSQuery / mustUnpackDNS 是这两条用例的小工具。
+func mustPackDNSQuery(t *testing.T, domain string) []byte {
+	t.Helper()
+	q := new(dns.Msg)
+	q.SetQuestion(dns.Fqdn(domain), dns.TypeA)
+	raw, err := q.Pack()
+	if err != nil {
+		t.Fatalf("pack query: %v", err)
+	}
+	return raw
+}
+
+func mustUnpackDNS(t *testing.T, raw []byte) *dns.Msg {
+	t.Helper()
+	m := new(dns.Msg)
+	if err := m.Unpack(raw); err != nil {
+		t.Fatalf("unpack query: %v", err)
+	}
+	return m
 }

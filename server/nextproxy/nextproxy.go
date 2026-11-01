@@ -5,15 +5,14 @@ import (
 	"fmt"
 	"net"
 	"net/url"
-	"regexp"
-	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/nange/easyss/v3/config"
 	"github.com/nange/easyss/v3/log"
-	"github.com/nange/easyss/v3/util"
-	"github.com/txthinking/socks5"
+	"github.com/nange/easyss/v3/rule"
+	xproxy "golang.org/x/net/proxy"
 )
 
 type NextProxy struct {
@@ -21,48 +20,16 @@ type NextProxy struct {
 	enableUDP   bool
 	allHost     bool
 	dialTimeout time.Duration
-	// dialer allows pluggable dialing backends (e.g. tsnet). If nil, use SOCKS5.
-	dialer func(ctx context.Context, network, addr string) (net.Conn, error)
 
-	mu             sync.RWMutex
-	ips            map[string]struct{}
-	cidrIPs        []*net.IPNet
-	domains        map[string]struct{}
-	domainPatterns []*regexp.Regexp
+	// rules 同时承载文件配置与 DNS 学到的条目。用 atomic.Pointer：LoadProxyFile 整体替换集合，
+	// 而 ShouldProxy/AddIP/AddDomain 可能在任意 goroutine 上读它。
+	rules atomic.Pointer[rule.Set]
 
-	// learnedIPs/learnedDomains 只统计由 AddIP/AddDomain 添加的条目。
-	// 上面的 map 中还包含文件配置的条目，因此不能用 len(ips)/len(domains)
-	// 作为学习预算：否则一个较大的代理配置文件会禁用动态学习。
+	// learnedMu 保护下面两个学习计数："是否新增"与"预算是否还有"必须在同一个临界区，
+	// 否则并发学习会一起越过上限。
+	learnedMu      sync.Mutex
 	learnedIPs     int
 	learnedDomains int
-}
-
-var (
-	tsnetRegistryMu sync.Mutex
-	tsnetRegistry   []*NextProxy
-)
-
-func registerTSNETProxy(np *NextProxy) {
-	if np == nil {
-		return
-	}
-	tsnetRegistryMu.Lock()
-	defer tsnetRegistryMu.Unlock()
-	tsnetRegistry = append(tsnetRegistry, np)
-}
-
-// AddCIDR adds a CIDR to the NextProxy's routing list (thread-safe).
-func (np *NextProxy) AddCIDR(cidr string) {
-	if np == nil {
-		return
-	}
-	_, ipnet, err := net.ParseCIDR(cidr)
-	if err != nil || ipnet == nil {
-		return
-	}
-	np.mu.Lock()
-	np.cidrIPs = append(np.cidrIPs, ipnet)
-	np.mu.Unlock()
 }
 
 func New(proxyURL string, enableUDP, allHost bool) (*NextProxy, error) {
@@ -74,15 +41,7 @@ func New(proxyURL string, enableUDP, allHost bool) (*NextProxy, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Support socks5 and tsnet schemes. tsnet backend is provided by
-	// optional implementation files; when not compiled, initTSNET returns
-	// a stub dialer that reports not-compiled.
-	switch u.Scheme {
-	case "socks5":
-		// ok
-	case "tsnet":
-		// ok, handled below
-	default:
+	if u.Scheme != "socks5" {
 		return nil, fmt.Errorf("unsupported next proxy scheme %q", u.Scheme)
 	}
 
@@ -90,21 +49,10 @@ func New(proxyURL string, enableUDP, allHost bool) (*NextProxy, error) {
 		url:       u,
 		enableUDP: enableUDP,
 		allHost:   allHost,
-		ips:       make(map[string]struct{}),
-		domains:   make(map[string]struct{}),
+		// 默认值只有 config.NewTimeouts(0) 一个出口，生产路径随后用 SetDialTimeout 覆盖。
+		dialTimeout: config.NewTimeouts(0).Dial,
 	}
-
-	// Initialize scheme-specific dialer if needed.
-	if u.Scheme == "tsnet" {
-		d, err := initTSNET(u, enableUDP)
-		if err != nil {
-			return nil, err
-		}
-		np.dialer = d
-		// register this instance for discovered-route updates
-		registerTSNETProxy(np)
-	}
-
+	np.rules.Store(rule.New())
 	return np, nil
 }
 
@@ -112,47 +60,24 @@ func (np *NextProxy) LoadProxyFile(proxyFile string) error {
 	if np == nil {
 		return nil
 	}
-
 	if proxyFile == "" {
 		return nil
 	}
 
-	entries, err := util.ReadFileLinesMap(proxyFile)
+	set, parseErrs, err := rule.ParseFile(proxyFile, rule.Options{AllowComments: true})
 	if err != nil {
 		return err
 	}
-
-	np.mu.Lock()
-	defer np.mu.Unlock()
-
-	for k := range entries {
-		if strings.HasPrefix(k, "regexp:") {
-			re, err := regexp.Compile(k[7:])
-			if err == nil {
-				np.domainPatterns = append(np.domainPatterns, re)
-			}
-			continue
-		}
-		if strings.Contains(k, "*") {
-			re, err := util.GlobToRegexp(k)
-			if err == nil {
-				np.domainPatterns = append(np.domainPatterns, re)
-			}
-			continue
-		}
-		_, ipnet, err2 := net.ParseCIDR(k)
-		if err2 == nil && ipnet != nil {
-			np.cidrIPs = append(np.cidrIPs, ipnet)
-			continue
-		}
-		if util.IsIP(k) {
-			np.ips[k] = struct{}{}
-			continue
-		}
-		np.domains[k] = struct{}{}
+	// 规则文件写错的行在服务端是致命的：上游代理列表一旦缺项，"本该走代理的域名悄悄直连出网"
+	// 就是静默的流量泄漏。
+	if err := rule.FileError(proxyFile, parseErrs); err != nil {
+		return err
 	}
-	log.Info("[NEXTPROXY] loaded proxy file", "file", proxyFile, "total", len(entries), "ips", len(np.ips), "cidrs", len(np.cidrIPs), "domains", len(np.domains), "patterns", len(np.domainPatterns))
+	np.rules.Store(set)
 
+	domains, ips, cidrs, patterns := set.Counts()
+	log.Info("[NEXTPROXY] loaded proxy file", "file", proxyFile,
+		"ips", ips, "cidrs", cidrs, "domains", domains, "patterns", patterns)
 	return nil
 }
 
@@ -160,107 +85,52 @@ func (np *NextProxy) ShouldProxy(host string) bool {
 	if np == nil {
 		return false
 	}
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		host = h
-	}
 	if np.allHost {
 		return true
 	}
-
-	np.mu.RLock()
-	defer np.mu.RUnlock()
-
-	if util.IsIP(host) {
-		if _, ok := np.ips[host]; ok {
-			return true
-		}
-		for _, cidr := range np.cidrIPs {
-			if cidr.Contains(net.ParseIP(host)) {
-				return true
-			}
-		}
-	} else {
-		return np.matchesDomainLocked(host)
-	}
-	return false
+	return np.rules.Load().MatchHost(host)
 }
 
-// IsCustomDomain 检查域名是否在自定义域名列表中，
-// 包括子域名匹配以及 glob/regexp 模式。
 func (np *NextProxy) IsCustomDomain(domain string) bool {
 	if np == nil {
 		return false
 	}
-
-	np.mu.RLock()
-	defer np.mu.RUnlock()
-
-	return np.matchesDomainLocked(domain)
+	return np.rules.Load().HasDomain(domain)
 }
 
-// matchesDomainLocked 报告 host、其任一父域名或任一配置模式是否命中配置的
-// 域名集合。调用方必须持有 np.mu：ShouldProxy 和 IsCustomDomain 是它的
-// 仅有两个调用方，此前各自维护一份相同的遍历逻辑副本。
-func (np *NextProxy) matchesDomainLocked(host string) bool {
-	if _, ok := np.domains[host]; ok {
-		return true
-	}
-	for _, sub := range util.SubDomains(host) {
-		if _, ok := np.domains[sub]; ok {
-			return true
-		}
-	}
-	for _, re := range np.domainPatterns {
-		if re.MatchString(host) {
-			return true
-		}
-	}
-	return false
-}
-
-// maxLearnedEntries 限制动态学习的 IP/域名集合的大小：自定义域名的 DNS 响应
-// 会在每次查询时喂给 AddIP/AddDomain，长期运行在大型 CDN 池（或记录频繁轮换
-// 的域名）之后的服务端若不加限制，这些 map 会无限增长。集合达到上限后学习
-// 停止；配置（文件加载）的条目不受影响。
+// maxLearnedEntries 限制动态学习的条目数：DNS 响应会随每次查询喂给 AddIP/AddDomain，跟在大型
+// CDN 池之后的服务端不加限制就会无限增长。文件配置的条目不受影响。
 const maxLearnedEntries = 4096
 
-// AddIP 向路由列表中添加一个 IP（线程安全）。学习的 IP 会做归一化
-// （IPv4 映射的 IPv6 折叠为 IPv4），以便与 dial 目标中观测到的字面 IP
-// 匹配。超过 maxLearnedEntries 后条目被丢弃，以保持集合有界。
 func (np *NextProxy) AddIP(ip string) {
-	if np == nil {
+	if np == nil || net.ParseIP(ip) == nil {
 		return
 	}
-	if parsed := net.ParseIP(ip); parsed != nil {
-		if ip4 := parsed.To4(); ip4 != nil {
-			ip = ip4.String()
-		} else {
-			ip = parsed.String()
-		}
+	np.learnedMu.Lock()
+	defer np.learnedMu.Unlock()
+	if np.learnedIPs >= maxLearnedEntries {
+		return
 	}
-	np.mu.Lock()
-	if _, exists := np.ips[ip]; !exists && np.learnedIPs < maxLearnedEntries {
-		np.ips[ip] = struct{}{}
+	if np.rules.Load().AddIP(ip) {
 		np.learnedIPs++
 	}
-	np.mu.Unlock()
 }
 
-// AddDomain 向路由列表中添加一个域名（线程安全）。超过 maxLearnedEntries
-// 后条目被丢弃，以保持集合有界。
 func (np *NextProxy) AddDomain(domain string) {
 	if np == nil {
 		return
 	}
-	np.mu.Lock()
-	if _, exists := np.domains[domain]; !exists && np.learnedDomains < maxLearnedEntries {
-		np.domains[domain] = struct{}{}
+	np.learnedMu.Lock()
+	defer np.learnedMu.Unlock()
+	if np.learnedDomains >= maxLearnedEntries {
+		return
+	}
+	if np.rules.Load().AddDomain(domain) {
 		np.learnedDomains++
 	}
-	np.mu.Unlock()
 }
 
-// SetDialTimeout 设置拨号连接 SOCKS5 代理的超时时间。
+// SetDialTimeout 是拨号超时的唯一入口，New 已用默认派生值播种，拨号路径不再判断零值。
 func (np *NextProxy) SetDialTimeout(d time.Duration) {
 	if np == nil {
 		return
@@ -269,82 +139,107 @@ func (np *NextProxy) SetDialTimeout(d time.Duration) {
 }
 
 func (np *NextProxy) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
-	if np == nil {
-		return nil, fmt.Errorf("nextproxy nil")
-	}
-	if np.dialer != nil {
-		return np.dialer(ctx, network, addr)
-	}
 	return np.dialSOCKS5Context(ctx, network, addr)
 }
 
+// dialSOCKS5Context 的 "tcp" 走 CONNECT（由 x/net/proxy 实现），"udp" 走 UDP ASSOCIATE
+// （见 udpAssociateConn）。
 func (np *NextProxy) dialSOCKS5Context(ctx context.Context, network, addr string) (net.Conn, error) {
-	username := ""
-	password := ""
 	if np.url.User != nil {
-		username = np.url.User.Username()
-		password, _ = np.url.User.Password()
 		log.Info("[NEXTPROXY] connecting via SOCKS5 proxy", "addr", np.url.Host, "network", network, "target", addr)
 	} else {
 		log.Debug("[NEXTPROXY] connecting via SOCKS5 proxy", "addr", np.url.Host, "network", network, "target", addr)
 	}
 
 	dialTimeout := np.dialTimeout
-	if dialTimeout <= 0 {
-		dialTimeout = config.DefaultDialTimeout
-	}
-	dialer := &net.Dialer{Timeout: dialTimeout}
-	socksTimeout := max(int(dialTimeout.Seconds()), 1)
 
-	type result struct {
-		conn net.Conn
-		err  error
+	// ctx 的截止时间优先于 np.dialTimeout：DNS 路径传入 background context，实际生效的
+	// 一直是后者。
+	dialCtx := ctx
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		dialCtx, cancel = context.WithTimeout(ctx, dialTimeout)
+		defer cancel()
 	}
-	ch := make(chan result, 1)
 
-	go func() {
-		c, err := socks5.NewClient(np.url.Host, username, password, socksTimeout, socksTimeout)
+	switch network {
+	case "udp", "udp4", "udp6":
+		conn, err := np.dialUDPAssociate(dialCtx, addr)
 		if err != nil {
-			ch <- result{nil, err}
-			return
+			return nil, fmt.Errorf("socks5 dial %s: %w", addr, err)
 		}
-		c.DialTCP = func(network string, laddr, raddr string) (net.Conn, error) {
-			return dialer.Dial(network, raddr)
-		}
-
-		conn, err := c.Dial(network, addr)
-		if err != nil {
-			ch <- result{nil, err}
-			return
-		}
-
-		// 清除 SOCKS5 协商期间设置的 deadline。socks5 库在 Negotiate() 中为
-		// 握手设置了 SetDeadline(now + TCPTimeout)，但从不清除它，这会导致
-		// 数据传输阶段超过该超时时间后连接超时。
-		_ = conn.SetDeadline(time.Time{})
-
-		ch <- result{conn, nil}
-	}()
-
-	select {
-	case <-ctx.Done():
-		// 排空 dial goroutine，防止连接泄漏。dial goroutine 仍在运行，
-		// 最终会向 ch 发送结果（缓冲区为 1，不会阻塞）。如果拨号成功，
-		// 由于调用方已经放弃，立即关闭该连接。
-		go func() {
-			res := <-ch
-			if res.conn != nil {
-				res.conn.Close() //nolint:errcheck
-			}
-		}()
-		return nil, fmt.Errorf("socks5 dial cancelled: %w", ctx.Err())
-	case res := <-ch:
-		return res.conn, res.err
+		return conn, nil
 	}
+
+	conn, err := np.dialSOCKS5Connect(dialCtx, network, addr, dialTimeout)
+	if err != nil {
+		return nil, fmt.Errorf("socks5 dial %s: %w", addr, err)
+	}
+	return conn, nil
 }
 
-// Host 以 "host:port" 形式返回上游代理地址（nil 接收者时返回 ""）。
-// 调用方只需要它用于拨号和日志，因此不暴露内部的 *url.URL。
+// 认证方法通告与 UDP 路径刻意不同：x/net 有凭据时通告 {无认证，用户名密码}，UDP 路径的库
+// 只通告 {用户名密码}，于是"无需认证但 URL 带凭据"的上游会 TCP 通、UDP 报 unsupported method。
+func (np *NextProxy) dialSOCKS5Connect(ctx context.Context, network, addr string, dialTimeout time.Duration) (net.Conn, error) {
+	dialer := &net.Dialer{Timeout: dialTimeout}
+	forward := socksDialerFunc(func(ctx context.Context, network, address string) (net.Conn, error) {
+		return dialer.DialContext(ctx, network, address)
+	})
+
+	var auth *xproxy.Auth
+	if user, pass, ok := np.credentials(); ok {
+		auth = &xproxy.Auth{User: user, Password: pass}
+	}
+	d, err := xproxy.SOCKS5("tcp", np.url.Host, auth, forward)
+	if err != nil {
+		return nil, fmt.Errorf("create socks5 dialer: %w", err)
+	}
+	cd, ok := d.(xproxy.ContextDialer)
+	if !ok {
+		return nil, fmt.Errorf("socks5 dialer %T does not support context", d)
+	}
+	return cd.DialContext(ctx, network, addr)
+}
+
+func (np *NextProxy) credentials() (user, password string, ok bool) {
+	if np.url == nil || np.url.User == nil {
+		return "", "", false
+	}
+	user = np.url.User.Username()
+	password, _ = np.url.User.Password()
+	if user == "" && password == "" {
+		return "", "", false
+	}
+	return user, password, true
+}
+
+// 返回的 deadline 是调用方在握手/关联成功后必须清除的绝对时间。
+func (np *NextProxy) dialProxyTCP(dialCtx context.Context) (net.Conn, time.Time, error) {
+	conn, err := (&net.Dialer{}).DialContext(dialCtx, "tcp", np.url.Host)
+	if err != nil {
+		return nil, time.Time{}, err
+	}
+	deadline, _ := dialCtx.Deadline()
+	if !deadline.IsZero() {
+		if err := conn.SetDeadline(deadline); err != nil {
+			conn.Close() //nolint:errcheck
+			return nil, time.Time{}, err
+		}
+	}
+	return conn, deadline, nil
+}
+
+// socksDialerFunc 把带 Timeout 的 net.Dialer 适配成 x/net/proxy 的底层拨号函数。
+type socksDialerFunc func(ctx context.Context, network, address string) (net.Conn, error)
+
+func (f socksDialerFunc) Dial(network, address string) (net.Conn, error) {
+	return f(context.Background(), network, address)
+}
+
+func (f socksDialerFunc) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	return f(ctx, network, address)
+}
+
 func (np *NextProxy) Host() string {
 	if np == nil || np.url == nil {
 		return ""

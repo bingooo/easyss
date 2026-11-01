@@ -3,11 +3,16 @@ package dns
 import (
 	"net"
 	"slices"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/miekg/dns"
 )
+
+// alwaysTunActive 让不关心 TUN 前提的用例照常解析；TUN 未生效时的拒答由
+// TestForwardServerRefusesWithoutTun 单独覆盖。
+func alwaysTunActive() bool { return true }
 
 // startTestDNSServer 在随机端口上启动一个本地 UDP DNS 服务器。当 fail 为
 // true 时，它对每个查询都回复 SERVFAIL；否则正常应答 A/AAAA 记录。返回
@@ -50,10 +55,8 @@ func startTestDNSServer(t *testing.T, fail bool) string {
 	return pc.LocalAddr().String()
 }
 
-// startBlackholeDNSServer 在随机端口上启动一个只收不回的 UDP 服务，模拟
-// "黑洞"上游：查询一直不产生应答，客户端只能等到自己的截止时间。被墙的公共
-// DNS、或指向不可达网段的错误配置都是这种形态（区别于 SERVFAIL/RST 那种
-// 立即失败）。返回地址并注册清理函数。
+// startBlackholeDNSServer 模拟"黑洞"上游：只收不回，客户端只能等到自己的截止时间
+// （区别于 SERVFAIL/RST 那种立即失败）。
 func startBlackholeDNSServer(t *testing.T) string {
 	t.Helper()
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
@@ -132,10 +135,8 @@ func startTestDNSHandler(t *testing.T, handler dns.HandlerFunc) string {
 	return pc.LocalAddr().String()
 }
 
-// startCorruptEDNS0DNSServer 复现"OPT 记录被放进 ANSWER 段、真正的记录被挤到
-// ADDITIONAL 段"这一类畸形应答（部分家用路由器/缓存对 EDNS0 查询就是这样应答
-// 的）。严格解析器（dig/BIND）判为畸形报文，宽松解析器（Go 标准库解析器）只
-// 看到一条 41 类型记录、拿不到任何地址，表现为解析失败（见 normalizeEDNS0Answer）。
+// startCorruptEDNS0DNSServer 复现家用路由器常见的畸形 EDNS0 应答：OPT 被放进 ANSWER
+// 段，Go 标准库解析器只看到一条 41 类型记录、拿不到地址，表现为解析失败。
 func startCorruptEDNS0DNSServer(t *testing.T) string {
 	t.Helper()
 	return startTestDNSHandler(t, dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
@@ -173,19 +174,26 @@ func startNODATADNSServer(t *testing.T) string {
 	}))
 }
 
+// startNXDOMAINDNSServer 返回一个对所有查询都回 NXDOMAIN 的健康解析器。
+func startNXDOMAINDNSServer(t *testing.T) string {
+	t.Helper()
+	return startTestDNSHandler(t, dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
+		m := new(dns.Msg)
+		m.SetReply(r)
+		m.Rcode = dns.RcodeNameError
+		_ = w.WriteMsg(m)
+	}))
+}
+
 func TestForwardQueryFallsBackToSystemDNS(t *testing.T) {
 	sysAddr := startTestDNSServer(t, false)
-	old := systemDNSServersFunc
-	systemDNSServersFunc = func() []string {
+	sysServers := systemServersFunc(func() []string {
 		return []string{sysAddr}
-	}
-	t.Cleanup(func() {
-		systemDNSServersFunc = old
-		resetSystemDNSCache()
-		resetBuiltinDNSCircuit()
 	})
+	t.Cleanup(resetBuiltinDNSCircuit)
 
-	fs := NewForwardServer("127.0.0.1:0", false)
+	fs := NewForwardServer("127.0.0.1:0", false, alwaysTunActive)
+	fs.system = sysServers
 	fs.client = &dns.Client{Timeout: 200 * time.Millisecond}
 	// 不可达的本地地址强制走回退路径
 	fs.dnsServers = []string{"127.0.0.1:1"}
@@ -209,17 +217,13 @@ func TestForwardQueryFallsBackToSystemDNS(t *testing.T) {
 }
 
 func TestForwardQueryAllServersUnavailable(t *testing.T) {
-	old := systemDNSServersFunc
-	systemDNSServersFunc = func() []string {
+	sysServers := systemServersFunc(func() []string {
 		return nil
-	}
-	t.Cleanup(func() {
-		systemDNSServersFunc = old
-		resetSystemDNSCache()
-		resetBuiltinDNSCircuit()
 	})
+	t.Cleanup(resetBuiltinDNSCircuit)
 
-	fs := NewForwardServer("127.0.0.1:0", false)
+	fs := NewForwardServer("127.0.0.1:0", false, alwaysTunActive)
+	fs.system = sysServers
 	fs.client = &dns.Client{Timeout: 200 * time.Millisecond}
 	fs.dnsServers = []string{"127.0.0.1:1"}
 
@@ -234,27 +238,207 @@ func TestForwardQueryAllServersUnavailable(t *testing.T) {
 	}
 }
 
-// TestForwardQuerySkipsSelfAsUpstream 验证转发服务器永远不会把自身作为回退
-// 上游。若没有该过滤，回退会递归进自身，堆积 goroutine 和 UDP socket，直到
-// 单次查询超时解开这条链。
-//
-// 构造必须用生产监听地址（":53"）：过滤条件曾经是 listenAddr 的字符串相等，
-// 于是改用通配地址后它永不命中——而 SystemDNSServers 的条目一律是 host:port，
-// 永远不可能等于 ":53"。用 127.0.0.1:53 构造的测试会"通过但空转"，掩盖该回归。
+// TestForwardQueryInvalidatesStaleSystemDNS 守住换 WAN 后的恢复路径：缓存的系统 DNS
+// 整份不可达时必须被作废，否则路由器上整个 LAN 的解析要等 5 分钟缓存过期。
+func TestForwardQueryInvalidatesStaleSystemDNS(t *testing.T) {
+	t.Cleanup(resetBuiltinDNSCircuit)
+
+	liveAddr := startTestDNSServer(t, false)
+	sys := &switchingSystemServers{servers: []string{"127.0.0.1:1"}} // 换网前的旧解析器
+
+	fs := NewForwardServer("127.0.0.1:0", false, alwaysTunActive)
+	fs.system = sys
+	fs.client = &dns.Client{Timeout: 100 * time.Millisecond}
+	fs.dnsServers = []string{"127.0.0.1:1"}
+
+	msg := new(dns.Msg)
+	msg.SetQuestion("example.com.", dns.TypeA)
+	if _, err := fs.forwardQuery(msg); err == nil {
+		t.Fatal("expected the stale system dns to fail")
+	}
+	if sys.invalidated != 1 {
+		t.Fatalf("a fully failed system dns list must be invalidated once, got %d", sys.invalidated)
+	}
+
+	// 作废后重新发现到的列表生效：下一条查询走新地址。
+	sys.servers = []string{liveAddr}
+	reply, err := fs.forwardQuery(msg)
+	if err != nil {
+		t.Fatalf("forwardQuery after invalidation: %v", err)
+	}
+	if len(reply.Answer) != 1 {
+		t.Fatalf("expected 1 answer, got %d", len(reply.Answer))
+	}
+}
+
+type switchingSystemServers struct {
+	servers     []string
+	invalidated int
+}
+
+func (s *switchingSystemServers) Servers() []string { return s.servers }
+
+func (s *switchingSystemServers) Invalidate() { s.invalidated++ }
+
+// TestForwardQueryPassesThroughNXDOMAIN 守住失效判据：健康的解析器回 NXDOMAIN 是正常应答，
+// 不是"整份兜底列表都没答"。判错会让 LAN 里每个不存在的域名都作废一次系统 DNS 缓存，而
+// 作废后要 spawn 一次 ipconfig/networksetup 并持有 systemDNS 的锁。
+func TestForwardQueryPassesThroughNXDOMAIN(t *testing.T) {
+	t.Cleanup(resetBuiltinDNSCircuit)
+	resetBuiltinDNSCircuit()
+
+	sys := &switchingSystemServers{servers: []string{startNXDOMAINDNSServer(t)}}
+	fs := NewForwardServer("127.0.0.1:0", false, alwaysTunActive)
+	fs.system = sys
+	fs.client = &dns.Client{Timeout: 200 * time.Millisecond}
+	fs.dnsServers = []string{"127.0.0.1:1"}
+
+	msg := new(dns.Msg)
+	msg.SetQuestion("nope.example.com.", dns.TypeA)
+	reply, err := fs.forwardQuery(msg)
+	if err != nil {
+		t.Fatalf("forwardQuery: %v, want the NXDOMAIN reply", err)
+	}
+	if reply.Rcode != dns.RcodeNameError {
+		t.Fatalf("rcode = %s, want NXDOMAIN", dns.RcodeToString[reply.Rcode])
+	}
+	if sys.invalidated != 0 {
+		t.Fatalf("a served negative answer must not invalidate the system dns cache, got %d", sys.invalidated)
+	}
+}
+
+// TestForwardQueryInvalidatesOnAllServfail 守住失效判据的另一半：整份列表只回 SERVFAIL 说明
+// 它给不出结果（换 WAN 后旧解析器的典型表现），仍要作废缓存让下一条查询重新发现。
+func TestForwardQueryInvalidatesOnAllServfail(t *testing.T) {
+	t.Cleanup(resetBuiltinDNSCircuit)
+	resetBuiltinDNSCircuit()
+
+	sys := &switchingSystemServers{servers: []string{startTestDNSServer(t, true)}}
+	fs := NewForwardServer("127.0.0.1:0", false, alwaysTunActive)
+	fs.system = sys
+	fs.client = &dns.Client{Timeout: 200 * time.Millisecond}
+	fs.dnsServers = []string{"127.0.0.1:1"}
+
+	msg := new(dns.Msg)
+	msg.SetQuestion("example.com.", dns.TypeA)
+	if _, err := fs.forwardQuery(msg); err == nil {
+		t.Fatal("expected an error when every upstream answers SERVFAIL")
+	}
+	if sys.invalidated != 1 {
+		t.Fatalf("a SERVFAIL-only list must be invalidated once, got %d", sys.invalidated)
+	}
+}
+
+// TestForwardQueryPrefersPositiveAnswerOverNXDOMAIN 守住"否定应答要等正应答"：并行竞速下先到
+// 的 NXDOMAIN 不能把另一台解析器的正确结果挤掉（分域解析里两台服务器结论不同很常见）。
+func TestForwardQueryPrefersPositiveAnswerOverNXDOMAIN(t *testing.T) {
+	t.Cleanup(resetBuiltinDNSCircuit)
+	resetBuiltinDNSCircuit()
+
+	nxAddr := startNXDOMAINDNSServer(t)
+	slowAddr := startSlowTestDNSServer(t, 50*time.Millisecond)
+
+	fs := NewForwardServer("127.0.0.1:0", false, alwaysTunActive)
+	fs.system = systemServersFunc(func() []string { return []string{nxAddr, slowAddr} })
+	fs.client = &dns.Client{Timeout: time.Second}
+	fs.dnsServers = []string{"127.0.0.1:1"}
+
+	msg := new(dns.Msg)
+	msg.SetQuestion("split.example.com.", dns.TypeA)
+	reply, err := fs.forwardQuery(msg)
+	if err != nil {
+		t.Fatalf("forwardQuery: %v", err)
+	}
+	if reply.Rcode != dns.RcodeSuccess || len(reply.Answer) != 1 {
+		t.Fatalf("want the positive answer, got rcode=%s answers=%d",
+			dns.RcodeToString[reply.Rcode], len(reply.Answer))
+	}
+}
+
+// TestForwardServerServesNXDOMAIN 走真实 socket 守住负应答透传：handleDNS 里的 SetReply 会把
+// Rcode 重置成 NOERROR，不在写回前保存，LAN 客户端就会把"域名不存在"当成解析成功。
+func TestForwardServerServesNXDOMAIN(t *testing.T) {
+	t.Cleanup(resetBuiltinDNSCircuit)
+	resetBuiltinDNSCircuit()
+
+	fs := NewForwardServer("127.0.0.1:0", false, alwaysTunActive)
+	fs.system = systemServersFunc(func() []string { return []string{startNXDOMAINDNSServer(t)} })
+	fs.client = &dns.Client{Timeout: 200 * time.Millisecond}
+	fs.dnsServers = []string{"127.0.0.1:1"}
+
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = fs.Serve(pc) }()
+	t.Cleanup(func() { _ = fs.Shutdown() })
+
+	msg := new(dns.Msg)
+	msg.SetQuestion("nope.example.com.", dns.TypeA)
+	reply, _, err := (&dns.Client{Timeout: time.Second}).Exchange(msg, pc.LocalAddr().String())
+	if err != nil {
+		t.Fatalf("exchange: %v", err)
+	}
+	if reply.Rcode != dns.RcodeNameError {
+		t.Fatalf("rcode = %s, want NXDOMAIN", dns.RcodeToString[reply.Rcode])
+	}
+}
+
+// TestForwardServerRefusesWithoutTun 守住 fail-closed：TUN 未生效时上游查询只能从物理网卡
+// 直连解析（DNS 泄漏），必须回 REFUSED，不能降级成直连解析器。
+func TestForwardServerRefusesWithoutTun(t *testing.T) {
+	t.Cleanup(resetBuiltinDNSCircuit)
+
+	upstream := startTestDNSServer(t, false)
+	var tunActive atomic.Bool
+	fs := NewForwardServer("127.0.0.1:0", false, tunActive.Load)
+	fs.client = &dns.Client{Timeout: 200 * time.Millisecond}
+	fs.dnsServers = []string{upstream}
+
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = fs.Serve(pc) }()
+	t.Cleanup(func() { _ = fs.Shutdown() })
+
+	msg := new(dns.Msg)
+	msg.SetQuestion("example.com.", dns.TypeA)
+	reply, _, err := (&dns.Client{Timeout: time.Second}).Exchange(msg, pc.LocalAddr().String())
+	if err != nil {
+		t.Fatalf("exchange: %v", err)
+	}
+	if reply.Rcode != dns.RcodeRefused {
+		t.Fatalf("rcode = %s, want REFUSED while the tun is inactive", dns.RcodeToString[reply.Rcode])
+	}
+	if len(reply.Answer) != 0 {
+		t.Fatalf("a refused query must carry no answer, got %d records", len(reply.Answer))
+	}
+
+	// 判据是每次查询现读运行期状态：TUN 起来后同一条服务器必须恢复解析。
+	tunActive.Store(true)
+	reply, _, err = (&dns.Client{Timeout: time.Second}).Exchange(msg, pc.LocalAddr().String())
+	if err != nil {
+		t.Fatalf("exchange after tun activation: %v", err)
+	}
+	if reply.Rcode != dns.RcodeSuccess || len(reply.Answer) != 1 {
+		t.Fatalf("want the forwarded answer once the tun is active, got rcode=%s answers=%d",
+			dns.RcodeToString[reply.Rcode], len(reply.Answer))
+	}
+}
+
+// TestForwardQuerySkipsSelfAsUpstream 守住自身地址过滤：漏掉它会递归进自身堆积 goroutine
+// 与 socket。必须用生产监听地址 ":53" 构造，用 127.0.0.1:53 的测试会"通过但空转"。
 func TestForwardQuerySkipsSelfAsUpstream(t *testing.T) {
-	old := systemDNSServersFunc
-	systemDNSServersFunc = func() []string {
+	sysServers := systemServersFunc(func() []string {
 		// 路由器上 /etc/resolv.conf 的常见形态：回环（dnsmasq 惯例）与
 		// 本机网卡地址，外加一个不可达的额外服务器。
 		return []string{"127.0.0.1:53", "[::1]:53", localIPv4(t) + ":53", "127.0.0.1:1"}
-	}
-	t.Cleanup(func() {
-		systemDNSServersFunc = old
-		resetSystemDNSCache()
-		resetBuiltinDNSCircuit()
 	})
+	t.Cleanup(resetBuiltinDNSCircuit)
 
-	fs := NewForwardServer(":53", false)
+	fs := NewForwardServer(":53", false, alwaysTunActive)
+	fs.system = sysServers
 	fs.client = &dns.Client{Timeout: 200 * time.Millisecond}
 	fs.dnsServers = []string{"127.0.0.1:1"} // 内置服务器全部不可达
 
@@ -304,6 +488,8 @@ func localIPv4(t *testing.T) string {
 // 非本机地址不是，本机网卡地址只在端口相同时才算自环（另一端口上的本机解析器
 // 并不会打回自己）。
 func TestIsSelfUpstreamAddr(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		name       string
 		addr       string
@@ -340,5 +526,28 @@ func TestIsSelfUpstreamAddr(t *testing.T) {
 	// （只有绑定的那个地址会），但环回仍然会经过通配之外的自身。
 	if !isSelfUpstreamAddr("127.0.0.1:53", "127.0.0.1:53") {
 		t.Error("isSelfUpstreamAddr(127.0.0.1:53, 127.0.0.1:53) = false, want true")
+	}
+}
+
+// TestForwardQuerySharesNoMsgAcrossUpstreams 固定每个并发上游拿到独立的 *dns.Msg：
+// Pack 会写 OPT 的 TTL（SetExtendedRcode），共享同一个 msg 时任一 EDNS0 查询都会
+// 在上游数 >= 2 时触发数据竞争（-race 必红）。
+func TestForwardQuerySharesNoMsgAcrossUpstreams(t *testing.T) {
+	t.Cleanup(resetBuiltinDNSCircuit)
+
+	first := startTestDNSServer(t, false)
+	second := startTestDNSServer(t, false)
+
+	fs := NewForwardServer("127.0.0.1:0", false, alwaysTunActive)
+	fs.dnsServers = []string{first, second}
+	fs.client = &dns.Client{Timeout: time.Second}
+
+	for range 10 {
+		msg := new(dns.Msg)
+		msg.SetQuestion("example.com.", dns.TypeA)
+		msg.SetEdns0(1232, false)
+		if _, err := fs.forwardQuery(msg); err != nil {
+			t.Fatalf("forwardQuery: %v", err)
+		}
 	}
 }

@@ -6,6 +6,8 @@ import (
 	"net/http/httptest"
 	"testing"
 	"time"
+
+	"github.com/nange/easyss/v3/config"
 )
 
 // newTunTestServer 构建一个配置了代理凭据的 HTTPProxyServer，模拟真实部署场景：
@@ -17,7 +19,7 @@ func newTunTestServer(t *testing.T) *HTTPProxyServer {
 		SocksAddr:  "127.0.0.1:4080",
 		Username:   "user",
 		Password:   "pass",
-		Timeout:    5 * time.Second,
+		Timeouts:   config.Timeouts{Base: 5 * time.Second},
 	})
 	if err != nil {
 		t.Fatalf("NewHTTPProxyServer: %v", err)

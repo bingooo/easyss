@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestLogOutput(t *testing.T) {
@@ -23,6 +25,22 @@ func TestLogOutput(t *testing.T) {
 	output := buf.String()
 	if !strings.Contains(output, "source=") || !strings.Contains(output, "log_test.go") {
 		t.Errorf("log output should contain file name, but not found. output: %s", output)
+	}
+}
+
+func TestAt(t *testing.T) {
+	var buf bytes.Buffer
+	handler := TextHandler(&buf, slog.LevelDebug)
+	SetLogger(slog.New(handler))
+
+	At(slog.LevelWarn, "at message")
+
+	output := buf.String()
+	if !strings.Contains(output, "level=WARN") || !strings.Contains(output, "at message") {
+		t.Errorf("At should log at the given level, output: %s", output)
+	}
+	if !strings.Contains(output, "log_test.go") {
+		t.Errorf("At should attribute the source to its caller, output: %s", output)
 	}
 }
 
@@ -59,7 +77,6 @@ func TestLogLevels(t *testing.T) {
 }
 
 func TestLogLevelFilter(t *testing.T) {
-	// Info 级别时，Debug 消息不应出现
 	var buf bytes.Buffer
 	handler := TextHandler(&buf, slog.LevelInfo)
 	SetLogger(slog.New(handler))
@@ -111,7 +128,6 @@ func TestJSONHandler(t *testing.T) {
 }
 
 func TestDefaultHandler(t *testing.T) {
-	// 验证 DefaultHandler 不 panic
 	handler := DefaultHandler(slog.LevelInfo)
 	if handler == nil {
 		t.Error("DefaultHandler returned nil")
@@ -129,7 +145,6 @@ func TestSetLoggerAndLogger(t *testing.T) {
 		t.Error("Logger() should return the newly set logger")
 	}
 
-	// 恢复原始 logger
 	SetLogger(original)
 }
 
@@ -137,35 +152,33 @@ func TestInit(t *testing.T) {
 	original := Logger()
 
 	t.Run("debug level", func(t *testing.T) {
-		Init("", "debug")
-		// Init 不应 panic，验证 logger 被设置
+		Init(Config{Level: "debug"})
 		if Logger() == nil {
 			t.Error("logger is nil after Init")
 		}
 	})
 
 	t.Run("warn level", func(t *testing.T) {
-		Init("", "warn")
+		Init(Config{Level: "warn"})
 		if Logger() == nil {
 			t.Error("logger is nil after Init")
 		}
 	})
 
 	t.Run("error level", func(t *testing.T) {
-		Init("", "error")
+		Init(Config{Level: "error"})
 		if Logger() == nil {
 			t.Error("logger is nil after Init")
 		}
 	})
 
 	t.Run("默认 info level", func(t *testing.T) {
-		Init("", "")
+		Init(Config{})
 		if Logger() == nil {
 			t.Error("logger is nil after Init")
 		}
 	})
 
-	// 恢复原始 logger
 	SetLogger(original)
 }
 
@@ -175,13 +188,12 @@ func TestInit_WithFile(t *testing.T) {
 
 	original := Logger()
 
-	Init(logPath, "info")
+	Init(Config{FilePath: logPath, Level: "info"})
 
 	if Logger() == nil {
 		t.Error("logger is nil after Init with file")
 	}
 
-	// 验证文件被创建
 	if _, err := os.Stat(logPath); err != nil {
 		t.Logf("log file not found (may have delayed creation): %v", err)
 	}
@@ -207,7 +219,6 @@ func TestFileWriter(t *testing.T) {
 		t.Error("wrote 0 bytes")
 	}
 
-	// 关闭后验证文件内容
 	w.Close() //nolint:errcheck
 
 	data, err := os.ReadFile(logPath)
@@ -219,26 +230,21 @@ func TestFileWriter(t *testing.T) {
 	}
 }
 
-// TestCloseFileOutput 固定"文件输出可以被显式释放"这一契约。
-//
-// 句柄必须由 Init 登记、由 CloseFileOutput 释放，而不能只等 GC 回收：被打开的
-// 文件在 Windows 上无法删除，Android 绑定在 Stop 之后清理/轮转日志文件时会被
-// 遗留句柄挡住（本用例的临时目录清理在 Windows 上就是这条断言的执行者）。
+// TestCloseFileOutput 固定句柄由 Init 登记、由 CloseFileOutput 释放，不能只等 GC：被打开的文件
+// 在 Windows 上无法删除，Android 在 Stop 后清理/轮转日志也会被遗留句柄挡住。
 func TestCloseFileOutput(t *testing.T) {
 	original := Logger()
 	defer SetLogger(original)
 
 	logPath := filepath.Join(t.TempDir(), "close.log")
 
-	Init(logPath, "debug")
+	Init(Config{FilePath: logPath, Level: "debug"})
 	t.Cleanup(func() {
-		// 兜底：断言失败提前返回时也要释放句柄，否则 Windows 上的临时目录清理
-		// 会再失败一次，把一次断言失败变成一条误导性的清理错误。
+		// 兜底释放：否则 Windows 上的临时目录清理会再失败一次，把断言失败变成误导性的清理错误。
 		_ = CloseFileOutput()
 	})
 
-	// 触发写入，使文件真的被打开；未写入时 lumberjack 不创建文件，句柄也就
-	// 无从谈起。
+	// 必须触发一次写入：未写入时 lumberjack 不创建文件，也就没有句柄。
 	Info("before close")
 
 	fileOutputMu.Lock()
@@ -259,19 +265,17 @@ func TestCloseFileOutput(t *testing.T) {
 		t.Error("CloseFileOutput kept the file output registered")
 	}
 
-	// 幂等：已经释放之后再调一次是空操作。
 	if err := CloseFileOutput(); err != nil {
 		t.Errorf("second CloseFileOutput: %v", err)
 	}
 
-	// 释放文件输出只改变目的地，不改变级别；释放后继续写日志也不应 panic。
+	// 释放只改目的地不改级别，释放后继续写日志也不应 panic。
 	if !Logger().Enabled(context.Background(), slog.LevelDebug) {
 		t.Error("closing the file output should keep the configured level")
 	}
 	Info("after close")
 
-	// 下一次 Init 重新打开文件：释放不是永久性的。
-	Init(logPath, "info")
+	Init(Config{FilePath: logPath, Level: "info"})
 	Info("reopened")
 	data, err := os.ReadFile(logPath)
 	if err != nil {
@@ -280,4 +284,46 @@ func TestCloseFileOutput(t *testing.T) {
 	if !strings.Contains(string(data), "reopened") {
 		t.Errorf("Init after CloseFileOutput should reopen the file, content: %q", data)
 	}
+}
+
+// TestCloseFileOutputIsTerminalForStaleLoggers 固定迟到的写入不能复活句柄：换掉包级 logger 只挡住之后
+// 才 Load 的写入，先拿到旧 logger 的后台 goroutine 仍会在 Close 之后写，而 lumberjack 发现句柄为 nil
+// 会重新打开文件，Windows 上的删除/重命名因此被挡住。
+func TestCloseFileOutputIsTerminalForStaleLoggers(t *testing.T) {
+	original := Logger()
+	defer SetLogger(original)
+
+	logPath := filepath.Join(t.TempDir(), "stale.log")
+
+	Init(Config{FilePath: logPath, Level: "debug"})
+	// 模拟在 CloseFileOutput 之前就拿到旧 logger 的后台 goroutine。
+	stale := Logger()
+
+	Info("before close")
+	if err := CloseFileOutput(); err != nil {
+		t.Fatalf("CloseFileOutput: %v", err)
+	}
+
+	if err := os.Remove(logPath); err != nil {
+		t.Fatalf("remove log file: %v", err)
+	}
+	stale.Info("late write through the stale logger")
+
+	if _, err := os.Stat(logPath); err == nil {
+		t.Error("a late write through a stale logger re-created the log file")
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("stat log file: %v", err)
+	}
+}
+
+// 固定 log.* 的键名（JSON 对象键序不属于契约）：客户端与服务端直接复用 Config，
+// file_path 之类的键名漂移会让用户配置静默失效。
+func TestConfigJSONShape(t *testing.T) {
+	data, err := json.Marshal(Config{Level: "debug", FilePath: "easyss.log"})
+	require.NoError(t, err)
+	require.JSONEq(t, `{"level":"debug","file_path":"easyss.log"}`, string(data))
+
+	var got Config
+	require.NoError(t, json.Unmarshal([]byte(`{"level":"warn","file_path":"/tmp/easyss.log"}`), &got))
+	require.Equal(t, Config{Level: "warn", FilePath: "/tmp/easyss.log"}, got)
 }

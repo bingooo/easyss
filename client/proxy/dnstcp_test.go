@@ -16,11 +16,10 @@ import (
 	clientconfig "github.com/nange/easyss/v3/client/config"
 	easydns "github.com/nange/easyss/v3/client/dns"
 	"github.com/nange/easyss/v3/client/router"
-	sharedconfig "github.com/nange/easyss/v3/config"
+	"github.com/nange/easyss/v3/config"
 	"github.com/nange/easyss/v3/crypto"
 	"github.com/nange/easyss/v3/protocol"
 	"github.com/nange/easyss/v3/transport"
-	"github.com/txthinking/socks5"
 )
 
 // testMasterKey 必须与 newTestStreamHandler 中使用的会话主密钥一致，测试才能
@@ -42,7 +41,7 @@ func newTCPDNSTestServer(t *testing.T, rt *router.Router, tr transport.Transport
 		Handler:    h,
 		Router:     rt,
 		Method:     protocol.MethodAES256GCM,
-		Timeouts: sharedconfig.Timeouts{
+		Timeouts: config.Timeouts{
 			Base:       30 * time.Second,
 			Dial:       10 * time.Second,
 			StreamIdle: 30 * time.Second,
@@ -72,7 +71,7 @@ func serveTCPDNSHandler(t *testing.T, srv *Socks5Server, target string) (net.Con
 		}
 		defer conn.Close() //nolint:errcheck
 		host, _, _ := net.SplitHostPort(target)
-		_ = srv.handleTCPDNS(conn, &socks5.Request{}, target, host)
+		_ = srv.handleTCPDNS(conn, target, host)
 	}()
 
 	client, err := net.Dial("tcp", ln.Addr().String())
@@ -85,19 +84,20 @@ func serveTCPDNSHandler(t *testing.T, srv *Socks5Server, target string) (net.Con
 	return client, bufio.NewReader(client)
 }
 
-// fakeEncryptedUpstream 让 mockTransport 产出的流"会应答"：它在服务端侧扮演
-// 加密会话的远端，读出客户端写来的引导记录（含 DNS 查询），再用同一套密钥在
-// s2c 方向写回一条 DATAGRAM 应答。这样代理 DNS 的成功路径（而不只是上游沉默的
-// 失败路径）可以在没有真实传输层的情况下被端到端验证。
+// fakeEncryptedUpstream 让 mockTransport 的流"会应答"，代理 DNS 的成功路径因此
+// 能在没有真实传输层时被端到端验证（否则只能测到上游沉默的失败路径）。
 type fakeEncryptedUpstream struct {
-	mu         sync.Mutex
-	written    []byte // c2s：客户端写入的字节
-	resp       []byte // s2c：测试回写的应答记录
-	separating bool   // serve 开始回写应答后置位，后续 Write 落入 resp
-	dataReady  chan struct{}
-	readyOnce  sync.Once
-	closed     chan struct{}
-	closeOnce  sync.Once
+	mu      sync.Mutex
+	written []byte // c2s：客户端写入的字节
+	// firstPayload 是引导记录里第一条 DATAGRAM 的原始载荷，即**服务端实际会收到的
+	// 那段字节**。它是"TCP DNS 经隧道后与 UDP DNS 同形"这一接口事实的断言入口。
+	firstPayload []byte
+	resp         []byte // s2c：测试回写的应答记录
+	separating   bool   // serve 开始回写应答后置位，后续 Write 落入 resp
+	dataReady    chan struct{}
+	readyOnce    sync.Once
+	closed       chan struct{}
+	closeOnce    sync.Once
 }
 
 func newFakeEncryptedUpstream() *fakeEncryptedUpstream {
@@ -172,7 +172,7 @@ func (f *fakeEncryptedUpstream) Close() error {
 
 // serve 读取客户端写来的引导记录（含 DNS 查询），再用同一套密钥在 s2c 方向
 // 加密回写一条 DATAGRAM 应答。responder 返回 nil 表示故意沉默，交由调用方的
-// DNS 响应读空闲超时（dnsOptions.RespTimeout）处理。
+// DNS 响应读空闲超时（dnsInterceptor.respTimeout）处理。
 func (f *fakeEncryptedUpstream) serve(salt []byte, masterKey []byte, responder func(*dns.Msg) *dns.Msg) error {
 	// 客户端在引导记录写出之前不会去读应答（Receive 紧随 Open 之后），因此这里
 	// 必须等到引导记录（含 DNS 查询）真正落盘，否则应答会先于引导记录被读走。
@@ -187,7 +187,7 @@ func (f *fakeEncryptedUpstream) serve(salt []byte, masterKey []byte, responder f
 		return errors.New("bootstrap record never arrived")
 	}
 
-	sk, err := crypto.NewStreamKeys(masterKey, salt, sharedconfig.EndpointUDP)
+	sk, err := crypto.NewStreamKeys(masterKey, salt, config.EndpointUDP)
 	if err != nil {
 		return err
 	}
@@ -200,6 +200,7 @@ func (f *fakeEncryptedUpstream) serve(salt []byte, masterKey []byte, responder f
 		if frame.Type != protocol.FrameDATAGRAM {
 			continue
 		}
+		f.firstPayload = append([]byte(nil), frame.Payload...)
 		query = new(dns.Msg)
 		if err := query.Unpack(frame.Payload); err != nil {
 			return err
@@ -284,41 +285,6 @@ func awaitSocks5Reply(t *testing.T, client net.Conn, br *bufio.Reader) {
 	}
 }
 
-// startUDPDNSResponder 启动一个本地 UDP DNS 应答器：任意 A 查询回 answerIP。
-func startUDPDNSResponder(t *testing.T, answerIP string) string {
-	t.Helper()
-	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen udp responder: %v", err)
-	}
-	t.Cleanup(func() { pc.Close() }) //nolint:errcheck
-	go func() {
-		buf := make([]byte, 2048)
-		for {
-			n, addr, err := pc.ReadFrom(buf)
-			if err != nil {
-				return
-			}
-			req := new(dns.Msg)
-			if err := req.Unpack(buf[:n]); err != nil {
-				continue
-			}
-			resp := new(dns.Msg)
-			resp.SetReply(req)
-			resp.Answer = append(resp.Answer, &dns.A{
-				Hdr: dns.RR_Header{Name: req.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
-				A:   net.ParseIP(answerIP),
-			})
-			data, err := resp.Pack()
-			if err != nil {
-				continue
-			}
-			_, _ = pc.WriteTo(data, addr)
-		}
-	}()
-	return pc.LocalAddr().String()
-}
-
 func TestTCPDNSMessageFraming(t *testing.T) {
 	// round-trip：写入的帧能被 readTCPDNSMessage 原样读出。
 	client, server := net.Pipe()
@@ -368,7 +334,7 @@ func (b *bytesReader) Read(p []byte) (int, error) {
 
 func TestHandleTCPDNSDirect(t *testing.T) {
 	easydns.ResetResolveState()
-	requested := startUDPDNSResponder(t, "1.2.3.4")
+	requested := startUDPDNSResponderAny(t, "1.2.3.4")
 	// 内置列表故意指向一个必然拨不通的地址：只有真正使用客户端请求的解析器
 	// （requested），这个用例才会拿到应答；若代码忽略请求地址而转投内置列表，
 	// 这里就会变成 SERVFAIL。
@@ -426,7 +392,7 @@ func TestHandleTCPDNSDirect(t *testing.T) {
 func TestHandleTCPDNSDirectFallsBackToBuiltinList(t *testing.T) {
 	easydns.ResetResolveState()
 	oldDNS := clientconfig.DirectDNSServers
-	clientconfig.DirectDNSServers = []string{startUDPDNSResponder(t, "5.6.7.8")}
+	clientconfig.DirectDNSServers = []string{startUDPDNSResponderAny(t, "5.6.7.8")}
 	t.Cleanup(func() { clientconfig.DirectDNSServers = oldDNS })
 
 	rt, err := router.New(router.Config{ProxyRule: router.ProxyRuleAuto, IPV6Rule: router.IPV6RuleDisable})
@@ -496,7 +462,7 @@ func TestHandleTCPDNSBlock(t *testing.T) {
 }
 
 // upstreamTransport 记录最近一次 Open 请求里的 salt，使测试能构造出与服务端
-// 完全一致的加密密钥；应答流由调用方通过 customStream 提供。
+// 完全一致的加密密钥；承载应答的流由调用方通过 newTCPDNSProxyServer 传入。
 type upstreamTransport struct {
 	*mockTransport
 	mu   sync.Mutex
@@ -605,12 +571,30 @@ func TestHandleTCPDNSProxySuccess(t *testing.T) {
 	if cached := srv.dns.cache.Get("proxy.example.com.", "A", false); cached == nil {
 		t.Error("proxied answer not cached")
 	}
+
+	// 隧道里必须是裸 DNS 报文：TCP DNS 的两字节长度前缀在 `readFirstTCPDNS` 里已剥掉，
+	// 服务端因此按端口 53 的 UDP 会话处理，无需为 DNS over TCP 另写路由。
+	stream.mu.Lock()
+	payload := append([]byte(nil), stream.firstPayload...)
+	stream.mu.Unlock()
+	packed, err := q.Pack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(payload, packed) {
+		t.Fatalf("tunnel payload = % x, want exactly msg.Pack() = % x", payload, packed)
+	}
+	decoded := new(dns.Msg)
+	if err := decoded.Unpack(payload); err != nil {
+		t.Fatalf("the tunnel payload must be a bare DNS message: %v", err)
+	}
+	if len(decoded.Question) != 1 || decoded.Question[0].Name != "proxy.example.com." {
+		t.Fatalf("question = %v, want proxy.example.com.", decoded.Question)
+	}
 }
 
-// TestHandleTCPDNSFallbackNonDNSDirectCrossPath 覆盖回退的另一半：首条报文不是
-// DNS 查询时，连接必须被完整交回 routeTCP（写回 SOCKS5 成功应答并按规则分流），
-// 而不是留下一个从未应答的 SOCKS5 连接。这里用自定义直连域名 + 本地 TCP 目标，
-// 使回退路径与既有 TestHandleTCPDNSFallbackNonDNS 走的分支不同。
+// TestHandleTCPDNSFallbackNonDNSDirectCrossPath 守住首条报文不是 DNS 查询时的回退：
+// 连接必须完整交回 routeTCP，而不是留下一个从未应答的 SOCKS5 连接。
 func TestHandleTCPDNSFallbackNonDNSDirectCrossPath(t *testing.T) {
 	rt, err := router.New(router.Config{ProxyRule: router.ProxyRuleAuto, IPV6Rule: router.IPV6RuleDisable})
 	if err != nil {
@@ -750,7 +734,7 @@ func TestHandleTCPDNSFallbackNonDNS(t *testing.T) {
 func TestHandleTCPDNSMultipleQueries(t *testing.T) {
 	easydns.ResetResolveState()
 	oldDNS := clientconfig.DirectDNSServers
-	clientconfig.DirectDNSServers = []string{startUDPDNSResponder(t, "1.2.3.4")}
+	clientconfig.DirectDNSServers = []string{startUDPDNSResponderAny(t, "1.2.3.4")}
 	t.Cleanup(func() { clientconfig.DirectDNSServers = oldDNS })
 
 	rt, err := router.New(router.Config{ProxyRule: router.ProxyRuleAuto, IPV6Rule: router.IPV6RuleDisable})
@@ -810,10 +794,8 @@ func TestHandleTCPDNSMultipleQueries(t *testing.T) {
 	}
 }
 
-// TestHandleTCPDNSProxyExchangeRecreatedAfterFailure 覆盖失效交换残留的回归：
-// 第一次代理查询失败（上游静默 → SERVFAIL）后，残留的已关闭交换必须从
-// 会话池移除，第二次代理查询要重建新交换（transport openCalls 增加到 2），
-// 而不是命中残留交换导致该连接后续代理查询永久 SERVFAIL。
+// TestHandleTCPDNSProxyExchangeRecreatedAfterFailure 守住失效交换的清理：失败后残留的
+// 已关闭交换必须移出会话池，否则该连接后续代理查询永远 SERVFAIL。
 func TestHandleTCPDNSProxyExchangeRecreatedAfterFailure(t *testing.T) {
 	rt, err := router.New(router.Config{ProxyRule: router.ProxyRuleAuto, IPV6Rule: router.IPV6RuleDisable})
 	if err != nil {
@@ -860,12 +842,8 @@ func TestHandleTCPDNSProxyExchangeRecreatedAfterFailure(t *testing.T) {
 	}
 }
 
-// TestHandleTCPDNSRepliesBeforeAnyQueryArrives 锁住 TCP DNS 拦截的应答顺序：
-// RFC 1928 的客户端（curl、浏览器，以及 TUN 模式下承载系统解析器的 tun2socks）在
-// 拿到 SOCKS5 应答之前不会发送任何字节，因此成功应答必须先于"首报文读取"写出。
-// 把应答推迟到读到首条 DNS 报文之后（#177 的实现），双方互等，连接只能挂到
-// streamIdleTimeout（8 × timeout，默认 240s）到期降级成普通中继——DNS 查询因此
-// 长时间卡住，网页与视频加载超时，而且默认日志里没有任何线索。
+// TestHandleTCPDNSRepliesBeforeAnyQueryArrives 锁住应答顺序：RFC 1928 客户端在拿到
+// SOCKS5 应答前不发送任何字节，把应答推迟到读到首条 DNS 报文之后就会双方互等。
 func TestHandleTCPDNSRepliesBeforeAnyQueryArrives(t *testing.T) {
 	rt, err := router.New(router.Config{ProxyRule: router.ProxyRuleAutoBlock, IPV6Rule: router.IPV6RuleDisable})
 	if err != nil {
@@ -988,5 +966,48 @@ func TestHandleTCPDNSRejectedAfterReplyCloses(t *testing.T) {
 	}
 	if !errors.Is(err, io.EOF) {
 		t.Fatalf("read error = %v, want EOF (the connection must be closed, not left hanging)", err)
+	}
+}
+
+// TestHandleTCPDNSProxyTimeoutInvalidatesExchange 覆盖超时后的交换作废：等待应答
+// 的 goroutine 必须持有交换快照，不能在 invalidate 置空会话字段后重读。
+func TestHandleTCPDNSProxyTimeoutInvalidatesExchange(t *testing.T) {
+	const queries = 3
+
+	rt, err := router.New(router.Config{ProxyRule: router.ProxyRuleAuto, IPV6Rule: router.IPV6RuleDisable})
+	if err != nil {
+		t.Fatalf("router.New: %v", err)
+	}
+	rt.AddProxyDomain("proxy.example.com")
+
+	streams := make([]transport.Stream, queries)
+	for i := range streams {
+		streams[i] = newBlockingStream()
+	}
+	tr := &mockTransport{streams: streams}
+	srv := newTCPDNSTestServer(t, rt, tr)
+	srv.dns.respTimeout = 50 * time.Millisecond
+
+	client, br := serveTCPDNSHandler(t, srv, "223.5.5.5:53")
+	awaitSocks5Reply(t, client, br)
+
+	for i := range queries {
+		q := new(dns.Msg)
+		q.SetQuestion("proxy.example.com.", dns.TypeA)
+		q.Id = uint16(0x3300 + i)
+		if err := writeTCPDNSMessage(client, q); err != nil {
+			t.Fatalf("query #%d: write: %v", i, err)
+		}
+		resp, err := readTCPDNSMessage(br, nil)
+		if err != nil {
+			t.Fatalf("query #%d: read response: %v", i, err)
+		}
+		if resp.Rcode != dns.RcodeServerFailure {
+			t.Errorf("query #%d: rcode = %d, want SERVFAIL", i, resp.Rcode)
+		}
+	}
+
+	if got := tr.openCalls(); got != queries {
+		t.Errorf("transport open calls = %d, want %d (every timeout must invalidate the exchange)", got, queries)
 	}
 }

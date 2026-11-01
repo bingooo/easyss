@@ -16,12 +16,16 @@ import (
 	"gopkg.in/natefinch/lumberjack.v2"
 )
 
-var logger = slog.New(DefaultHandler(slog.LevelInfo))
+// logger 是当前日志器。必须用原子指针：Init/CloseFileOutput 与后台 goroutine
+// 的日志写入天然并发，普通变量在 -race 下会直接判数据竞争。
+var logger atomic.Pointer[slog.Logger]
 
-// fileOutput 记录当前日志器的文件输出（lumberjack 写入器），使重新初始化和显式
-// 关闭都能释放底层文件句柄。没有这条记录时，句柄只能等 GC 回收——被打开的文件
-// 在 Windows 上无法删除或重命名，而 Android 绑定会在同一个进程里反复走
-// Start/Stop，宿主删除日志文件的操作会被遗留句柄挡住（见 CloseFileOutput）。
+func init() {
+	logger.Store(slog.New(DefaultHandler(slog.LevelInfo)))
+}
+
+// fileOutput 记录当前的文件输出，使重新初始化与显式关闭都能释放底层句柄。
+// 只靠 GC 不够：Windows 上被打开的文件无法删除或重命名。
 var (
 	fileOutputMu sync.Mutex
 	fileOutput   io.Closer
@@ -32,12 +36,10 @@ type AtomicLevel struct {
 	level atomic.Int32
 }
 
-// Level 返回当前日志级别。
 func (al *AtomicLevel) Level() slog.Level {
 	return slog.Level(al.level.Load())
 }
 
-// SetLevel 设置日志级别。
 func (al *AtomicLevel) SetLevel(level slog.Level) {
 	al.level.Store(int32(level))
 }
@@ -50,11 +52,11 @@ func SetLevel(level slog.Level) {
 }
 
 func SetLogger(l *slog.Logger) {
-	logger = l
+	logger.Store(l)
 }
 
 func Logger() *slog.Logger {
-	return logger
+	return logger.Load()
 }
 
 func Debug(msg string, args ...any) {
@@ -73,8 +75,15 @@ func Error(msg string, args ...any) {
 	log(slog.LevelError, msg, args...)
 }
 
+// At 以给定级别写日志，供调用点按运行期条件选择级别（如首次/重复）。source 与固定级别
+// 的包装函数一样归属到调用点。
+func At(level slog.Level, msg string, args ...any) {
+	log(level, msg, args...)
+}
+
 func log(level slog.Level, msg string, args ...any) {
-	if !logger.Enabled(context.Background(), level) {
+	l := logger.Load()
+	if !l.Enabled(context.Background(), level) {
 		return
 	}
 	var pcs [1]uintptr
@@ -82,7 +91,7 @@ func log(level slog.Level, msg string, args ...any) {
 	runtime.Callers(3, pcs[:])
 	r := slog.NewRecord(time.Now(), level, msg, pcs[0])
 	r.Add(args...)
-	_ = logger.Handler().Handle(context.Background(), r)
+	_ = l.Handler().Handle(context.Background(), r)
 }
 
 func newReplaceAttrFunc(cn *time.Location) func([]string, slog.Attr) slog.Attr {
@@ -152,19 +161,58 @@ func TextHandler(w io.Writer, level slog.Leveler) slog.Handler {
 	)
 }
 
+// closableFileWriter 让"关闭"成为终态：后台 goroutine 可能在 Close 之前就 Load 到旧 logger，
+// 而 lumberjack 的语义是"写时句柄为 nil 就重新打开"，迟到的写入会把刚释放的句柄复活。
+type closableFileWriter struct {
+	mu     sync.Mutex
+	writer *lumberjack.Logger
+	closed bool
+}
+
+func (w *closableFileWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.closed {
+		// 丢弃而不报错：这条记录通常已由 MultiHandler 的 stdout 分支写出，
+		// 冒泡错误只会让调用方看到与日志目的无关的失败。
+		return len(p), nil
+	}
+	return w.writer.Write(p)
+}
+
+func (w *closableFileWriter) Close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.closed {
+		return nil
+	}
+	w.closed = true
+	return w.writer.Close()
+}
+
 func FileWriter(outputFile string) io.WriteCloser {
-	return &lumberjack.Logger{
-		Filename:   outputFile,
-		MaxSize:    10,
-		MaxAge:     1,
-		MaxBackups: 1,
-		LocalTime:  true,
+	return &closableFileWriter{
+		writer: &lumberjack.Logger{
+			Filename:   outputFile,
+			MaxSize:    10,
+			MaxAge:     1,
+			MaxBackups: 1,
+			LocalTime:  true,
+		},
 	}
 }
 
-func Init(outputFile, level string) {
+// Config 是日志配置的线格式（客户端与服务端共用），Init 是唯一的应用入口。
+type Config struct {
+	Level    string `json:"level"`
+	FilePath string `json:"file_path"`
+}
+
+func Init(cfg Config) {
 	l := slog.LevelInfo
-	switch level {
+	switch cfg.Level {
 	case "debug":
 		l = slog.LevelDebug
 	case "warn":
@@ -174,15 +222,15 @@ func Init(outputFile, level string) {
 	}
 	atomicLevel.SetLevel(l)
 
-	// 先摘下旧的文件输出（安装完新日志器后再关闭它）：初始化可能被同一进程
-	// 反复调用，不接管上一个写入器就会累积已打开的文件句柄。
+	// 先摘下旧的文件输出、装完新日志器后再关闭它：Init 可能被同一进程反复调用，
+	// 不接管上一个写入器就会累积已打开的句柄。
 	fileOutputMu.Lock()
 	prev := fileOutput
 	fileOutput = nil
 	fileOutputMu.Unlock()
 
-	if outputFile != "" {
-		w := FileWriter(outputFile)
+	if cfg.FilePath != "" {
+		w := FileWriter(cfg.FilePath)
 		fileOutputMu.Lock()
 		fileOutput = w
 		fileOutputMu.Unlock()
@@ -196,13 +244,8 @@ func Init(outputFile, level string) {
 	}
 }
 
-// CloseFileOutput 关闭文件输出，并把日志器切回"只写 stdout、级别不变"的状态；
-// 下一次 Init 会按传入的路径重新打开文件。没有文件输出时它是空操作，因此可以
-// 重复调用。
-//
-// 释放句柄这件事必须由初始化日志的一方在停止时显式完成：被打开的文件在
-// Windows 上无法删除/重命名，宿主（Android 绑定、托盘）在服务停止后清理或轮转
-// 日志文件时会被遗留句柄挡住。
+// CloseFileOutput 关闭文件输出并把日志器切回"只写 stdout、级别不变"，没有文件输出时是空操作。
+// 句柄必须由初始化日志的一方显式释放，否则 Windows 上无法删除/重命名被占用的日志文件。
 func CloseFileOutput() error {
 	fileOutputMu.Lock()
 	w := fileOutput
@@ -213,9 +256,8 @@ func CloseFileOutput() error {
 		return nil
 	}
 
-	// 先摘掉文件处理器再关句柄：lumberjack 在句柄为 nil 时会于下一次写入重新
-	// 打开文件，若日志器仍挂着文件处理器，"关闭"就会被紧随其后的写入撤销，
-	// 宿主删除日志文件的操作也就白做了。
+	// 两层缺一不可：换掉包级 logger 管住之后的写入，关闭写入器（终态语义）管住先已 Load
+	// 到旧 logger、却晚于本次 Close 的写入。
 	SetLogger(slog.New(DefaultHandler(&atomicLevel)))
 	return w.Close()
 }

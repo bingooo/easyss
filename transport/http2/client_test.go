@@ -10,7 +10,7 @@ import (
 
 	utls "github.com/refraction-networking/utls"
 
-	sharedconfig "github.com/nange/easyss/v3/config"
+	"github.com/nange/easyss/v3/config"
 	"github.com/nange/easyss/v3/transport"
 )
 
@@ -28,15 +28,15 @@ func TestUTLSDialUsesHTTP2(t *testing.T) {
 
 	slot := newSlot(&utls.Config{
 		InsecureSkipVerify: true,
-		NextProtos:         sharedconfig.NextProtos,
-	}, time.Second, nil, time.Minute)
-	t.Cleanup(slot.t.CloseIdleConnections)
+		NextProtos:         config.NextProtos,
+	}, config.NewTimeouts(time.Second), nil)
+	t.Cleanup(slot.transport().CloseIdleConnections)
 
 	req, err := http.NewRequest(http.MethodPost, srv.URL, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp, err := slot.t.RoundTrip(req)
+	resp, err := slot.transport().RoundTrip(req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,9 +65,9 @@ func TestHTTP2Transport_Non200StatusIsRejected(t *testing.T) {
 		ServerURL: srv.URL,
 		TLSConfig: &utls.Config{
 			InsecureSkipVerify: true,
-			NextProtos:         sharedconfig.NextProtos,
+			NextProtos:         config.NextProtos,
 		},
-		Timeout: time.Second,
+		Timeouts: config.Timeouts{Base: time.Second},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -75,7 +75,7 @@ func TestHTTP2Transport_Non200StatusIsRejected(t *testing.T) {
 	t.Cleanup(func() { _ = tr.Close() })
 
 	stream, err := tr.Open(context.Background(), transport.OpenRequest{
-		Endpoint:     sharedconfig.EndpointTCP,
+		Endpoint:     config.EndpointTCP,
 		Salt:         "dGVzdHNhbHR0ZXN0c2FsdA",
 		HighPriority: true,
 	})
@@ -111,9 +111,9 @@ func TestHTTP2Transport_200StatusReadsBody(t *testing.T) {
 		ServerURL: srv.URL,
 		TLSConfig: &utls.Config{
 			InsecureSkipVerify: true,
-			NextProtos:         sharedconfig.NextProtos,
+			NextProtos:         config.NextProtos,
 		},
-		Timeout: time.Second,
+		Timeouts: config.Timeouts{Base: time.Second},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -121,7 +121,7 @@ func TestHTTP2Transport_200StatusReadsBody(t *testing.T) {
 	t.Cleanup(func() { _ = tr.Close() })
 
 	stream, err := tr.Open(context.Background(), transport.OpenRequest{
-		Endpoint:     sharedconfig.EndpointTCP,
+		Endpoint:     config.EndpointTCP,
 		Salt:         "dGVzdHNhbHR0ZXN0c2FsdA",
 		HighPriority: true,
 	})
@@ -136,6 +136,73 @@ func TestHTTP2Transport_200StatusReadsBody(t *testing.T) {
 	}
 	if string(body) != "hello" {
 		t.Fatalf("got %q, want %q", body, "hello")
+	}
+}
+
+// GotConn 是流的连接身份来源：它必须在本传输上触发，回报的 self 就是这一代登记的身份，
+// 复用同一连接的流拿到同一个身份。标准库若不再把 DialTLSContext 的返回值原样交回，
+// 这条测试会先失败，而不是让失效静默退化成空操作。
+func TestHTTP2Stream_ConnIdentityComesFromGotConn(t *testing.T) {
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("hello"))
+	}))
+	srv.EnableHTTP2 = true
+	srv.Config.Protocols = &http.Protocols{}
+	srv.Config.Protocols.SetHTTP2(true)
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+
+	tr, err := New(Config{
+		ServerURL:    srv.URL,
+		TLSConfig:    &utls.Config{InsecureSkipVerify: true, NextProtos: config.NextProtos},
+		MaxSlotCount: 1,
+		Timeouts:     config.Timeouts{Base: time.Second},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = tr.Close() })
+
+	open := func() *http2Stream {
+		s, err := tr.Open(context.Background(), transport.OpenRequest{
+			Endpoint:     config.EndpointTCP,
+			Salt:         "dGVzdHNhbHR0ZXN0c2FsdA",
+			HighPriority: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.ReadFull(s, make([]byte, 5)); err != nil {
+			t.Fatal(err)
+		}
+		stream, ok := s.(*http2Stream)
+		if !ok {
+			t.Fatalf("Open returned %T, want *http2Stream", s)
+		}
+		t.Cleanup(func() { _ = stream.Close() })
+		return stream
+	}
+
+	first := open()
+	firstID := first.conn.Load()
+	if firstID == nil {
+		t.Fatal("the first stream must record the connection reported by GotConn")
+	}
+	firstGen := first.gen.Load()
+	if firstGen == nil {
+		t.Fatal("the stream must record the generation it was submitted on")
+	}
+	if got := firstGen.conn.Load(); got != firstID {
+		t.Fatalf("stream identity %p is not the generation's registered connection %p", firstID, got)
+	}
+
+	second := open()
+	if got := second.gen.Load(); got != firstGen {
+		t.Fatal("the second stream must reuse the same generation")
+	}
+	if got := second.conn.Load(); got != firstID {
+		t.Fatalf("reused stream identity = %p, want the same connection %p", got, firstID)
 	}
 }
 
@@ -159,9 +226,9 @@ func TestHTTP2Transport_GrowEventAttribution(t *testing.T) {
 		ServerURL: srv.URL,
 		TLSConfig: &utls.Config{
 			InsecureSkipVerify: true,
-			NextProtos:         sharedconfig.NextProtos,
+			NextProtos:         config.NextProtos,
 		},
-		Timeout: time.Second,
+		Timeouts: config.Timeouts{Base: time.Second},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -171,7 +238,7 @@ func TestHTTP2Transport_GrowEventAttribution(t *testing.T) {
 	open := func(target string) {
 		t.Helper()
 		stream, err := tr.Open(context.Background(), transport.OpenRequest{
-			Endpoint:     sharedconfig.EndpointTCP,
+			Endpoint:     config.EndpointTCP,
 			Salt:         "dGVzdHNhbHR0ZXN0c2FsdA",
 			HighPriority: true,
 			Target:       target,
@@ -196,8 +263,8 @@ func TestHTTP2Transport_GrowEventAttribution(t *testing.T) {
 	if ev.Live != 2 {
 		t.Fatalf("event live = %d, want 2 (first activation)", ev.Live)
 	}
-	if ev.Endpoint != sharedconfig.EndpointTCP {
-		t.Fatalf("event endpoint = %q, want %q", ev.Endpoint, sharedconfig.EndpointTCP)
+	if ev.Endpoint != config.EndpointTCP {
+		t.Fatalf("event endpoint = %q, want %q", ev.Endpoint, config.EndpointTCP)
 	}
 	if ev.Target != "example.com:443" {
 		t.Fatalf("event target = %q, want example.com:443", ev.Target)
@@ -217,7 +284,7 @@ func TestTrackReadMarksSlotHeavy(t *testing.T) {
 		stream := &http2Stream{slot: slot, startTime: time.Now()}
 
 		// 低于快阈值且对慢路径而言太年轻：不标记。
-		stream.trackRead(sharedconfig.HeavyStreamThresholdBytes - 1)
+		stream.trackRead(config.HeavyStreamThresholdBytes - 1)
 		if slot.heavy.Load() != 0 || stream.heavyState.Load() != heavyIdle {
 			t.Fatalf("marked heavy before threshold: slot.heavy=%d state=%d", slot.heavy.Load(), stream.heavyState.Load())
 		}
@@ -227,7 +294,7 @@ func TestTrackReadMarksSlotHeavy(t *testing.T) {
 		if slot.heavy.Load() != 1 || stream.heavyState.Load() != heavyMarked {
 			t.Fatalf("expected heavy mark after threshold: slot.heavy=%d state=%d", slot.heavy.Load(), stream.heavyState.Load())
 		}
-		if slot.bytesRecv.Load() != int64(sharedconfig.HeavyStreamThresholdBytes+1) {
+		if slot.bytesRecv.Load() != int64(config.HeavyStreamThresholdBytes+1) {
 			t.Fatalf("bytesRecv not accumulated: %d", slot.bytesRecv.Load())
 		}
 		if slot.connBytes.Load() != slot.bytesRecv.Load() {
@@ -256,11 +323,11 @@ func TestTrackReadMarksSlotHeavy(t *testing.T) {
 		slot := &transportSlot{}
 		stream := &http2Stream{
 			slot:      slot,
-			startTime: time.Now().Add(-sharedconfig.HeavyStreamMinAge - time.Second),
+			startTime: time.Now().Add(-config.HeavyStreamMinAge - time.Second),
 		}
 
 		// 低于慢阈值：无论存活多久都不标记。
-		stream.trackRead(sharedconfig.HeavyStreamSlowThresholdBytes - 1)
+		stream.trackRead(config.HeavyStreamSlowThresholdBytes - 1)
 		if slot.heavy.Load() != 0 {
 			t.Fatalf("marked heavy below slow threshold: %d", slot.heavy.Load())
 		}
@@ -277,7 +344,7 @@ func TestTrackReadMarksSlotHeavy(t *testing.T) {
 		slot := &transportSlot{}
 		stream := &http2Stream{slot: slot, startTime: time.Now()}
 
-		stream.trackRead(sharedconfig.HeavyStreamSlowThresholdBytes)
+		stream.trackRead(config.HeavyStreamSlowThresholdBytes)
 		if slot.heavy.Load() != 0 {
 			t.Fatalf("young stream marked heavy: %d", slot.heavy.Load())
 		}
@@ -286,7 +353,7 @@ func TestTrackReadMarksSlotHeavy(t *testing.T) {
 	// nil 槽位是无操作（例如测试构造的流）。
 	t.Run("nil slot no-op", func(t *testing.T) {
 		noSlot := &http2Stream{}
-		noSlot.trackRead(sharedconfig.HeavyStreamThresholdBytes)
+		noSlot.trackRead(config.HeavyStreamThresholdBytes)
 		if noSlot.heavyState.Load() != heavyIdle {
 			t.Fatal("nil slot must not be marked heavy")
 		}
@@ -298,7 +365,7 @@ func TestTrackReadMarksSlotHeavy(t *testing.T) {
 		slot := &transportSlot{}
 		stream := &http2Stream{slot: slot, startTime: time.Now()}
 		stream.releaseHeavy()
-		stream.trackRead(sharedconfig.HeavyStreamThresholdBytes)
+		stream.trackRead(config.HeavyStreamThresholdBytes)
 		if slot.heavy.Load() != 0 {
 			t.Fatalf("heavy marked after release: %d", slot.heavy.Load())
 		}

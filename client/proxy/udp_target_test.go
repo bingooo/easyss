@@ -9,7 +9,7 @@ import (
 
 	"github.com/miekg/dns"
 	"github.com/nange/easyss/v3/client/router"
-	"github.com/txthinking/socks5"
+	"github.com/nange/easyss/v3/util"
 )
 
 // nbnsQName 把 NetBIOS 名字编码成 NBNS 查询里的 QNAME：15 字节名字（空格补齐）
@@ -39,12 +39,8 @@ func nbnsQueryPayload(name string, suffix byte) []byte {
 	return append(data, 0x00, 0x00, 0x20, 0x00, 0x01)
 }
 
-// newUDPTargetTestServer 构造一个用于 UDP 入口判定的 Socks5Server：返回的 socket
-// 同时充当客户端来源地址与 SOCKS5 UDPConn，以及记录直连拨号地址的通道。
-//
-// 直连拨号被替换为"记录目标后拨到本机静默对端"：用例只关心某条数据报有没有被拨到，
-// 既不希望（255.255.255.255/198.18.255.255 这类目标在本机会被路由进 TUN，真的发出去）
-// 也不依赖本机路由表能否连上目标。
+// newUDPTargetTestServer 里直连拨号被换成"记录目标后拨到本机静默对端"：用例只关心
+// 某条数据报有没有被拨到，既不真的把 255.255.255.255 这类目标发出去，也不依赖本机路由表。
 func newUDPTargetTestServer(t *testing.T, rt *router.Router) (*Socks5Server, *net.UDPConn, chan string) {
 	t.Helper()
 	sock, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
@@ -65,6 +61,9 @@ func newUDPTargetTestServer(t *testing.T, rt *router.Router) (*Socks5Server, *ne
 	})
 	// 拦截器在构造时持有 router 指针：两个使用方必须同时更新。
 	srv.router, srv.dns.router = rt, rt
+	// 把这个 socket 注册为当前 UDP 中继：同步 DNS 应答（sendToClient /
+	// responseDNSMsg）会经它写回查询的来源地址，因此可以直接从这里读回断言。
+
 	return srv, sock, dialed
 }
 
@@ -89,7 +88,7 @@ func TestHandleUDPDNSInterceptionRequiresPort53(t *testing.T) {
 	if err := probe.Unpack(payload); err != nil {
 		t.Fatalf("unpack nbns payload: %v", err)
 	}
-	if !isDNSQueryMsg(probe) {
+	if !util.IsDNSRequest(probe) {
 		t.Fatal("nbns payload must parse as a dns query, otherwise this case proves nothing")
 	}
 	if got := dns.TypeToString[probe.Question[0].Qtype]; got != "NIMLOC" {
@@ -101,8 +100,9 @@ func TestHandleUDPDNSInterceptionRequiresPort53(t *testing.T) {
 
 	srv, sock, dialed := newUDPTargetTestServer(t, newUDPTargetRouter(t))
 	clientAddr := sock.LocalAddr().(*net.UDPAddr)
+	frame, _ := buildUDPFrame(t, target, payload)
 
-	if err := srv.handleUDP(&socks5.Server{UDPConn: sock}, clientAddr, buildUDPDatagram(t, target, payload)); err != nil {
+	if err := srv.handleUDP(srv.registerTestUDPRelay(sock, clientAddr), frame, payload); err != nil {
 		t.Fatalf("handleUDP: %v", err)
 	}
 
@@ -139,8 +139,11 @@ func TestHandleUDPDNSInterceptionOnPort53(t *testing.T) {
 	}
 	srv, sock, dialed := newUDPTargetTestServer(t, rt)
 	clientAddr := sock.LocalAddr().(*net.UDPAddr)
+	// 注意：handleUDP 接收的是 SOCKS5 帧里承载的载荷，不含 RSV/FRAG/ATYP 头，
+	// 与旧库的 socks5.Datagram.Data 语义一致；帧头只用来给出目标地址。
+	frame, _ := buildUDPFrame(t, target, data)
 
-	if err := srv.handleUDP(&socks5.Server{UDPConn: sock}, clientAddr, buildUDPDatagram(t, target, data)); err != nil {
+	if err := srv.handleUDP(srv.registerTestUDPRelay(sock, clientAddr), frame, data); err != nil {
 		t.Fatalf("handleUDP: %v", err)
 	}
 
@@ -152,15 +155,12 @@ func TestHandleUDPDNSInterceptionOnPort53(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read udp reply: %v (a dns query on port 53 must still be intercepted)", err)
 	}
-	reply, err := socks5.NewDatagramFromBytes(buf[:n])
-	if err != nil {
-		t.Fatalf("parse datagram: %v", err)
-	}
-	if got := reply.Address(); got != target {
-		t.Errorf("reply source = %s, want the client's target %s", got, target)
+	replyTarget, replyData := parseUDPFrame(t, buf[:n])
+	if replyTarget != target {
+		t.Errorf("reply source = %s, want the client's target %s", replyTarget, target)
 	}
 	resp := new(dns.Msg)
-	if err := resp.Unpack(reply.Data); err != nil {
+	if err := resp.Unpack(replyData); err != nil {
 		t.Fatalf("unpack reply: %v", err)
 	}
 	if !resp.Response || resp.Id != q.Id {
@@ -211,7 +211,8 @@ func TestHandleUDPDropsLinkLocalTargets(t *testing.T) {
 			srv, sock, dialed := newUDPTargetTestServer(t, newUDPTargetRouter(t))
 			clientAddr := sock.LocalAddr().(*net.UDPAddr)
 
-			if err := srv.handleUDP(&socks5.Server{UDPConn: sock}, clientAddr, buildUDPDatagram(t, tt.target, payload)); err != nil {
+			frame, _ := buildUDPFrame(t, tt.target, payload)
+			if err := srv.handleUDP(srv.registerTestUDPRelay(sock, clientAddr), frame, payload); err != nil {
 				t.Fatalf("handleUDP: %v", err)
 			}
 
@@ -235,7 +236,7 @@ func TestHandleUDPDropsLinkLocalTargets(t *testing.T) {
 
 // TestIsNonRelayableUDPTarget 固定判定的边界：只丢弃受限广播/多播/链路本地单播，
 // 子网广播（198.18.255.255、192.168.1.255）是 global unicast，直连拨号会绑定物理
-// 接口，历史上一直按直连中继，行为必须保持不变。
+// 接口，按直连中继处理。
 func TestIsNonRelayableUDPTarget(t *testing.T) {
 	tests := []struct {
 		host string

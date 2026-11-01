@@ -6,12 +6,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptrace"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	sharedconfig "github.com/nange/easyss/v3/config"
-	"github.com/nange/easyss/v3/log"
+	"github.com/nange/easyss/v3/config"
 	"github.com/nange/easyss/v3/stats"
 	"github.com/nange/easyss/v3/transport"
 )
@@ -27,25 +27,32 @@ type http2Stream struct {
 	done   func()
 	slot   *transportSlot
 
-	// respReady 在 RoundTrip 结果（r/respErr）落定后关闭：Read 与
-	// AwaitResponse 都等待它，但只有 Read 消费响应体。
+	// respReady 在 RoundTrip 结果落定后关闭：Read 与 AwaitResponse 都等它，但只有 Read 消费响应体。
 	respReady chan struct{}
 	readyOnce sync.Once
 
-	// bootstrapSentAt 是客户端完成冲刷加密 bootstrap 记录（请求体）的时刻。
-	// 服务端在拨号源端之前就用响应头应答，因此该时间戳与响应到达之间的
-	// 时间差就是纯粹的 client<->server 路径 RTT（不含源端耗时）。
-	// 以 UnixNano 存储；0 表示从未打戳。
+	// endpoint/target 只为日志归因，不参与任何调度或协议决策。
+	endpoint string
+	target   string
+
+	// bootstrapSentAt 是 bootstrap 记录冲刷完成的时刻（UnixNano，0 表示未打戳）。服务端在
+	// 拨号源端之前就应答，因此到响应到达的差值就是纯路径 RTT，不含源端耗时。
 	bootstrapSentAt atomic.Int64
 
-	// connInUse 是本流实际使用过的底层连接身份，在第一次 body 写完成时快照
-	// （见 snapshotConnInUse）。InvalidateConn 只关闭它，并按槽位指针的身份
-	// CAS 决定唯一赢家。
-	connInUse atomic.Pointer[slotConn]
+	// gen 是本流提交请求时所用的那一代连接，由发起 RoundTrip 的 goroutine 在提交前写入。
+	gen atomic.Pointer[slotTransport]
 
-	// liveness 在本流所在连接上做一次轻量存活探测（见 transport.ConnLiveness）；
-	// 为 nil 时 ConnAlive 报告"无法判定"（未配置探测令牌）。
-	liveness func(ctx context.Context, slot *transportSlot) (alive, ok bool)
+	// trace 由本流独占。h2 在写出请求之前触发 GotConn，因此这条流实际落在哪条连接上不靠
+	// 猜：同一代里 net/http 可能重拨并换掉身份，失效必须按它。
+	trace httptrace.ClientTrace
+	// conn 是 trace 记录的身份；nil 表示这条流从未拿到连接（拨号阶段就失败了）。
+	conn atomic.Pointer[slotConn]
+
+	// liveness 为 nil 时 ConnAlive 报无法判定。
+	liveness func(ctx context.Context, gen *slotTransport) (alive, ok bool)
+
+	// slowRTT 为 nil（测试里裸构造的流）时越界样本照常逐条打印。
+	slowRTT *slowRTTLogLimiter
 
 	mu      sync.Mutex
 	r       io.ReadCloser
@@ -55,26 +62,22 @@ type http2Stream struct {
 	rtErrMu sync.Mutex
 	rtErr   error // RoundTrip 错误，捕获以便在 Write() 中提供更好的诊断
 
-	// heavy 流跟踪：一旦流够格成为 heavy（快速的大传输，或差链路上的慢
-	// 传输），它就会标记自己的槽位，使新流避免共享那条连接。见下文
-	// heavyIdle/heavyMarked/heavyReleased。
+	// heavy 流跟踪：流够格成为 heavy 后标记自己的槽位，使新流避开那条连接。
 	startTime   time.Time
 	transferred atomic.Int64
 	heavyMu     sync.Mutex
 	heavyState  atomic.Int32
 }
 
-// heavy 流状态机：流在首次够格成为 heavy 时从 heavyIdle 转换到 heavyMarked，
-// 关闭时从 heavyMarked 转换到 heavyReleased。互斥锁把每次转换与其槽位计数
-// 更新配对，因此无论 Read/Write/Close 如何交错，slot.heavy 都不会泄漏。
+// heavy 流状态机：首次够格时 idle→marked，关闭时 marked→released。互斥锁把每次转换与槽位
+// 计数更新配对，因此 Read/Write/Close 怎么交错都不会泄漏计数。
 const (
 	heavyIdle     int32 = iota // 流从未够格成为 heavy
 	heavyMarked                // 已够格：slot.heavy 已递增
 	heavyReleased              // 已关闭：若曾标记则 slot.heavy 已递减
 )
 
-// trackRead 累计下载字节数：计入槽位（传输健康与连接轮换信号）和 heavy 流
-// 检测器。
+// 累计下载字节数：计入槽位（健康与轮换信号）和 heavy 检测器。
 func (s *http2Stream) trackRead(n int) {
 	if s.slot == nil || n <= 0 {
 		return
@@ -84,8 +87,7 @@ func (s *http2Stream) trackRead(n int) {
 	s.accumulate(n)
 }
 
-// trackWrite 累计上传字节数：计入连接轮换计数器（上传密集的连接也必须触发
-// 轮换，因为中间设备按任一方向的总字节数限速）和 heavy 流检测器。
+// 中间设备按任一方向的总字节数限速，上传密集的连接也必须触发轮换。
 func (s *http2Stream) trackWrite(n int) {
 	if s.slot == nil || n <= 0 {
 		return
@@ -94,22 +96,18 @@ func (s *http2Stream) trackWrite(n int) {
 	s.accumulate(n)
 }
 
-// accumulate 把数据喂给 heavy 流检测器，并在流首次够格时把所属槽位标记为
-// heavy：要么跨越了快速大小阈值，要么存活足够久且至少承载了慢速阈值
-// （慢链路上即使小传输也会持续很久）。
+// 首次够格时标记槽位：跨越快速大小阈值，或存活足够久且承载了慢速阈值。
 func (s *http2Stream) accumulate(n int) {
 	if s.slot == nil || n <= 0 {
 		return
 	}
 	total := s.transferred.Add(int64(n))
-	// 快路径：标记每条流至多发生一次；一旦状态离开 heavyIdle（已标记或
-	// 已释放）就无事可做。
 	if s.heavyState.Load() != heavyIdle {
 		return
 	}
-	fast := total >= sharedconfig.HeavyStreamThresholdBytes
-	slow := total >= sharedconfig.HeavyStreamSlowThresholdBytes &&
-		time.Since(s.startTime) >= sharedconfig.HeavyStreamMinAge
+	fast := total >= config.HeavyStreamThresholdBytes
+	slow := total >= config.HeavyStreamSlowThresholdBytes &&
+		time.Since(s.startTime) >= config.HeavyStreamMinAge
 	if !fast && !slow {
 		return
 	}
@@ -120,9 +118,7 @@ func (s *http2Stream) accumulate(n int) {
 	}
 }
 
-// releaseHeavy 每条流恰好释放一次槽位的 heavy 标记。它从流的 done 回调
-// （由 sync.OnceFunc 守护）中调用，而 accumulate 可能从 Read/Write 并发
-// 运行。互斥锁把每次状态转换与计数更新配对，因此 slot.heavy 不会泄漏。
+// 每条流恰好释放一次槽位的 heavy 标记；它与 accumulate 可能并发。
 func (s *http2Stream) releaseHeavy() {
 	if s.slot == nil {
 		return
@@ -138,23 +134,18 @@ func (s *http2Stream) releaseHeavy() {
 	}
 }
 
-// setRoundTripErr 存储 RoundTrip 错误，供管道写入以 io.ErrClosedPipe 失败时
-// 的 Write() 使用。
 func (s *http2Stream) setRoundTripErr(err error) {
 	s.rtErrMu.Lock()
 	s.rtErr = err
 	s.rtErrMu.Unlock()
 }
 
-// MarkBootstrapSent 记录 bootstrap 记录冲刷到传输层的时刻。响应头大约在一个
-// 路径 RTT 后到达（服务端在拨号源端之前应答），Read() 把它记录为纯粹的
-// client<->server RTT 样本。
 func (s *http2Stream) MarkBootstrapSent() {
 	s.bootstrapSentAt.Store(time.Now().UnixNano())
 }
 
 func (s *http2Stream) Read(p []byte) (int, error) {
-	// 结果落定前阻塞等待；Close 会取消请求，使 RoundTrip 返回并落定结果。
+	// Close 会取消请求，使 RoundTrip 返回并落定结果。
 	if s.respReady != nil {
 		<-s.respReady
 	}
@@ -171,7 +162,7 @@ func (s *http2Stream) Read(p []byte) (int, error) {
 	if r == nil {
 		s.done()
 		if respErr != nil {
-			return 0, respErr
+			return 0, s.wrapRetired(respErr)
 		}
 		return 0, io.EOF
 	}
@@ -182,6 +173,7 @@ func (s *http2Stream) Read(p []byte) (int, error) {
 	}
 	if err != nil {
 		s.done()
+		err = s.wrapRetired(err)
 	}
 	return n, err
 }
@@ -190,7 +182,6 @@ func (s *http2Stream) Write(p []byte) (int, error) {
 	n, err := s.w.Write(p)
 	if n > 0 {
 		s.trackWrite(n)
-		s.snapshotConnInUse()
 	}
 	if err != nil {
 		s.done()
@@ -199,32 +190,29 @@ func (s *http2Stream) Write(p []byte) (int, error) {
 			rtErr := s.rtErr
 			s.rtErrMu.Unlock()
 			if rtErr != nil {
-				// 同时包裹两个错误，使调用方仍能匹配 io.ErrClosedPipe 做重试
-				// 决策，同时也能看到根本原因。
-				return n, fmt.Errorf("%w: %w", io.ErrClosedPipe, rtErr)
+				// 同时包裹两个错误，调用方仍能匹配 io.ErrClosedPipe 做重试决策。
+				return n, s.wrapRetired(fmt.Errorf("%w: %w", io.ErrClosedPipe, rtErr))
 			}
 		}
+		return n, s.wrapRetired(err)
 	}
 	return n, err
 }
 
-// snapshotConnInUse 记住承载本流的底层连接。第一次 body 写完成时连接必然已经
-// 建立：net/http 必须先写出请求头、拿到连接，才会去读取请求体；而每个槽位的
-// http.Transport 设了 MaxConnsPerHost=1，同一时刻至多一条连接，因此这个快照
-// 就是"我自己实际用过的那条"。InvalidateConn 据此只关闭它。
-func (s *http2Stream) snapshotConnInUse() {
-	if s.slot == nil || s.connInUse.Load() != nil {
-		return
+// 给连接代已作废的读写错误加上 transport.ErrConnRetired：判死与 net/http 自然回收都会换代，
+// 代不一致即说明这条流不可能再健康。io.EOF 是正常结束，不能包装。
+func (s *http2Stream) wrapRetired(err error) error {
+	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, transport.ErrConnRetired) {
+		return err
 	}
-	if sc := s.slot.conn.Load(); sc != nil {
-		s.connInUse.CompareAndSwap(nil, sc)
+	gen := s.gen.Load()
+	if gen == nil || s.slot == nil || s.slot.generation() == gen {
+		return err
 	}
+	return fmt.Errorf("%w: %w", transport.ErrConnRetired, err)
 }
 
-// deliver 落定 RoundTrip 的结果：先存入 r/respErr（Write 的诊断与
-// AwaitResponse 都要读它），再关闭 respReady 唤醒等待方。若流在结果到达前
-// 已被上层放弃（判死重试或取消），响应体不会再有人读取，因此在这里关闭它，
-// 避免遗留一条无人读取的 HTTP/2 流。
+// 流若已在上层被放弃，响应体不会有人读取，必须在这里关闭，避免遗留一条无人读取的流。
 func (s *http2Stream) deliver(res roundTripResult) {
 	var body io.ReadCloser
 	if res.resp != nil {
@@ -244,27 +232,29 @@ func (s *http2Stream) deliver(res roundTripResult) {
 
 	s.setRoundTripErr(res.err)
 	if res.err == nil && res.resp != nil {
-		// 响应头已到达：若 MarkBootstrapSent 已打戳（bootstrap 记录已冲刷），
-		// 这就是纯路径 RTT——服务端在拨号源端之前就提交了响应。在结果落定的
-		// 时刻采样，避免把代理层等待/调度的时间算进路径 RTT。
+		// 在结果落定的时刻采样，避免把代理层的等待与调度算进路径 RTT。
 		if t0 := s.bootstrapSentAt.Load(); t0 > 0 {
-			stats.RecordRTT(time.Since(time.Unix(0, t0)))
+			d := time.Since(time.Unix(0, t0))
+			stats.RecordRTT(d)
+			// 越界样本额外记 Warn 并限流：平均值只能看出变慢，日志回答是谁慢。
+			s.slowRTT.log(d, slowRTTSample{
+				source:   slowRTTSourceStream,
+				endpoint: s.endpoint,
+				target:   s.target,
+				slot:     s.slot,
+			})
 		}
 	}
 	s.readyOnce.Do(func() { close(s.respReady) })
 }
 
-// roundTripErr 返回落定后的 RoundTrip 错误：Read 与 AwaitResponse 对它的解读
-// 一致，但拒绝类错误在 AwaitResponse 中被视为"结果已就绪"。
 func (s *http2Stream) roundTripErr() error {
 	s.rtErrMu.Lock()
 	defer s.rtErrMu.Unlock()
-	return s.rtErr
+	return s.wrapRetired(s.rtErr)
 }
 
-// AwaitResponse 等待 RoundTrip 结果就绪而不消费响应体
-// （见 transport.ResponseAwaiter）：服务端以非 200 拒绝握手同样是"结果已就绪"，
-// 重试决策不应把它当作网络故障（分类留给首次 Read）。ctx 结束时返回 ctx.Err()。
+// 服务端以非 200 拒绝握手同样是结果已就绪，重试决策不应把它当作网络故障。
 func (s *http2Stream) AwaitResponse(ctx context.Context) error {
 	if s.respReady == nil {
 		return nil
@@ -280,36 +270,36 @@ func (s *http2Stream) AwaitResponse(ctx context.Context) error {
 	}
 }
 
-// ConnAlive 在本流所在槽位的连接上做一次轻量存活探测
-// （见 transport.ConnLiveness）。ok=false 表示无法判定（未配置探测令牌），
-// 调用方应按判死处理。
+// ok=false 表示无法判定（未配置探测令牌或尚未提交）。探测以代为粒度：HEAD 可能落到同代
+// 的另一条连接（重拨出来的，或本来就在池里的旧连接），结论不一定对这条流的那条成立。
 func (s *http2Stream) ConnAlive(ctx context.Context) (alive, ok bool) {
-	if s.slot == nil || s.liveness == nil {
+	if s.liveness == nil {
 		return false, false
 	}
-	return s.liveness(ctx, s.slot)
+	gen := s.gen.Load()
+	if gen == nil {
+		return false, false
+	}
+	return s.liveness(ctx, gen)
 }
 
-// InvalidateConn 强制关闭本流实际使用过的底层连接
-// （见 transport.ConnInvalidator），使下一次 Open 重新拨号。身份 CAS 同时挡住
-// 两件事：同一连接被多条流重复失效（只有赢家执行），以及误杀后来新建的连接
-// （新连接身份不同，CAS 必然失败）。
+// GotConn 在写出请求前触发。一次 RoundTrip 可能因 errClientConnUnusable 带未读 body 重试并
+// 再次触发，记最后一条：那才是这条流实际承载在的那条连接。
+func (s *http2Stream) noteConn(info httptrace.GotConnInfo) {
+	if tc, ok := info.Conn.(*trackedConn); ok && tc.self != nil {
+		s.conn.Store(tc.self)
+	}
+}
+
+// 身份来自 GotConn，是本流最后一次尝试落到的连接：本流自己重试换到的连接会被关（那正是
+// 实际承载它的那条），其他流拨出的替代者不受影响。没有身份说明这条流从未拿到连接。
 func (s *http2Stream) InvalidateConn() {
-	sc := s.connInUse.Load()
-	if sc == nil || s.slot == nil {
+	gen := s.gen.Load()
+	conn := s.conn.Load()
+	if s.slot == nil || gen == nil || conn == nil {
 		return
 	}
-	if s.slot.conn.CompareAndSwap(sc, nil) {
-		s.slot.resetRotation()
-		_ = sc.c.Close()
-		// 这是连接级事件，与 slot grown/rotated/retired 同级放在 Info：身份 CAS
-		// 保证每条被丢弃的连接恰好记一条，同一连接上的多条流同时判死也不会刷屏。
-		// 默认 Info 级别下它是"判死即换连接"唯一可见的锚点（逐流的判死原因与
-		// 重试决策在代理层记 Debug，见 client/proxy/stream.go）。
-		log.Info("[TRANSPORT] connection invalidated",
-			"slot", s.slot.idx,
-			"active_streams", s.slot.active.Load())
-	}
+	s.slot.invalidateConnIf(gen, conn, "stream dead")
 }
 
 func (s *http2Stream) CloseWrite() error {
@@ -323,8 +313,8 @@ func (s *http2Stream) Close() error {
 
 	s.mu.Lock()
 	s.closed = true
-	// 结果可能已经交付但还没有人读取（判死重试、上层取消）：关闭它，避免
-	// 遗留一条无人读取的 HTTP/2 流。结果迟到的情形由 deliver 处理。
+	// 结果已交付但无人读取（判死重试、上层取消）时关闭它，避免遗留 HTTP/2 流；
+	// 结果迟到的情形由 deliver 处理。
 	r := s.r
 	s.r = nil
 	if s.respErr == nil {
@@ -345,12 +335,8 @@ var (
 	_ transport.ConnInvalidator = (*http2Stream)(nil)
 )
 
-// SlotDraining 报告流的槽位是否已到驱逐期：连接超过生命周期或字节限制
-// （expiring），或已被证实持续缓慢（degraded），因此应被回收。代理层断言
-// 流实现了 transport.SlotDrainingStream，并通过 relay.BidirectionalWithDrain
-// 提前关闭空闲流，使徘徊的 keep-alive 和半关闭连接无法把槽位的轮换/退役
-// 推迟到完整的中继空闲超时。活跃流永远不会被排空：中继只会在它们空闲
-// ExpiringStreamDrainIdle 时间后才关闭它们。
+// 代理层据此用 relay.BidirectionalWithDrain 提前关闭空闲流，使 keep-alive 与半关闭连接
+// 无法推迟轮换。
 func (s *http2Stream) SlotDraining() bool {
 	return s.slot != nil && (s.slot.expiring.Load() || s.slot.degraded.Load())
 }

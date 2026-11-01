@@ -9,13 +9,15 @@ import (
 	"syscall"
 	"testing"
 
-	"github.com/nange/easyss/v3/client/config"
+	clientconfig "github.com/nange/easyss/v3/client/config"
 	"github.com/nange/easyss/v3/client/router"
-	sharedconfig "github.com/nange/easyss/v3/config"
+	"github.com/nange/easyss/v3/config"
 	"github.com/xjasonlyu/tun2socks/v2/dialer"
 )
 
 func TestIsInterfaceStaleError(t *testing.T) {
+	t.Parallel()
+
 	cases := []struct {
 		name string
 		err  error
@@ -41,8 +43,7 @@ func TestIsInterfaceStaleError(t *testing.T) {
 }
 
 func TestRefreshDirectDialer(t *testing.T) {
-	orig := detectDialIface
-	t.Cleanup(func() { detectDialIface = orig })
+	t.Parallel()
 
 	c := &Client{}
 	c.bound.Store(boundIface{name: "en0", index: 4})
@@ -51,7 +52,7 @@ func TestRefreshDirectDialer(t *testing.T) {
 	en1 := &net.Interface{Index: 7, Name: "en1", Flags: net.FlagUp}
 
 	t.Run("interface changed", func(t *testing.T) {
-		detectDialIface = func() (*net.Interface, error) { return en1, nil }
+		c.sys.detectIface = func() (*net.Interface, error) { return en1, nil }
 		if !c.refreshDirectDialer() {
 			t.Fatal("expected refresh to replace the dialer")
 		}
@@ -65,14 +66,14 @@ func TestRefreshDirectDialer(t *testing.T) {
 	})
 
 	t.Run("unchanged interface", func(t *testing.T) {
-		detectDialIface = func() (*net.Interface, error) { return en1, nil }
+		c.sys.detectIface = func() (*net.Interface, error) { return en1, nil }
 		if c.refreshDirectDialer() {
 			t.Fatal("expected no refresh for the same interface")
 		}
 	})
 
 	t.Run("detection failure keeps old dialer", func(t *testing.T) {
-		detectDialIface = func() (*net.Interface, error) { return nil, errors.New("no route") }
+		c.sys.detectIface = func() (*net.Interface, error) { return nil, errors.New("no route") }
 		if c.refreshDirectDialer() {
 			t.Fatal("expected no refresh on detection failure")
 		}
@@ -84,40 +85,34 @@ func TestRefreshDirectDialer(t *testing.T) {
 }
 
 // newTestClient 构建一个最小化的 Client，带 router，并通过 tunEnabled 切换 TUN 模式。
+// TUN 状态由 SetTunMode 显式设置：它不再来自配置快照（见 Client.tunMode）。
 func newTestClient(t *testing.T, tunEnabled bool) *Client {
 	t.Helper()
-
-	cfg := &config.ClientConfig{}
-	cfg.Local.EnableTun2socks = tunEnabled
 
 	rt, err := router.New(router.Config{})
 	if err != nil {
 		t.Fatalf("router.New: %v", err)
 	}
 
-	c := &Client{cfg: cfg, router: rt}
+	c := &Client{cfg: &clientconfig.ClientConfig{}, router: rt}
+	c.SetTunMode(tunEnabled)
 	c.bound.Store(boundIface{name: "en0", index: 4})
 	c.dialer.Store(dialer.New())
 	return c
 }
 
 func TestDialWithConfigRefreshesAndRetriesOnStaleError(t *testing.T) {
-	origDetect := detectDialIface
-	origBound := boundDialContext
-	t.Cleanup(func() {
-		detectDialIface = origDetect
-		boundDialContext = origBound
-	})
+	t.Parallel()
 
 	c := newTestClient(t, true)
 
 	// 我们"休眠"期间接口发生了变化。
-	detectDialIface = func() (*net.Interface, error) {
+	c.sys.detectIface = func() (*net.Interface, error) {
 		return &net.Interface{Index: 9, Name: "en9", Flags: net.FlagUp}, nil
 	}
 
 	calls := 0
-	boundDialContext = func(_ *Client, ctx context.Context, network, addr string) (net.Conn, error) {
+	c.sys.dialBound = func(_ *Client, ctx context.Context, network, addr string) (net.Conn, error) {
 		calls++
 		if calls == 1 {
 			return nil, syscall.ENETDOWN
@@ -142,21 +137,16 @@ func TestDialWithConfigRefreshesAndRetriesOnStaleError(t *testing.T) {
 }
 
 func TestDialWithConfigNoRetryOnNonStaleError(t *testing.T) {
-	origDetect := detectDialIface
-	origBound := boundDialContext
-	t.Cleanup(func() {
-		detectDialIface = origDetect
-		boundDialContext = origBound
-	})
+	t.Parallel()
 
 	c := newTestClient(t, true)
 
-	detectDialIface = func() (*net.Interface, error) {
+	c.sys.detectIface = func() (*net.Interface, error) {
 		return &net.Interface{Index: 9, Name: "en9", Flags: net.FlagUp}, nil
 	}
 
 	calls := 0
-	boundDialContext = func(_ *Client, ctx context.Context, network, addr string) (net.Conn, error) {
+	c.sys.dialBound = func(_ *Client, ctx context.Context, network, addr string) (net.Conn, error) {
 		calls++
 		return nil, syscall.ECONNREFUSED
 	}
@@ -177,23 +167,74 @@ func TestDialWithConfigNoRetryOnNonStaleError(t *testing.T) {
 	}
 }
 
+// TestSetTunModeControlsTheBoundDialPath 固定"运行期 TUN 状态来自 SetTunMode、
+// 不来自配置快照"：TUN 关闭时直连拨号不得走绑定接口的拨号器，SetTunMode(true)
+// 之后才走。
+func TestSetTunModeControlsTheBoundDialPath(t *testing.T) {
+	t.Parallel()
+
+	c := newTestClient(t, false)
+
+	boundCalls := 0
+	c.sys.dialBound = func(*Client, context.Context, string, string) (net.Conn, error) {
+		boundCalls++
+		return &net.TCPConn{}, nil
+	}
+
+	// TUN 关闭：走普通 net.Dialer（刻意拨一个必然被拒绝的端口），
+	// 绑定接口的拨号路径不得被碰到。
+	if _, err := c.dialWithConfig(context.Background(), "tcp", "127.0.0.1:1"); err == nil {
+		t.Fatal("expected an error from the plain dialer")
+	}
+	if boundCalls != 0 {
+		t.Fatalf("bound dial calls = %d, want 0 while TUN is off", boundCalls)
+	}
+
+	// TUN 打开：同一个客户端现在必须走绑定接口的拨号器。
+	c.SetTunMode(true)
+	conn, err := c.dialWithConfig(context.Background(), "tcp", "127.0.0.1:1")
+	if err != nil {
+		t.Fatalf("dialWithConfig after SetTunMode(true): %v", err)
+	}
+	if conn == nil || boundCalls != 1 {
+		t.Fatalf("bound dial calls = %d (conn=%v), want 1 after TUN is on", boundCalls, conn)
+	}
+}
+
+// TestTunModeAndTunForwardingAreIndependent 固定两个状态不能互相代偿：拨号器的绑定与 forward DNS
+// 的放行各有各的边，合并会把其中一方推向不安全的一侧。
+func TestTunModeAndTunForwardingAreIndependent(t *testing.T) {
+	t.Parallel()
+
+	c := newTestClient(t, false)
+
+	c.SetTunForwarding(true)
+	if c.TunModeEnabled() {
+		t.Fatal("publishing the forwarding state must not bind the direct dialer")
+	}
+	if !c.TunForwardingEnabled() {
+		t.Fatal("SetTunForwarding(true) was not published")
+	}
+
+	c.SetTunForwarding(false)
+	c.SetTunMode(true)
+	if c.TunForwardingEnabled() {
+		t.Fatal("binding the direct dialer must not open the forward DNS gate")
+	}
+}
+
 func TestDialWithConfigNoRefreshWhenBindingUnchanged(t *testing.T) {
-	origDetect := detectDialIface
-	origBound := boundDialContext
-	t.Cleanup(func() {
-		detectDialIface = origDetect
-		boundDialContext = origBound
-	})
+	t.Parallel()
 
 	c := newTestClient(t, true)
 
 	// 与启动时记录的接口相同：刷新不得替换它，因此重试仍使用同一个 dialer。
-	detectDialIface = func() (*net.Interface, error) {
+	c.sys.detectIface = func() (*net.Interface, error) {
 		return &net.Interface{Index: 4, Name: "en0", Flags: net.FlagUp}, nil
 	}
 
 	calls := 0
-	boundDialContext = func(_ *Client, ctx context.Context, network, addr string) (net.Conn, error) {
+	c.sys.dialBound = func(_ *Client, ctx context.Context, network, addr string) (net.Conn, error) {
 		calls++
 		if calls == 1 {
 			return nil, syscall.ENETDOWN
@@ -211,13 +252,12 @@ func TestDialWithConfigNoRefreshWhenBindingUnchanged(t *testing.T) {
 }
 
 func TestDialWithConfigPlainPathWhenTunDisabled(t *testing.T) {
-	origBound := boundDialContext
-	t.Cleanup(func() { boundDialContext = origBound })
+	t.Parallel()
 
 	c := newTestClient(t, false)
 
 	called := false
-	boundDialContext = func(_ *Client, ctx context.Context, network, addr string) (net.Conn, error) {
+	c.sys.dialBound = func(_ *Client, ctx context.Context, network, addr string) (net.Conn, error) {
 		called = true
 		return nil, errors.New("must not be used when TUN is disabled")
 	}
@@ -233,14 +273,13 @@ func TestDialWithConfigPlainPathWhenTunDisabled(t *testing.T) {
 }
 
 func TestRefreshDirectDialerIgnoresTunDevice(t *testing.T) {
-	orig := detectDialIface
-	t.Cleanup(func() { detectDialIface = orig })
+	t.Parallel()
 
 	c := newTestClient(t, true)
-	detectDialIface = func() (*net.Interface, error) {
+	c.sys.detectIface = func() (*net.Interface, error) {
 		// TUN 激活期间，Windows/Linux 的路由探测会解析到 TUN 设备本身。
 		// 绑定到它会让每次拨号都回环进 TUN 设备。
-		return &net.Interface{Index: 10, Name: sharedconfig.DefaultTunDeviceName, Flags: net.FlagUp}, nil
+		return &net.Interface{Index: 10, Name: config.DefaultTunDeviceName, Flags: net.FlagUp}, nil
 	}
 
 	if c.refreshDirectDialer() {
@@ -253,14 +292,13 @@ func TestRefreshDirectDialerIgnoresTunDevice(t *testing.T) {
 }
 
 func TestRefreshDirectDialerIgnoresCustomTunDeviceName(t *testing.T) {
-	orig := detectDialIface
-	t.Cleanup(func() { detectDialIface = orig })
+	t.Parallel()
 
 	c := newTestClient(t, true)
 	c.cfg.Local.TunConfig = json.RawMessage(`{"device":"my-tun9"}`)
 
 	t.Run("custom tun device name is rejected", func(t *testing.T) {
-		detectDialIface = func() (*net.Interface, error) {
+		c.sys.detectIface = func() (*net.Interface, error) {
 			return &net.Interface{Index: 21, Name: "my-tun9", Flags: net.FlagUp}, nil
 		}
 		if c.refreshDirectDialer() {
@@ -273,7 +311,7 @@ func TestRefreshDirectDialerIgnoresCustomTunDeviceName(t *testing.T) {
 	})
 
 	t.Run("unrelated interface still refreshes", func(t *testing.T) {
-		detectDialIface = func() (*net.Interface, error) {
+		c.sys.detectIface = func() (*net.Interface, error) {
 			return &net.Interface{Index: 22, Name: "en7", Flags: net.FlagUp}, nil
 		}
 		if !c.refreshDirectDialer() {
@@ -287,23 +325,18 @@ func TestRefreshDirectDialerIgnoresCustomTunDeviceName(t *testing.T) {
 }
 
 func TestDialWithConfigNoRetryWhenRefreshDetectsTun(t *testing.T) {
-	origDetect := detectDialIface
-	origBound := boundDialContext
-	t.Cleanup(func() {
-		detectDialIface = origDetect
-		boundDialContext = origBound
-	})
+	t.Parallel()
 
 	c := newTestClient(t, true)
 
 	// 拨号因接口过期错误失败，但探测解析到 TUN 设备（TUN 已激活）：刷新必须保留旧的绑定
 	// 且不重试，因为经由 TUN 设备重试会形成回环。
-	detectDialIface = func() (*net.Interface, error) {
-		return &net.Interface{Index: 10, Name: sharedconfig.DefaultTunDeviceName, Flags: net.FlagUp}, nil
+	c.sys.detectIface = func() (*net.Interface, error) {
+		return &net.Interface{Index: 10, Name: config.DefaultTunDeviceName, Flags: net.FlagUp}, nil
 	}
 
 	calls := 0
-	boundDialContext = func(_ *Client, ctx context.Context, network, addr string) (net.Conn, error) {
+	c.sys.dialBound = func(_ *Client, ctx context.Context, network, addr string) (net.Conn, error) {
 		calls++
 		return nil, syscall.ENETDOWN
 	}
@@ -325,16 +358,16 @@ func TestDialWithConfigNoRetryWhenRefreshDetectsTun(t *testing.T) {
 }
 
 func TestStartupDialIface(t *testing.T) {
-	tunIface := &net.Interface{Index: 10, Name: sharedconfig.DefaultTunDeviceName, Flags: net.FlagUp}
+	t.Parallel()
+
+	tunIface := &net.Interface{Index: 10, Name: config.DefaultTunDeviceName, Flags: net.FlagUp}
 
 	t.Run("probe returns physical interface", func(t *testing.T) {
-		orig := detectDialIface
-		t.Cleanup(func() { detectDialIface = orig })
-		detectDialIface = func() (*net.Interface, error) {
+		c := newTestClient(t, true)
+		c.sys.detectIface = func() (*net.Interface, error) {
 			return &net.Interface{Index: 4, Name: "en0", Flags: net.FlagUp}, nil
 		}
 
-		c := newTestClient(t, true)
 		iface := c.startupDialIface()
 		if iface == nil || iface.Name != "en0" {
 			t.Fatalf("startupDialIface = %v, want en0", iface)
@@ -342,29 +375,21 @@ func TestStartupDialIface(t *testing.T) {
 	})
 
 	t.Run("probe returns TUN device, falls back to physical interface", func(t *testing.T) {
-		origDetect := detectDialIface
-		origList := listInterfaces
-		origAddrs := ifaceAddrs
-		t.Cleanup(func() {
-			detectDialIface = origDetect
-			listInterfaces = origList
-			ifaceAddrs = origAddrs
-		})
-		detectDialIface = func() (*net.Interface, error) { return tunIface, nil }
-		listInterfaces = func() ([]net.Interface, error) {
+		c := newTestClient(t, true)
+		c.sys.detectIface = func() (*net.Interface, error) { return tunIface, nil }
+		c.sys.listInterfaces = func() ([]net.Interface, error) {
 			return []net.Interface{
-				{Index: 10, Name: sharedconfig.DefaultTunDeviceName, Flags: net.FlagUp},
+				{Index: 10, Name: config.DefaultTunDeviceName, Flags: net.FlagUp},
 				{Index: 7, Name: "en0", Flags: net.FlagUp},
 			}, nil
 		}
-		ifaceAddrs = func(iface *net.Interface) ([]net.Addr, error) {
+		c.sys.ifaceAddrs = func(iface *net.Interface) ([]net.Addr, error) {
 			if iface.Name != "en0" {
 				return nil, errors.New("no addrs")
 			}
 			return []net.Addr{&net.IPNet{IP: net.IPv4(192, 168, 1, 5), Mask: net.CIDRMask(24, 32)}}, nil
 		}
 
-		c := newTestClient(t, true)
 		iface := c.startupDialIface()
 		if iface == nil || iface.Name != "en0" || iface.Index != 7 {
 			t.Fatalf("startupDialIface = %v, want fallback en0/index 7", iface)
@@ -372,18 +397,12 @@ func TestStartupDialIface(t *testing.T) {
 	})
 
 	t.Run("probe fails and no usable interface, returns nil", func(t *testing.T) {
-		origDetect := detectDialIface
-		origList := listInterfaces
-		t.Cleanup(func() {
-			detectDialIface = origDetect
-			listInterfaces = origList
-		})
-		detectDialIface = func() (*net.Interface, error) { return nil, errors.New("no route") }
-		listInterfaces = func() ([]net.Interface, error) {
-			return []net.Interface{{Index: 10, Name: sharedconfig.DefaultTunDeviceName, Flags: net.FlagUp}}, nil
+		c := newTestClient(t, true)
+		c.sys.detectIface = func() (*net.Interface, error) { return nil, errors.New("no route") }
+		c.sys.listInterfaces = func() ([]net.Interface, error) {
+			return []net.Interface{{Index: 10, Name: config.DefaultTunDeviceName, Flags: net.FlagUp}}, nil
 		}
 
-		c := newTestClient(t, true)
 		if iface := c.startupDialIface(); iface != nil {
 			t.Fatalf("startupDialIface = %v, want nil (unbound fallback)", iface)
 		}
@@ -391,11 +410,11 @@ func TestStartupDialIface(t *testing.T) {
 }
 
 func TestInitDirectDialerUnsupportedPlatform(t *testing.T) {
-	orig := ifaceBindUnsupported
-	t.Cleanup(func() { ifaceBindUnsupported = orig })
-	ifaceBindUnsupported = func() bool { return true }
+	t.Parallel()
 
 	c := &Client{}
+	c.sys.bindUnsupported = func() bool { return true }
+
 	c.bound.Store(boundIface{name: "en0", index: 4})
 
 	if name := c.initDirectDialer(); name != "" {
@@ -411,18 +430,14 @@ func TestInitDirectDialerUnsupportedPlatform(t *testing.T) {
 }
 
 func TestInitDirectDialerBindsWhenSupported(t *testing.T) {
-	orig := ifaceBindUnsupported
-	origDetect := detectDialIface
-	t.Cleanup(func() {
-		ifaceBindUnsupported = orig
-		detectDialIface = origDetect
-	})
-	ifaceBindUnsupported = func() bool { return false }
-	detectDialIface = func() (*net.Interface, error) {
+	t.Parallel()
+
+	c := &Client{}
+	c.sys.bindUnsupported = func() bool { return false }
+	c.sys.detectIface = func() (*net.Interface, error) {
 		return &net.Interface{Index: 7, Name: "en0", Flags: net.FlagUp}, nil
 	}
 
-	c := &Client{}
 	if name := c.initDirectDialer(); name != "en0" {
 		t.Fatalf("initDirectDialer = %q, want en0", name)
 	}
@@ -433,19 +448,13 @@ func TestInitDirectDialerBindsWhenSupported(t *testing.T) {
 }
 
 func TestInitDirectDialerUnboundOnDetectionFailure(t *testing.T) {
-	orig := ifaceBindUnsupported
-	origDetect := detectDialIface
-	origList := listInterfaces
-	t.Cleanup(func() {
-		ifaceBindUnsupported = orig
-		detectDialIface = origDetect
-		listInterfaces = origList
-	})
-	ifaceBindUnsupported = func() bool { return false }
-	detectDialIface = func() (*net.Interface, error) { return nil, errors.New("no route") }
-	listInterfaces = func() ([]net.Interface, error) { return nil, nil }
+	t.Parallel()
 
 	c := &Client{}
+	c.sys.bindUnsupported = func() bool { return false }
+	c.sys.detectIface = func() (*net.Interface, error) { return nil, errors.New("no route") }
+	c.sys.listInterfaces = func() ([]net.Interface, error) { return nil, nil }
+
 	if name := c.initDirectDialer(); name != "" {
 		t.Fatalf("initDirectDialer = %q, want unbound", name)
 	}
@@ -458,11 +467,11 @@ func TestInitDirectDialerUnboundOnDetectionFailure(t *testing.T) {
 }
 
 func TestRefreshDirectDialerSkipsOnUnsupportedPlatform(t *testing.T) {
-	orig := ifaceBindUnsupported
-	t.Cleanup(func() { ifaceBindUnsupported = orig })
-	ifaceBindUnsupported = func() bool { return true }
+	t.Parallel()
 
 	c := &Client{}
+	c.sys.bindUnsupported = func() bool { return true }
+
 	c.bound.Store(boundIface{name: "en0", index: 4})
 	c.dialer.Store(dialer.New())
 

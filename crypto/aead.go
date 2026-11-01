@@ -11,6 +11,8 @@ import (
 
 type Encryptor interface {
 	Encrypt(plaintext, aad []byte, nonce []byte) ([]byte, error)
+	// EncryptInto 必须原地写入 dst 的底层数组（从 dst 起点开始），调用方依赖返回切片
+	// 仍指回同一块缓冲；容量不足就另分配会让写出的记录变成缓冲残留数据，是线上正确性问题。
 	EncryptInto(dst, plaintext, aad, nonce []byte) ([]byte, error)
 	Decrypt(ciphertext, aad []byte, nonce []byte) ([]byte, error)
 	NonceSize() int

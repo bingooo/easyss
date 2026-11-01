@@ -1,6 +1,7 @@
 package stats
 
 import (
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -19,23 +20,36 @@ type StreamMeter struct {
 	last         atomic.Int64
 	state        atomic.Value
 	lastLoggedAt atomic.Int64
+	// done 停止观察 goroutine（若已启动）；loopStarted 保证它至多启动一次，并让 Close 能区分
+	// "已启动、需要等待它退出"与"从未启动、不能等"。
 	done         chan struct{}
+	loopStarted  atomic.Bool
+	loopFinished chan struct{}
+	closeOnce    sync.Once
 }
 
+// NewStreamMeter 创建一条流的字节计数与停顿探测器。观察 goroutine 不在构造时启动：停顿判定
+// 要求 total ≥ stallThreshold，绝大多数流（短命流、空闲长连接、心跳流）一生都用不到它，惰性
+// 化因此省掉每条流一个 goroutine 加一个 5s ticker，且不改变可观测语义。
 func NewStreamMeter(component, target string) *StreamMeter {
 	m := &StreamMeter{
-		component: component,
-		target:    target,
-		done:      make(chan struct{}),
+		component:    component,
+		target:       target,
+		done:         make(chan struct{}),
+		loopFinished: make(chan struct{}),
 	}
 	m.state.Store("open")
-	go m.loop()
 	return m
 }
 
 func (m *StreamMeter) Add(n int, state string) {
 	if n > 0 {
-		m.total.Add(int64(n))
+		total := m.total.Add(int64(n))
+		// 先做只读的 Load 再 CAS：total 只会继续增长，少了这层短路，热路径上每次 Add
+		// 都要付一次注定失败的原子 RMW；CAS 仍负责并发下的唯一性。
+		if total >= stallThreshold && !m.loopStarted.Load() && m.loopStarted.CompareAndSwap(false, true) {
+			go m.loop()
+		}
 	}
 	m.SetState(state)
 }
@@ -46,16 +60,21 @@ func (m *StreamMeter) SetState(state string) {
 	}
 }
 
-// Bytes 返回该流中继的总字节数。
 func (m *StreamMeter) Bytes() int64 {
 	return m.total.Load()
 }
 
+// Close 停止停顿探测并等待观察 goroutine 退出，幂等。只有真正启动过 goroutine 时才等待：
+// 未启动时 loopFinished 永远不会关闭，在那里等待就是永久阻塞。
 func (m *StreamMeter) Close() {
-	close(m.done)
+	m.closeOnce.Do(func() { close(m.done) })
+	if m.loopStarted.Load() {
+		<-m.loopFinished
+	}
 }
 
 func (m *StreamMeter) loop() {
+	defer close(m.loopFinished)
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	for {

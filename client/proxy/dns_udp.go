@@ -2,29 +2,25 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"net"
-	"strings"
 
 	"github.com/miekg/dns"
-	"github.com/nange/easyss/v3/client/config"
+	clientconfig "github.com/nange/easyss/v3/client/config"
 	"github.com/nange/easyss/v3/log"
+	"github.com/nange/easyss/v3/shaper"
 	"github.com/nange/easyss/v3/stats"
-	"github.com/nange/easyss/v3/util"
 )
 
-// udpReply 把一条 DNS 应答交回客户端：msg 供同步分支（屏蔽/缓存/直连）使用，
-// raw 供异步的代理分支使用——后者的应答由 udpPool.receiveLoop 在任意时刻送回。
-// 两者的组帧都由前端负责（SOCKS5 数据报必须按客户端请求的目标地址封装）。
+// msg 供同步分支（屏蔽/缓存/直连）使用，raw 供异步的代理分支使用（应答由
+// udpPool.receiveLoop 在任意时刻送回）；组帧由前端负责，SOCKS5 数据报要按客户端目标封装。
 type udpReply struct {
 	msg func(*dns.Msg) error
 	raw func([]byte)
 }
 
-// udpDNSQuery 是一条已完成解包的 UDP DNS 查询及其应答通道。
-// raw 是原始数据报载荷，用于经隧道发出（首载荷会合并进引导记录）。
-// src/dst 只用于日志：请求来源与客户端询问的解析器。端口门控之后的 UDP DNS
-// 拦截一律以 53 为目标，但日志里的 dst 能直接指出"这条查询被送到哪里"，
-// 排障时不必再从 QNAME 反推。
+// raw 是原始数据报载荷，用于经隧道发出（首载荷会合并进引导记录）；src/dst 只用于日志，
+// dst 能直接指出这条查询被送到哪里，排障不必再从 QNAME 反推。
 type udpDNSQuery struct {
 	raw   []byte
 	msg   *dns.Msg
@@ -33,67 +29,54 @@ type udpDNSQuery struct {
 	reply udpReply
 }
 
-// handleUDPQuery 处理一条 UDP DNS 查询：Block 本地屏蔽，缓存命中直接应答，
-// Direct 走直连解析，其余经隧道到 config.ProxyDNSServer。
 func (d *dnsInterceptor) handleUDPQuery(clientAddr *net.UDPAddr, req udpDNSQuery) error {
 	plan := d.plan(req.msg)
-	switch plan.action {
-	case dnsActionBlock:
-		log.Info("[DNS_BLOCK] blocked", "domain", plan.domain, "qtype", plan.qtype,
-			"src", req.src, "dst", req.dst)
-		return req.reply.msg(blockedDNSReply(req.msg))
-	case dnsActionCacheHit:
-		return req.reply.msg(plan.cached)
-	case dnsActionDirect:
-		return d.directUDPQuery(req, plan)
-	default:
-		return d.proxyUDPQuery(clientAddr, req, plan)
+	ex := dnsExchange{plan: plan, src: req.src, dst: req.dst}
+
+	if plan.action != dnsActionProxy {
+		resp, err := d.executeSync(ex, req.msg, req.dst)
+		if err != nil {
+			return err
+		}
+		return req.reply.msg(resp)
 	}
+	return d.proxyUDPQuery(clientAddr, req, ex)
 }
 
-// directUDPQuery 同步解析一条直连查询并立即应答：客户端显式请求的解析器
-// （req.dst）优先，失败回落到内置/系统 DNS。
-func (d *dnsInterceptor) directUDPQuery(req udpDNSQuery, plan dnsPlan) error {
-	log.Info("[DNS_DIRECT]", "domain", plan.domain, "qtype", plan.qtype,
-		"src", req.src, "dst", req.dst)
-	stats.RecordDNSDirectQuery()
+// 下行帧的目标取自查询自己的 dst，交换键因此必须含它：同一源端口向两个解析器查询时，
+// 共用交换会把第二条的应答封成第一条的目标，tun2socks 按五元组丢弃。上游只用于与普通
+// UDP 交换区分命名空间。
+func dnsExchangeKey(src net.Addr, dst string) string {
+	return src.String() + "_" + clientconfig.ProxyDNSServer + "_" + dst
+}
 
-	resp, err := d.resolveDirectDNS(req.msg, plan.domain, req.dst)
+// 首载荷合并进引导记录，不需要额外发送；后续查询复用现有交换，应答由 receiveLoop 异步送回。
+func (d *dnsInterceptor) proxyUDPQuery(clientAddr *net.UDPAddr, req udpDNSQuery, ex dnsExchange) error {
+	// 上游解析器依据查询里的 EDNS0 尺寸决定应答上限；钳制与重新封包由执行器
+	// 统一处理（与 TCP 路径共用同一段逻辑）。
+	payload, err := prepareProxied(req.msg, req.raw)
 	if err != nil {
-		log.Error("[DNS_DIRECT]", "domain", plan.domain, "err", err,
-			"src", req.src, "dst", req.dst)
-		return err
+		log.Warn("[DNS_PROXY] repack clamped query", "err", err)
+		payload = req.raw
 	}
-	log.Info("[DNS_DIRECT] result", "domain", plan.domain, "qtype", plan.qtype,
-		"answers", util.DNSAnswerStrings(resp), "src", req.src, "dst", req.dst)
 
-	resp.Id = req.msg.Id
-	return req.reply.msg(resp)
-}
+	// 应答必须伪装成来自 req.dst（客户端配置的解析器）而不是 upstream：流按客户端目标
+	// 标识，透明 NAT（tun2socks）会丢弃源地址不匹配的数据报，查询就看起来没有应答。
+	upstream := clientconfig.ProxyDNSServer
+	key := dnsExchangeKey(clientAddr, req.dst)
 
-// proxyUDPQuery 把一条查询交给经隧道的 UDP 交换。首载荷合并进引导记录时不需要
-// 额外发送；后续查询直接复用现有交换。应答由 receiveLoop 异步送回。
-func (d *dnsInterceptor) proxyUDPQuery(clientAddr *net.UDPAddr, req udpDNSQuery, plan dnsPlan) error {
-	// upstream 是本代理解析查询的位置；客户端请求的是其自身解析器所配置的
-	// 服务器，而应答必须伪装成来自该地址（req.dst），与其他所有 DNS 分支
-	// 一致。如果改用 upstream 来封装应答，透明 NAT（tun2socks）会把它丢弃：
-	// 流是按客户端的目标来标识的，声称来自不同服务器的数据报永远不会匹配，
-	// 查询就会看起来没有得到应答。
-	upstream := config.ProxyDNSServer
-	key := clientAddr.String() + "_" + upstream
-
-	log.Info("[DNS_PROXY]", "domain", plan.domain, "qtype", plan.qtype,
-		"src", req.src, "dst", req.dst)
+	log.At(dnsLogLevel(ex.plan.first), "[DNS_PROXY]", "domain", ex.plan.domain, "qtype", ex.plan.qtype,
+		"src", ex.src, "dst", ex.dst)
 	stats.RecordDNSProxyQuery()
 
-	ue, created, err := d.pool.acquireExchange(context.Background(), key, upstream, req.raw)
+	ue, created, err := d.pool.acquireExchange(context.Background(), key, upstream, payload)
 	if err != nil {
 		log.Error("[UDP_PROXY] open exchange", "dst", upstream, "err", err)
 		return err
 	}
 	onData := func(data []byte) {
 		if req.reply.raw != nil {
-			req.reply.raw(d.postProcessProxied(data, req.src, req.dst))
+			req.reply.raw(d.postProcessProxied(data, ex.src, ex.dst))
 		}
 	}
 	if created {
@@ -101,35 +84,15 @@ func (d *dnsInterceptor) proxyUDPQuery(clientAddr *net.UDPAddr, req udpDNSQuery,
 		return nil // 第一个载荷已在握手中发送
 	}
 
-	if err := ue.Send(req.raw); err != nil {
+	if err := ue.Send(payload); err != nil {
+		if errors.Is(err, shaper.ErrClosed) {
+			log.Debug("[DNS_PROXY] send on closed exchange", "domain", ex.plan.domain)
+			d.pool.removeExchange(key, ue)
+			return nil
+		}
 		log.Error("[UDP_PROXY] send", "err", err)
 		d.pool.removeExchange(key, ue)
 		return err
 	}
 	return nil
-}
-
-// postProcessProxied 处理一条经隧道返回的 DNS 应答：按 ipv6 策略剥离 AAAA、
-// 写入代理缓存、记录结果并按自定义域名规则学习。解包失败或不是响应时原样返回。
-// src/dst 只用于日志，与对应的 [DNS_PROXY] 查询行配对。
-func (d *dnsInterceptor) postProcessProxied(data []byte, src, dst string) []byte {
-	msg := &dns.Msg{}
-	if err := msg.Unpack(data); err != nil || !util.IsDNSResponse(msg) {
-		return data
-	}
-	if d.router.ShouldIPV6Disable() && msg.Question[0].Qtype == dns.TypeAAAA {
-		msg.Answer = nil
-		if packed, packErr := msg.Pack(); packErr == nil {
-			data = packed
-		}
-	}
-	_ = d.cache.Set(msg, false)
-
-	domain := strings.TrimSuffix(msg.Question[0].Name, ".")
-	qtype := dns.TypeToString[msg.Question[0].Qtype]
-	log.Info("[DNS_PROXY] result", "domain", domain, "qtype", qtype,
-		"answers", util.DNSAnswerStrings(msg), "src", src, "dst", dst)
-
-	d.learnDNSAnswers(msg, domain, false)
-	return data
 }

@@ -17,31 +17,30 @@ jobs:
         with:
           go-version-file: 'go.mod'
 
-      - name: Cache go module
-        uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cache/go-build
-            ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
-          restore-keys: |
-            ${{ runner.os }}-go-
-
       - name: Set up Java
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@v6
         with:
           distribution: 'temurin'
-          java-version: '17'
+          java-version: '21'
 
       - name: Install gomobile
         run: |
-          go install golang.org/x/mobile/cmd/gomobile@latest
+          # 版本取自 go.mod 的 tool 块，不要加 @latest（否则每次 CI 都可能换版本）
+          go install golang.org/x/mobile/cmd/gomobile golang.org/x/mobile/cmd/gobind
           export PATH="$(go env GOPATH)/bin:$PATH"
           gomobile init
 
       # 发布前显式校验（构建步骤本身不再顺带跑 lint/测试）
       - name: Verify (lint + tests)
         run: make verify
+
+      # nightly 的 release tag 由最后一步 action-gh-release 创建，构建时还不存在；
+      # 先在本地打一个同名轻量 tag，让 Makefile 的 `git describe --tags` 距离变成 0，
+      # 注入的 version.GitTag 才会是本次构建的 nightly-<sha>，而不是最近的历史版本 tag
+      # （例如 v3.0.0-rc14-15-g5909694）。-f 兼容同一提交重跑 workflow：此时该 tag
+      # 可能已随 fetch-depth: 0 的 checkout 一起拉下来。远端 tag 仍由 action-gh-release 创建。
+      - name: Tag this build
+        run: git tag -f nightly-$(git rev-parse --short HEAD)
 
       # 一次产出全部平台二进制、14 个 zip 与 Android AAR（见 Makefile 的 build/pack/dist）
       - name: Build release assets

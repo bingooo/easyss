@@ -94,7 +94,9 @@ func TestIsTransientStreamError(t *testing.T) {
 		ErrServerRejectedHandshake,
 		fmt.Errorf("wrapped: %w", ErrServerRejectedHandshake),
 		&transport.HandshakeRejectedError{StatusCode: 408},
+		fmt.Errorf("read: %w", transport.ErrConnRetired),
 		errors.New("crypto: read cipher_len: http2: client connection lost"),
+		errors.New("crypto: read cipher_len: http2: client connection force closed via ClientConn.Close"),
 		errors.New("crypto: write record: http2: stream closed"),
 		errors.New("write on closed connection: connection reset by peer"),
 	}

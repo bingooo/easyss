@@ -10,61 +10,98 @@ import (
 	"github.com/nange/easyss/v3/util"
 )
 
-// sysDNSFunc 负责发现系统 DNS 服务器，可在测试中覆盖。
-var sysDNSFunc = util.SysDNS
-
-// systemDNSServersFunc 返回格式化后的系统 DNS 服务器列表，供回退路径使用，
-// 可在测试中覆盖。
-var systemDNSServersFunc = SystemDNSServers
-
-const systemDNSCacheTTL = 5 * time.Minute
-
-var (
-	systemDNSMu     sync.Mutex
-	systemDNSCached []string
-	systemDNSTime   time.Time
+const (
+	systemDNSCacheTTL = 5 * time.Minute
+	// 整份列表都失败后重新发现的最短间隔：网络真断时不能每条查询都 spawn 一次
+	// ipconfig/networksetup，但换 WAN 后必须能在几秒内换到新地址。
+	systemDNSRediscoverInterval = 5 * time.Second
 )
 
-// SystemDNSServers 以 host:port 地址的形式返回系统 DNS 服务器，从操作系统
-// 惰性发现并短暂缓存。当所有内置直连 DNS 服务器都不可用时作为回退使用。
-// 空结果也会被缓存，这样失败的发现（例如缓慢的 ipconfig 调用）不会在每次
-// DNS 查询时重复执行。
-func SystemDNSServers() []string {
-	systemDNSMu.Lock()
-	defer systemDNSMu.Unlock()
+// systemServers 给出去重后的系统 DNS 兜底地址（host:port）。生产实现是 *systemDNS，
+// 测试用静态列表替换。Invalidate 只允许在整份列表都失败后调用，实现自带节流。
+type systemServers interface {
+	Servers() []string
+	Invalidate()
+}
 
-	if time.Since(systemDNSTime) < systemDNSCacheTTL {
-		return systemDNSCached
+// systemDNS 发现并缓存系统 DNS 服务器。缓存属于实例：测试构造独立实例即可避免
+// 进程级状态互相污染。
+type systemDNS struct {
+	discover func() ([]string, error)
+
+	mu     sync.Mutex
+	cached []string
+	at     time.Time
+	// invalidatedAt 是上次生效的作废时间。节流锚在这里而不是 at：缓存刚过期时换 WAN，
+	// 发现与失败落在同一次查询里，锚在发现时间会把最该生效的那次作废吞掉。
+	invalidatedAt time.Time
+}
+
+func newSystemDNS(discover func() ([]string, error)) *systemDNS {
+	return &systemDNS{discover: discover}
+}
+
+// Servers 以 host:port 返回系统 DNS 服务器，惰性发现并短暂缓存。空结果也缓存，
+// 失败发现（例如缓慢的 ipconfig）才不会在每次查询时重跑。
+func (s *systemDNS) Servers() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if time.Since(s.at) < systemDNSCacheTTL {
+		return s.cached
 	}
 
-	servers, err := sysDNSFunc()
+	servers, err := s.discover()
 	if err != nil {
 		log.Warn("[DNS] get system dns servers", "err", err)
 	}
 	var addrs []string
-	for _, s := range servers {
-		if s == "" {
+	for _, server := range servers {
+		if server == "" {
 			continue
 		}
-		addrs = append(addrs, net.JoinHostPort(s, "53"))
+		addrs = append(addrs, net.JoinHostPort(server, "53"))
 	}
-	systemDNSCached = addrs
-	systemDNSTime = time.Now()
+	s.cached = addrs
+	s.at = time.Now()
 	return addrs
 }
 
-// WithSystemDNSFallbackReserve 返回内置 DNS 分支应使用的 context：ctx 带截止
-// 时间且剩余预算大于预留量时，把内置分支的截止时间提前一个 ResolveItemTimeout
-// （即一个完整条目的预算），这样系统 DNS 兜底至少还能拿到这段时间。
-//
-// 内置 DNS 若是黑洞（丢包，而不是 RST/SERVFAIL 那种立即失败），单次查询会一直
-// 等到超时；没有这层切分，预解析的整个预算会被内置服务器吃掉，随后复用同一个
-// （已过期的）context 的系统 DNS 兜底就会在毫秒内以 dial i/o timeout 全部失败
-// ——即使系统 DNS（DHCP/内网解析器）本身完全可用。
-//
-// 无截止时间（调用方不设总预算）或剩余预算已不足预留量时原样返回，不做切分。
-// 覆盖内置 + 系统两段分支的调用方应在进入内置分支前调用它，并把返回的 context
-// 只用于内置分支；系统兜底分支继续用原来的 ctx，从而仍然受总预算约束。
+func (s *systemDNS) reset() {
+	s.mu.Lock()
+	s.cached = nil
+	s.at = time.Time{}
+	s.invalidatedAt = time.Time{}
+	s.mu.Unlock()
+}
+
+// Invalidate 在整份列表都不可达后丢弃缓存：缓存可能来自上一个网络。首次作废总是生效，
+// 之后按 systemDNSRediscoverInterval 节流，热路径上每条查询都调也只会在窗口外重发现一次。
+func (s *systemDNS) Invalidate() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if time.Since(s.invalidatedAt) < systemDNSRediscoverInterval {
+		return
+	}
+	s.cached = nil
+	s.at = time.Time{}
+	s.invalidatedAt = time.Now()
+}
+
+// InvalidateSystemDNS 作废进程级的系统 DNS 发现缓存，供 proxy 等跨包调用方使用。
+func InvalidateSystemDNS() {
+	defaultSystemDNS.Invalidate()
+}
+
+// defaultSystemDNS 是进程的唯一系统 DNS 发现器；ResetResolveState 清的就是它的缓存。
+var defaultSystemDNS = newSystemDNS(util.SysDNS)
+
+func SystemDNSServers() []string {
+	return defaultSystemDNS.Servers()
+}
+
+// 把内置分支的截止时间提前一个 ResolveItemTimeout，给系统 DNS 兜底留出至少一个条目的预算；
+// 内置 DNS 若是黑洞，兜底复用同一个已过期的 ctx 会立刻全部超时。返回的 ctx 只用于内置分支。
 func WithSystemDNSFallbackReserve(ctx context.Context) (context.Context, context.CancelFunc) {
 	deadline, ok := ctx.Deadline()
 	if !ok {

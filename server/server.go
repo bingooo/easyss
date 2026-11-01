@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	stdlog "log"
@@ -17,32 +18,38 @@ import (
 	"time"
 
 	"github.com/caddyserver/certmagic"
-	sharedconfig "github.com/nange/easyss/v3/config"
+	"github.com/mholt/acmez/v3/acme"
+	"github.com/nange/easyss/v3/config"
 	"github.com/nange/easyss/v3/crypto"
 	"github.com/nange/easyss/v3/log"
-	"github.com/nange/easyss/v3/server/config"
+	serverconfig "github.com/nange/easyss/v3/server/config"
 	"github.com/nange/easyss/v3/server/handler"
 	"github.com/nange/easyss/v3/server/nextproxy"
-	"github.com/nange/easyss/v3/shaper"
 	"github.com/nange/easyss/v3/stats"
 )
 
 type Server struct {
-	cfg        *config.FileConfig
+	cfg *serverconfig.FileConfig
+	mux *http.ServeMux
+
+	// mu 串行化启动发布与关闭：Shutdown 可能与 Start 并发。
+	mu         sync.Mutex
 	httpServer *http.Server
-	mux        *http.ServeMux
 	certCache  *certmagic.Cache
 	statsDone  chan struct{}
-	statsOnce  sync.Once
+	stopped    bool
 }
 
-func New(cfg *config.FileConfig) (*Server, error) {
-	for _, p := range cfg.Transport.Protocols {
-		if p != "h2" {
-			return nil, fmt.Errorf("unsupported transport protocol %q (only h2 is supported)", p)
-		}
-	}
+// acmeProfileShortLived 只为 IP 标识符而设：LE 的 IP 地址证书必须是短生命周期证书，
+// shortlived 是唯一允许 ip 标识符的 profile，名称写错会在启动期报 unknown profile name。
+const acmeProfileShortLived = "shortlived"
 
+// New 自己校验一次：测试与嵌入式调用会直接手搓 FileConfig，只靠配置加载路径校验等于留一条
+// 绕过口子。Validate 是纯内存检查且幂等。
+func New(cfg *serverconfig.FileConfig) (*Server, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
 	s := &Server{
 		cfg: cfg,
 	}
@@ -50,28 +57,28 @@ func New(cfg *config.FileConfig) (*Server, error) {
 	return s, nil
 }
 
-func (s *Server) initTLS() (*tls.Config, error) {
+func (s *Server) initTLS() (*tls.Config, *certmagic.Cache, error) {
 	cfg := s.cfg
 	srvCfg := cfg.Server
 
-	if srvCfg.CertPath != "" && srvCfg.KeyPath != "" {
+	if cfg.UsesManualCertificate() {
 		cert, err := tls.LoadX509KeyPair(srvCfg.CertPath, srvCfg.KeyPath)
 		if err != nil {
-			return nil, fmt.Errorf("load cert: %w", err)
+			return nil, nil, fmt.Errorf("load cert: %w", err)
 		}
 		return &tls.Config{
 			Certificates: []tls.Certificate{cert},
-			NextProtos:   sharedconfig.NextProtos,
+			NextProtos:   config.NextProtos,
 			MinVersion:   tls.VersionTLS12,
-		}, nil
+		}, nil, nil
 	}
 
 	storagePath, err := certmagicStoragePath()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if err := os.MkdirAll(storagePath, 0700); err != nil {
-		return nil, fmt.Errorf("create certmagic storage: %w", err)
+		return nil, nil, fmt.Errorf("create certmagic storage: %w", err)
 	}
 
 	s.resolveEmail(storagePath)
@@ -83,19 +90,18 @@ func (s *Server) initTLS() (*tls.Config, error) {
 		if cache != nil {
 			cache.Stop()
 		}
-		_ = cleanCertmagicDomainAssets(context.Background(), storage, srvCfg.Domain)
+		_ = cleanCertmagicDomainAssets(context.Background(), storage, srvCfg.Host)
 		tlsConfig, cache, err = s.manageCert(storage, true)
 	}
 	if err != nil {
 		if cache != nil {
 			cache.Stop()
 		}
-		return nil, fmt.Errorf("certmagic: %w", err)
+		return nil, nil, fmt.Errorf("certmagic: %w", err)
 	}
 
-	s.certCache = cache
-	tlsConfig.NextProtos = append(slices.Clone(sharedconfig.NextProtos), tlsConfig.NextProtos...)
-	return tlsConfig, nil
+	tlsConfig.NextProtos = append(slices.Clone(config.NextProtos), tlsConfig.NextProtos...)
+	return tlsConfig, cache, nil
 }
 
 func (s *Server) manageCert(storage certmagic.Storage, disableARI bool) (*tls.Config, *certmagic.Cache, error) {
@@ -115,10 +121,15 @@ func (s *Server) manageCert(storage certmagic.Storage, disableARI bool) (*tls.Co
 	acmeCfg.Agreed = true
 	acmeCfg.Email = s.cfg.Server.Email
 	acmeCfg.DisableHTTPChallenge = true
+	// IP 标识符必须显式请求短生命周期 profile：LE 对 ip 标识符会自动选它，但"IP 证书只能是
+	// 短生命周期证书"是这个模式的硬约束，写在请求里才不依赖服务端的自动选择。
+	if s.cfg.ACMESubjectIsIP() {
+		acmeCfg.Profile = acmeProfileShortLived
+	}
 	cmCfg.Issuers = []certmagic.Issuer{certmagic.NewACMEIssuer(cmCfg, acmeCfg)}
 
 	tlsConfig := cmCfg.TLSConfig()
-	err := cmCfg.ManageSync(context.Background(), []string{s.cfg.Server.Domain})
+	err := cmCfg.ManageSync(context.Background(), []string{s.cfg.Server.Host})
 	if err != nil {
 		return nil, cache, err
 	}
@@ -138,7 +149,7 @@ func (s *Server) resolveEmail(storagePath string) {
 	log.Info("[SERVER] generated random ACME email", "email", s.cfg.Server.Email)
 }
 
-func (s *Server) statsLoop() {
+func (s *Server) statsLoop(done <-chan struct{}) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -159,7 +170,7 @@ func (s *Server) statsLoop() {
 				"padding", stats.HumanBytes(snap.PaddingBytes),
 				"records", snap.RecordsWritten,
 			)
-		case <-s.statsDone:
+		case <-done:
 			return
 		}
 	}
@@ -225,6 +236,20 @@ func shouldRetryFreshCertificate(err error) bool {
 	if err == nil {
 		return false
 	}
+	// 按类型分类 ACME 失败：detail 文本只在 Problem 类型本身不足以区分时兜底。
+	if problem, ok := errors.AsType[acme.Problem](err); ok {
+		// 404 在 ACME 语义下基本只来自 ARI（certID 不存在）。它比 detail 文本略宽，
+		// 但重签只发生在启动阶段，接受这个已知的宽判据。
+		if problem.Type == acme.ProblemTypeAlreadyReplaced ||
+			problem.Status == http.StatusNotFound {
+			return true
+		}
+		detail := strings.ToLower(problem.Detail)
+		return strings.Contains(detail, "replaces field") ||
+			strings.Contains(detail, "could not validate ari") ||
+			strings.Contains(detail, "requested certificate was not found")
+	}
+	// 兼容没有 acme.Problem 包装的路径（上层可能把错误文本重新包装）。
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "replaces field") ||
 		strings.Contains(msg, "could not validate ari") ||
@@ -251,27 +276,36 @@ func cleanCertmagicDomainAssets(ctx context.Context, storage certmagic.Storage, 
 func (s *Server) Start() error {
 	cfg := s.cfg
 	srvCfg := cfg.Server
-	// 基础超时派生出流空闲、UDP 空闲、拨号与 h2 连接空闲：越界值在这里归一化，
-	// 使启动日志与后续全部派生看到同一个值（见 sharedconfig.NormalizeTimeout）。
-	timeout := sharedconfig.TimeoutDuration(cfg.Timeout)
-	log.Info("[SERVER] starting", "listen", srvCfg.Listen, "domain", srvCfg.Domain, "timeout", int(timeout.Seconds()))
+	// 这里再算一次（幂等）是为了覆盖不经过配置加载的调用方，启动日志与后续派生看到同一个值。
+	timeout := config.TimeoutDuration(cfg.Timeout)
+	log.Info("[SERVER] starting", "listen", srvCfg.ListenAddr(), "host", srvCfg.Host, "timeout", int(timeout.Seconds()))
 
-	tlsConfig, err := s.initTLS()
+	tlsConfig, certCache, err := s.initTLS()
 	if err != nil {
 		log.Error("[SERVER] init TLS failed", "err", err)
 		return err
 	}
-	if srvCfg.CertPath != "" && srvCfg.KeyPath != "" {
+	// 提交前缓存还不归 Server 所有：启动失败或 Shutdown 先到时由这里回收。
+	committed := false
+	defer func() {
+		if !committed && certCache != nil {
+			certCache.Stop()
+		}
+	}()
+	if cfg.UsesManualCertificate() {
 		log.Info("[SERVER] TLS mode: cert files", "cert", srvCfg.CertPath, "key", srvCfg.KeyPath)
+	} else if cfg.ACMESubjectIsIP() {
+		// IP-only 模式：LE 直接为这个公网 IPv4 签发短生命周期证书，只能用 tls-alpn-01 验证，
+		// 因此公网 443 在首次签发与每次续期时都必须可达。
+		log.Info("[SERVER] TLS mode: certmagic (Let's Encrypt IP certificate)",
+			"subject", srvCfg.Host, "email", srvCfg.Email, "profile", acmeProfileShortLived,
+			"challenge", "tls-alpn-01", "acme_requires", "inbound tcp/443 from the internet")
 	} else {
-		log.Info("[SERVER] TLS mode: certmagic (Let's Encrypt)", "domain", srvCfg.Domain, "email", srvCfg.Email)
+		log.Info("[SERVER] TLS mode: certmagic (Let's Encrypt)", "host", srvCfg.Host, "email", srvCfg.Email)
 	}
 
-	timeouts := sharedconfig.NewTimeouts(timeout)
+	timeouts := config.NewTimeouts(timeout)
 
-	// 构造本次部署唯一的回退实例：模式配置与部署级身份都在这里一次性确定，
-	// 随后由各个 handler 共享。构造失败会直接让服务器启动失败，不会留下
-	// 部分改写的可见状态。
 	fallback, err := handler.NewFallback(handler.FallbackConfig{
 		Target:       cfg.Fallback.Target,
 		PreserveHost: cfg.Fallback.PreserveHost,
@@ -307,18 +341,12 @@ func (s *Server) Start() error {
 		MasterKey:      masterKey,
 		AllowedMethods: srvCfg.GetAllowedMethods(),
 		Timeouts:       timeouts,
-		Shaper: shaper.Config{
-			BatchWindowMS: cfg.Shaper.BatchWindowMS,
-			Cover: shaper.CoverConfig{
-				BudgetRatio: cfg.Shaper.CoverBudgetRatio,
-				BudgetCap:   cfg.Shaper.CoverBudgetCap,
-			},
-		},
-		NextProxy: np,
-		Fallback:  fallback,
+		Shaper:         cfg.Shaper,
+		NextProxy:      np,
+		Fallback:       fallback,
 	})
 
-	probePayload := make([]byte, sharedconfig.ProbePayloadSize)
+	probePayload := make([]byte, config.ProbePayloadSize)
 	if _, err := io.ReadFull(rand.Reader, probePayload); err != nil {
 		return fmt.Errorf("generate probe payload: %w", err)
 	}
@@ -331,40 +359,62 @@ func (s *Server) Start() error {
 	s.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		fallback.Serve(w, r)
 	})
-	s.mux.Handle(sharedconfig.EndpointTCP, proxyHandler)
-	s.mux.Handle(sharedconfig.EndpointUDP, proxyHandler)
-	s.mux.Handle(sharedconfig.EndpointICMP, proxyHandler)
-	s.mux.Handle(sharedconfig.EndpointProbe, probeHandler)
+	s.mux.Handle(config.EndpointTCP, proxyHandler)
+	s.mux.Handle(config.EndpointUDP, proxyHandler)
+	s.mux.Handle(config.EndpointICMP, proxyHandler)
+	s.mux.Handle(config.EndpointProbe, probeHandler)
 
-	s.httpServer = buildHTTPServer(cfg, tlsConfig, s.mux, timeout)
+	srv := buildHTTPServer(cfg, tlsConfig, s.mux, timeout)
 
-	log.Info("[SERVER] listening", "addr", srvCfg.Listen, "routes", []string{"/", sharedconfig.EndpointTCP, sharedconfig.EndpointUDP, sharedconfig.EndpointICMP, sharedconfig.EndpointProbe})
-	s.statsDone = make(chan struct{})
-	go s.statsLoop()
-	return s.httpServer.ListenAndServeTLS("", "")
+	statsDone := make(chan struct{})
+	s.mu.Lock()
+	if s.stopped {
+		s.mu.Unlock()
+		return http.ErrServerClosed
+	}
+	s.httpServer = srv
+	s.certCache = certCache
+	s.statsDone = statsDone
+	committed = true
+	s.mu.Unlock()
+
+	// 打进生效的 HTTP/2 参数：上传速度上不去时，第一件事是确认服务端给了多大的窗口与并发流。
+	log.Info("[SERVER] listening",
+		"addr", srvCfg.ListenAddr(),
+		"routes", []string{"/", config.EndpointTCP, config.EndpointUDP, config.EndpointICMP, config.EndpointProbe},
+		"probe_payload_bytes", len(probePayload),
+		"h2_max_frame_size", srv.HTTP2.MaxReadFrameSize,
+		"h2_recv_buf_stream", srv.HTTP2.MaxReceiveBufferPerStream,
+		"h2_recv_buf_conn", srv.HTTP2.MaxReceiveBufferPerConnection,
+		"h2_max_concurrent_streams", srv.HTTP2.MaxConcurrentStreams)
+
+	go s.statsLoop(statsDone)
+	return srv.ListenAndServeTLS("", "")
 }
 
-// buildHTTPServer 组装 HTTP 服务器，其 HTTP/2 流控窗口按上传吞吐量来定尺寸：
-// 每流接收窗口限制了单个上传流的在途数据量（吞吐 ≈ 窗口/RTT），因此两个窗口
-// 都必须足够大，以适配高 RTT 链路。
-func buildHTTPServer(cfg *config.FileConfig, tlsConfig *tls.Config, mux *http.ServeMux, timeout time.Duration) *http.Server {
+// buildHTTPServer 的 HTTP/2 参数按上传吞吐量定尺寸：流级接收窗口决定单条上传流的在途数据量
+// （吞吐 ≈ 窗口/RTT），连接级窗口是每连接上界。这里只保留 0 值兜底。
+func buildHTTPServer(cfg *serverconfig.FileConfig, tlsConfig *tls.Config, mux *http.ServeMux, timeout time.Duration) *http.Server {
 	http2Cfg := &http.HTTP2Config{
-		MaxReadFrameSize:              sharedconfig.HTTP2ServerMaxReadFrameSize,
-		MaxReceiveBufferPerConnection: sharedconfig.HTTP2ServerReceiveBufferPerConnection,
-		MaxReceiveBufferPerStream:     sharedconfig.HTTP2ServerReceiveBufferPerStream,
+		MaxReadFrameSize:              effectiveH2(cfg.Transport.H2MaxFrameSize, config.HTTP2ServerMaxReadFrameSize),
+		MaxReceiveBufferPerConnection: effectiveH2(cfg.Transport.H2RecvBufConn, config.HTTP2ServerReceiveBufferPerConnection),
+		MaxReceiveBufferPerStream:     effectiveH2(cfg.Transport.H2RecvBufStream, config.HTTP2ServerReceiveBufferPerStream),
+		MaxConcurrentStreams:          config.HTTP2ServerMaxConcurrentStreams,
+		// 响应写最终都排进这条连接唯一的写循环；没有上界的网络写会让一个停住的
+		// 对端拖住整条连接上的 handler 收尾。
+		WriteByteTimeout: timeout,
 	}
-	if cfg.Transport.H2MaxFrameSize > 0 {
-		http2Cfg.MaxReadFrameSize = cfg.Transport.H2MaxFrameSize
-	}
-	if cfg.Transport.H2RecvBufConn > 0 {
-		http2Cfg.MaxReceiveBufferPerConnection = cfg.Transport.H2RecvBufConn
-	}
-	if cfg.Transport.H2RecvBufStream > 0 {
-		http2Cfg.MaxReceiveBufferPerStream = cfg.Transport.H2RecvBufStream
+
+	// 连接级窗口同时是流级窗口的硬上限：配得比流级窗口小，单条流的在途额度就由它决定，
+	// 且不会以其他方式暴露。只告警不纠正：压小连接窗口往往是有意的内存收敛。
+	if http2Cfg.MaxReceiveBufferPerConnection < http2Cfg.MaxReceiveBufferPerStream {
+		log.Warn("[SERVER] h2 connection receive window is smaller than the per-stream window: the effective per-stream in-flight limit is the connection window",
+			"h2_recv_buf_conn", http2Cfg.MaxReceiveBufferPerConnection,
+			"h2_recv_buf_stream", http2Cfg.MaxReceiveBufferPerStream)
 	}
 
 	srv := &http.Server{
-		Addr:              cfg.Server.Listen,
+		Addr:              cfg.Server.ListenAddr(),
 		TLSConfig:         tlsConfig,
 		Handler:           mux,
 		ErrorLog:          stdErrorLog(),
@@ -378,29 +428,41 @@ func buildHTTPServer(cfg *config.FileConfig, tlsConfig *tls.Config, mux *http.Se
 	return srv
 }
 
+// 越界值由 config.LoadConfig 拒绝；0 值兜底让绕过配置加载的调用方拿到默认值而不是 0。
+func effectiveH2(v, def int) int {
+	if v == 0 {
+		return def
+	}
+	return v
+}
+
 func (s *Server) Shutdown(ctx context.Context) error {
 	log.Info("[SERVER] shutting down")
 
-	// 停止 stats 循环 goroutine，使其不会在关闭后泄漏。
-	s.statsOnce.Do(func() {
-		if s.statsDone != nil {
-			close(s.statsDone)
-		}
-	})
-
-	if s.certCache != nil {
-		s.certCache.Stop()
-		s.certCache = nil
+	s.mu.Lock()
+	if s.stopped {
+		s.mu.Unlock()
+		return nil
 	}
-	if s.httpServer != nil {
-		return s.httpServer.Shutdown(ctx)
+	s.stopped = true
+	httpServer, certCache, statsDone := s.httpServer, s.certCache, s.statsDone
+	s.httpServer, s.certCache, s.statsDone = nil, nil, nil
+	s.mu.Unlock()
+
+	if statsDone != nil {
+		close(statsDone)
+	}
+	if certCache != nil {
+		certCache.Stop()
+	}
+	if httpServer != nil {
+		return httpServer.Shutdown(ctx)
 	}
 	return nil
 }
 
-// stdErrorLog 将 Go 内部 http.Server/HTTP2 的日志（连接级错误、PING 超时、
-// 协议错误、TLS 握手错误等）转接到 easyss 的 slog 日志器。handler 的 panic
-// 由 ProxyHandler.ServeHTTP 中的 recover 单独处理。
+// stdErrorLog 把 http.Server/HTTP2 的内部日志（连接级错误、PING 超时、TLS 握手错误）转接到
+// easyss 的 slog 日志器。
 func stdErrorLog() *stdlog.Logger {
 	return stdlog.New(slogErrorWriter{}, "", 0)
 }

@@ -1,57 +1,48 @@
 # Easyss
 
-Easyss是一款兼容socks5的安全代理上网工具，目标是使访问国外技术网站更流畅免受干扰。
+Easyss 是一款兼容 SOCKS5/HTTP 代理的安全上网工具，目标是使访问国外技术网站更流畅、免受干扰。
 
-有报道表明访问国外技术网站正变得越来越困难，即使用了一些常用代理技术也面临被干扰的可能性。
-为了以防万一，提前准备，重新实现了一套协议以加快访问速度和对抗嗅探。
+有报道表明访问国外技术网站正变得越来越困难，即使用了一些常用代理技术也面临被干扰的可能性。为了以防万一提前准备，重新实现了一套协议以加快访问速度和对抗嗅探。
 
-**当前master分支，对应全新的版本v3，v3内核进行了完全的重构。性能和稳定性都有大幅提升，欢迎下载v3最新rc版本进行测试。 如需v2文档请[点击](https://github.com/nange/easyss/tree/v2)**
+**当前 master 分支对应全新的 v3，内核完全重构，性能与稳定性大幅提升。如需 v2 文档请[点击](https://github.com/nange/easyss/tree/v2)。**
 
 ## 特性
 
-* 简单稳定易用, 没有复杂的配置项；支持 IPv4/IPv6 双栈网络
-* 无流量特征，不易被嗅探：底层基于真实 HTTP/2 (TLS) 传输协议，并通过流量整形、真实网页 fallback、智能请求连接调度等手段，兼顾连接隐蔽性与运行稳定性
-* 全平台支持(Linux, MacOS, Windows, Android等)
-* 支持SOCKS5(TCP/UDP, thanks [socks5](https://github.com/txthinking/socks5))、HTTP 代理协议
-* 支持浏览器级别代理(设置系统代理), 和系统全局代理(thanks [tun2socks](https://github.com/xjasonlyu/tun2socks)); 全局代理支持`ping`命令(ICMP Echo协议)
-* 支持系统托盘图标管理客户端 (thanks [systray](https://github.com/gogpu/systray))
-* 可配置多服务器切换; 自定义直连、代理白名单(IP/域名)
+* 简单稳定易用，没有复杂的配置项；支持 IPv4/IPv6 双栈网络
+* 无流量特征，不易被嗅探：底层基于真实 HTTP/2 (TLS) 传输协议，并通过流量整形、真实网页 fallback、智能连接调度等手段兼顾隐蔽性与稳定性
+* 全平台支持（Linux、macOS、Windows、Android 等）
+* 支持 SOCKS5（TCP/UDP，thanks [go-socks5](https://github.com/things-go/go-socks5)）与 HTTP 代理协议
+* 支持浏览器代理（设置系统代理）与系统全局代理（thanks [tun2socks](https://github.com/xjasonlyu/tun2socks)），支持 `ping`（ICMP Echo）
+* 支持系统托盘图标管理客户端（thanks [systray](https://github.com/gogpu/systray)）
+* 可配置多服务器切换；自定义直连、代理白名单（IP/域名）
 * 支持服务端链式代理
 
 ## 下载
 
-### 在release页面直接下载(各平台)编译好的二进制文件
+在 [release 页面](https://github.com/nange/easyss/releases)直接下载各平台编译好的二进制文件。
 
-[去下载](https://github.com/nange/easyss/releases)
-
-**MacOS 用户注意：** `Easyss.app` 未经 Apple 公证，从网上下载解压后首次双击会被 Gatekeeper 拦截（提示无法验证开发者/应用已损坏）。**仅首次下载后**需要先在终端执行以下命令解除隔离属性，然后即可正常双击运行：
+**macOS 用户注意：** `Easyss.app` 未经 Apple 公证，首次双击会被 Gatekeeper 拦截（提示无法验证开发者/应用已损坏）。请在首次下载后进入 `Easyss.app` 所在目录执行：
 
 ```bash
 xattr -cr ./Easyss.app
 ```
 
-命令行进入 `Easyss.app` 所在目录，并执行上述命令。（配置文件需与程序同目录，建议将 app 保留在自选目录而非 `/Applications`）。
-
-之后使用客户端内置的自更新功能升级时，新版本会自动清除隔离属性，无需再手动执行 `xattr` 命令。
-
-如果想通过源码编译，可查看`Makefile`中的内容。
+之后即可正常双击运行。配置文件需与程序同目录，建议将 app 放在自选目录而非 `/Applications`。源码编译请参考 `Makefile`。
 
 ## 用法
 
 ### 客户端
 
-创建配置文件：`config.json`，并把配置文件放入`easyss`二进制相同目录中。
+创建配置文件 `config.json` 并放入 `easyss` 二进制所在目录。
 
 Easyss v3 支持两种配置模式，自动识别：
 
-* **简化模式**：扁平 JSON 格式，兼容 v2 配置，适合大多数用户
-* **完整模式**：嵌套 JSON 格式，支持多服务器等高级功能，通过 `version: 3` 标识
+* **简化模式**：扁平 JSON，兼容 v2 配置，适合大多数用户
+* **完整模式**：嵌套 JSON，支持多服务器等高级功能，需 `version: 3`
 
----
+#### 简化模式（推荐，兼容 v2）
 
-#### 简化模式（推荐, 兼容v2）
-
-只包含最常用的配置项，适合简单使用，仅支持配置单一服务器（最简配置示例）：
+仅支持配置单一服务器，最简配置：
 
 ```json
 {
@@ -63,276 +54,197 @@ Easyss v3 支持两种配置模式，自动识别：
 }
 ```
 
-**简化模式参数说明（完整参数说明）：**
+**参数说明：**
 
 | 参数 | 必填 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `server` | 是 | - | 服务器地址（域名或IP） |
+| `server` | 是 | - | 服务器地址（域名或 IP，不含端口） |
 | `server_port` | 是 | - | 服务器端口 |
 | `password` | 是 | - | 通信加密密钥 |
 | `local_port` | 否 | 4080 | 本地 SOCKS5 监听端口。`http_port` 自动设为 `local_port + 1000` |
 | `method` | 否 | aes-256-gcm | 加密方式，可选: `aes-256-gcm`, `chacha20-poly1305` |
 | `proxy_rule` | 否 | auto | 代理规则，可选: `auto`, `reverse_auto`, `proxy`, `direct`, `auto_block` |
-| `timeout` | 否 | 30 | 基础超时时间，单位秒，取值范围 15-60（越界取边界值）；TCP/UDP 空闲、拨号、DNS 响应与连接轮换均由它派生（见"`timeout` 派生规则"） |
-| `bind_all` | 否 | false | 是否将监听端口绑定到所有本地 IP |
+| `timeout` | 否 | 30 | 基础超时时间，单位秒，取值范围 15-60（越界取边界值）；TCP/UDP 空闲、拨号、DNS 响应与连接轮换均由它派生（见下文） |
+| `bind_all` | 否 | false | 是否将监听端口绑定到所有本地 IP；开启时监听 `[::]`，系统代理与 TUN 等本机自用端点改用同族回环 `[::1]` 访问本地代理 |
 | `outbound_proto` | 否 | native | 出口协议，可选: `native`, `h2`（效果相同，均为 HTTP/2） |
 | `log_level` | 否 | info | 日志级别，可选: `debug`, `info`, `warn`, `error` |
 | `log_file_path` | 否 | 空 | 日志文件路径，为空则输出到标准输出 |
 | `direct_file` | 否 | 空 | 自定义直连文件路径（IP/CIDR/域名/正则混写，每行一条，支持 `regexp:` 和 `*` 通配符） |
 | `proxy_file` | 否 | 空 | 自定义代理文件路径（IP/CIDR/域名/正则混写，每行一条，支持 `regexp:` 和 `*` 通配符） |
 
-除 3 个必填参数外，其他均为可选。以上未列出的字段（如 `sn`, `ca_path`, `http_port`, `ipv6_rule`, `enable_quic` 等）也可在简化模式中使用，会自动迁移到 v3 完整格式。
+除 3 个必填参数外其他均为可选。未列出的字段（如 `sn`、`ca_path`、`http_port`、`ipv6_rule`、`enable_quic` 等）同样可在简化模式中使用，加载时会在内存中转换为完整模式（不回写配置文件）。配置项也可用命令行参数覆盖，见 `./easyss --help`。
 
-执行以下命令可查看简化模式示例：
-
-```bash
-./easyss -show-config-example-simple
-```
-
-**简化模式命令行参数：**
-
-简化模式的配置项也可通过命令行参数指定，优先级高于配置文件：
-
-| 参数 | 说明 |
-| --- | --- |
-| `-s` | 服务器地址 |
-| `-p` | 服务器端口 |
-| `-k` | 通信加密密钥 |
-| `-l` | 本地 SOCKS5 端口 |
-| `-m` | 加密方式 |
-| `-proxy-rule` | 代理规则 |
-| `-t` | 超时时间（秒） |
-| `-outbound-proto` | 出口协议 |
-| `-log-level` | 日志级别 |
-| `-sn` | TLS SNI 覆盖 |
-| `-enable-quic` | 启用 QUIC 协议 |
-| `-ipv6-rule` | IPv6 规则 |
-| `-direct-file` | 自定义直连文件路径 |
-| `-proxy-file` | 自定义代理文件路径 |
-
-示例：
-
-```bash
-./easyss -c config.json -s my-server.com -p 443 -k mypass -l 1080
-```
-
----
+执行 `./easyss -show-config-example-simple` 可查看简化模式示例。
 
 #### 完整模式
 
-支持所有 v3 高级功能（多服务器、流量整形、传输层调参等）：
+支持所有 v3 高级功能（多服务器、流量整形、传输层调参等），最简配置示例：
 
 ```json
 {
   "version": 3,
-  "servers": [{
-    "address": "your-domain.com",
-    "port": 443,
-    "password": "your-password",
-    "method": "aes-256-gcm",
-    "sn": "",
-    "ca_path": "",
-    "default": true
-  }],
+  "servers": [
+    {
+      "host": "your-domain.com",
+      "port": 443,
+      "password": "your-password"
+    }
+  ],
   "local": {
     "socks_port": 4080,
-    "http_port": 5080,
-    "bind_all": false,
-    "disable_sys_proxy": false,
-    "enable_forward_dns": false,
-    "enable_tun2socks": false,
-    "enable_quic": false
-  },
-  "routing": {
-    "proxy_rule": "auto",
-    "ipv6_rule": "auto",
-    "direct_file": "",
-    "proxy_file": ""
-  },
-  "transport": {
-    "protocol": "h2",
-    "conn_count_max": 15,
-    "stream_threshold": 4,
-    "priority_slot_ratio": 0.4,
-    "conn_max_bytes": 268435456
-  },
-  "shaper": {
-    "batch_window_ms": 3,
-    "cover_budget_ratio": 0.03,
-    "cover_budget_cap": 16384
+    "http_port": 5080
   },
   "log": {
     "level": "info",
     "file_path": "easyss.log"
   },
-  "timeout": 30,
-  "auth_username": "",
-  "auth_password": "",
-  "pprof_enabled": false
+  "timeout": 30
 }
 ```
 
-执行以下命令查看完整模式所有可配置字段：
+> **注意**：`"version": 3` 且 `servers` 非空是识别完整模式的依据。`local.socks_port` 为 0 时不启动任何本地代理服务器；`local.http_port` 未配置时由它推导（`socks_port + 1000`）。
 
-```bash
-./easyss -show-config-example
-```
+其余字段（`servers` 的加密方式/SNI/CA、`routing`、`transport`、`shaper`、`auth_username` 等）均有默认值，按需配置；`./easyss -show-config-example` 可查看完整示例。
 
-**transport 参数说明（默认值以代码为准，0 表示使用默认值）：**
+**servers 参数说明（可配置多个，托盘菜单可切换）：**
 
-| 参数 | 默认值 | 说明 |
-| --- | --- | --- |
-| `transport.protocol` | h2 | 传输协议（目前仅支持 h2） |
-| `transport.conn_count_max` | 15 | 最大连接数，懒加载扩容的上限 |
-| `transport.stream_threshold` | 4 | 活跃流达到该阈值且连接数未达上限时，新建连接 |
-| `transport.priority_slot_ratio` | 0.4 | 优先（交互式）槽位占连接数的比例，其余为批量槽位 |
-| `transport.conn_max_bytes` | 268435456 | 单连接双向累计最大字节数（256MB），0 使用默认值；超限后轮换连接 |
+| 参数 | 必填 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `servers[].host` | 是 | - | 服务器主机名或 IP 字面量（不含端口；IPv6 字面量无需方括号，客户端会自动补上） |
+| `servers[].name` | 否 | 空 | 托盘"选择服务器"菜单的显示名称（切换失败通知中同时显示 name 与 `host:port`）；留空或全空白时显示 `host:port`。只影响展示，不参与连接与切换 |
+| `servers[].port` | 否 | 443 | 服务器端口 |
+| `servers[].password` | 是 | - | 通信加密密钥 |
+| `servers[].method` | 否 | aes-256-gcm | 加密方式，可选: `aes-256-gcm`, `chacha20-poly1305`；必须在服务端 `allowed_methods` 允许的列表内 |
+| `servers[].sn` | 否 | 空 | TLS SNI 覆盖，留空则使用 `host`。服务端用 IP 证书（IP-only 模式）时必须留空；Cloudflare 优选 IP 场景填对应域名（见"配置 Cloudflare 优选 IP"） |
+| `servers[].ca_path` | 否 | 空 | 自定义 CA 证书路径（服务端使用自签证书时填写） |
+| `servers[].default` | 否 | false | 是否为默认服务器；条目都不填时取列表第一个 |
 
-**`timeout` 派生规则（客户端与服务端共用，以代码为准）：**
+> **兼容性**：旧键 `servers[].address` 等价于 `host`，新旧键同时出现会报错；`host` 必填且不得包含端口。升级是单向兼容（新二进制可读旧键），升级后请勿再用旧版本运行新配置。
 
-| 派生项 | 公式 | 默认值（timeout = 30） |
-| --- | --- | --- |
-| TCP 流空闲超时 | 8 × timeout | 240s |
-| UDP 会话空闲超时 | 2 × timeout | 60s |
-| 出站拨号超时 | timeout ÷ 3，钳制在 [3s, 15s] | 10s |
-| DNS 响应读取超时 | timeout ÷ 3 | 10s |
-| 连接轮换生命周期（客户端） | 12 × timeout | 360s |
-| h2 连接空闲超时（服务端） | 8 × timeout | 240s |
+**local 参数说明：**
 
-`timeout` 的取值范围为 **15-60** 秒（非正值取默认值 30，超出范围取最近的边界）：它派生出上表全部超时，过小会让空闲连接被频繁误杀、过大则让半开连接长时间占用资源。其中连接轮换到期后槽位停止接收新流、其空闲连接被关闭，下一条流重新拨号（对用户无感），**进行中的流永不被打断**。
+| 参数 | 必填 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `local.socks_port` | 否 | - | 本地 SOCKS5 监听端口（如 4080）；为 0 时不启动本地代理服务器，通常需要填写 |
+| `local.http_port` | 否 | `socks_port + 1000` | 本地 HTTP 代理监听端口；未配置时由 `socks_port` 推导，显式配置优先。`socks_port` 为 0 时它也是 0；它非 0 而 `socks_port` 为 0 时启动会报错 |
+| `local.bind_all` | 否 | false | 是否将监听端口绑定到所有本地 IP；开启时监听 `[::]`，系统代理与 TUN 等本机自用端点改用同族回环 `[::1]` 访问本地代理 |
+| `local.disable_sys_proxy` | 否 | false | 是否不设置系统代理（headless 版默认会设置） |
+| `local.enable_forward_dns` | 否 | false | 是否在本机所有网卡的 53 端口提供 DNS 转发（供 LAN 设备使用）。仅路由器透明代理场景，需 `socks_port > 0` 才能启动；运行中 TUN 未生效时转发器对所有查询回 REFUSED；移动端（gomobile 绑定）不支持，配置后 `mobile.Start` 直接报错 |
+| `local.enable_tun2socks` | 否 | false | 是否启用 TUN 全局透明代理 |
+| `local.enable_quic` | 否 | false | 是否允许 QUIC（UDP 443）走代理 |
+| `local.tun_mtu` | 否 | 1500 | TUN 设备与 tun2socks 的 MTU，钳制到 [1280, 9000] |
+| `local.tun_config` | 否 | 空 | TUN 参数覆盖，目前仅支持 `{"device": "my-tun9"}` 自定义设备名（简化模式下是包含该对象的字符串）；未知键或类型不匹配会报错 |
 
-**shaper 参数说明：**
+**routing 参数说明：**
 
-| 参数 | 默认值 | 说明 |
-| --- | --- | --- |
-| `shaper.batch_window_ms` | 3 | 流量整形批处理窗口，单位毫秒，范围 1-10 |
-| `shaper.cover_budget_ratio` | 0.03 | cover traffic 占真实流量的预算比例，范围 (0, 1] |
-| `shaper.cover_budget_cap` | 16384 | cover traffic 最大累积预算，单位字节，默认 16KB |
+| 参数 | 必填 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `routing.proxy_rule` | 否 | auto | 代理规则，可选: `auto`, `reverse_auto`, `proxy`, `direct`, `auto_block` |
+| `routing.ipv6_rule` | 否 | auto | IPv6 规则，可选: `auto`（网络与服务端都支持时才启用）, `enable`（强制启用）, `disable`（禁用）；填其他值等同 `disable` |
+| `routing.direct_file` | 否 | 空 | 自定义直连文件路径（IP/CIDR/域名/正则混写，每行一条，支持 `regexp:` 和 `*` 通配符） |
+| `routing.proxy_file` | 否 | 空 | 自定义代理文件路径（同上格式） |
+
+**其他参数说明：**
+
+| 参数 | 必填 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `version` | 是 | - | 配置版本，完整模式固定为 `3`；字段改名（如 `address`→`host`）不改变该版本号 |
+| `log.level` | 否 | info | 日志级别，可选: `debug`, `info`, `warn`, `error` |
+| `log.file_path` | 否 | 空 | 日志文件路径，为空则输出到标准输出 |
+| `timeout` | 否 | 30 | 基础超时时间，单位秒，取值范围 15-60（越界取边界值）；TCP/UDP 空闲、拨号、DNS 响应与连接轮换均由它派生（见下文） |
+| `auth_username` | 否 | 空 | 本地代理的用户名（SOCKS5/HTTP 代理认证），留空表示不校验 |
+| `auth_password` | 否 | 空 | 本地代理的密码 |
+| `pprof_enabled` | 否 | false | 是否启用 pprof 调试服务（127.0.0.1:6060） |
+
+**高级参数（`transport` / `shaper`）：**
+
+传输层连接数、缓冲与流量整形参数均可配置，默认值适配绝大多数网络；完整字段与默认值见 `./easyss -show-config-example`。
+
+**`timeout`（默认 30，范围 15-60）：** 基础超时，TCP/UDP 空闲、出站拨号与 DNS 响应超时都由它派生。过小会让空闲连接被频繁误杀，过大则让半开连接长时间占用资源；连接轮换到期只影响新流，进行中的流不会被打断。
 
 #### 配置模式自动识别
 
-Easyss 通过检测配置文件自动区分模式：
-
 * 包含 `"version": 3` 且 `servers` 非空 → **完整模式**
-* 不包含 `version` 或 `servers` 为空 → **简化模式**（自动迁移到完整模式）
+* 其他情况 → **简化模式**（加载时在内存中转换为完整模式，不回写配置文件）
 
-简化模式的配置会在加载时自动转换为完整模式，用户无需手动迁移。
+保存好配置文件后双击 `easyss`，托盘会出现 Easyss 图标：
 
----
+![托盘图标](docs/images/tray.png)
 
-保存好配置文件后，双击`easyss`，程序会自动启动，托盘会出现Easyss的图标，如下:
+**注意：代理对象选择"系统全局流量"时，需要管理员权限。** Windows 上客户端以普通用户运行（非管理员账户也能开机自启），在托盘里开启该开关时会弹出 UAC 授权，授权后客户端以管理员身份重启并自动开启；macOS/Linux 则就地请求提权。
 
-![托盘图标](assets/img/tray.png)
+**开机自启动与网络尚未就绪：** 开机时 WiFi/网络往往尚未就绪，客户端不会启动失败：服务端域名解析失败只会变成一条启动警告（托盘提示"网络尚未就绪、已在后台重试"），本地代理端口照常监听，后台持续重试解析，网络恢复后自动可用。若配置了系统全局流量（Tun2socks），此时会跳过 TUN，网络恢复后在托盘菜单重新开启即可。
 
-![托盘图标](assets/img/tray2.png)
+**无托盘（headless）版本的系统代理：** `easyss-headless`（以及 `easyss --disable-tray`）没有托盘菜单，会在本地代理启动成功后直接设置系统代理，并在退出时自动撤销；不需要时配置 `"disable_sys_proxy": true`（完整模式为 `local.disable_sys_proxy`）。
 
-![托盘图标](assets/img/tray3.png)
-
-**注意：代理对象，选择系统全局流量时，需要管理员权限。**
-
-**开机自启动与网络尚未就绪：**
-
-Easyss 支持开机自启动。开机时 WiFi/网络往往还没有初始化完成，此时客户端**不会启动失败**：服务端域名解析失败只会变成一条启动警告（托盘会提示"网络尚未就绪、已在后台重试"），SOCKS5/HTTP 代理端口照常监听，后台按退避持续重试解析，网络恢复后代理自动可用（并会再提示一次"网络已就绪"）。
-
-如果配置了"系统全局流量(Tun2socks)"，网络未就绪时会**跳过 TUN**（此时启用会把系统 DNS 指向本机转发服务器却无法解析服务端域名）；托盘中的"系统全局流量"会保持未勾选，等网络恢复后在托盘菜单里重新开启即可。
-
-**无托盘（headless）版本的系统代理：**
-
-`easyss-headless`（以及 `easyss --disable-tray`）没有托盘菜单可以勾选"浏览器(设置系统代理)"，因此会在本地代理启动成功后**直接设置系统代理**（等价于该勾选项），并在收到退出信号时自动撤销。不需要它时，在配置里设置 `"disable_sys_proxy": true`（完整模式为 `local.disable_sys_proxy`）；通常只有改用 `enable_tun2socks` 做全局透明代理时才需要关掉。
-
-两点需要注意：
-
-* Linux 上设置 GNOME 代理走 `gsettings`，发布会话环境走 `systemctl --user` / `dbus-update-activation-environment`。以 root 或 systemd 系统服务方式运行时这些通常不可达，此时系统代理**不会**生效，日志里只留下 `[SYSPROXY]`/`[EASYSS-V3] set system proxy failed` 警告——这种部署请改用 `enable_tun2socks`（TUN）或手动配置代理。
-* 进程被 `kill -9`（SIGKILL）或崩溃时来不及撤销，系统代理会残留并指向一个已经停止的本地端口，表现为"整机断网"。手动恢复（GNOME）：`gsettings set org.gnome.system.proxy mode 'none'`，然后重新启动 Easyss 即可。
+* Linux 上以 root 或 systemd 系统服务方式运行时 `gsettings`/`dbus` 通常不可达，系统代理不会生效，这类部署请改用 TUN 或手动配置代理。
+* 进程被 `kill -9` 或崩溃时来不及撤销，系统代理会残留并指向已停止的本地端口，表现为"整机断网"；GNOME 下执行 `gsettings set org.gnome.system.proxy mode 'none'` 即可恢复。
 
 **自定义直连/代理白名单：**
 
-对于部分国内/国外的 IP 或域名，可能 `Easyss` 没有正确识别路由规则。可通过 `direct_file` 和 `proxy_file` 自定义。
+个别国内/国外 IP 或域名可能未被正确识别路由，可用 `direct_file` 和 `proxy_file` 自定义。在 `easyss` 所在目录下新建文本文件（如 `direct.txt`、`proxy.txt`），IP/CIDR/域名可混写，每行一条记录。
 
-在 `easyss` 所在目录下新建文本文件（如 `direct.txt`、`proxy.txt`），IP/CIDR/域名可混写，每行一条记录。然后在配置中指定路径：
-
-> 配置中的相对路径（`direct_file`、`proxy_file`、`ca_path` 等）会先按当前工作目录查找，找不到时自动回退到 `easyss` 可执行文件所在目录（macOS 下为 `.app` 旁）。这样从 Finder 双击、开机自启（launchd）等方式启动时也能正常读取，不受启动目录影响。
-
-**简化模式：**
+简化模式：
 
 ```json
-{
-  "direct_file": "direct.txt",
-  "proxy_file": "proxy.txt"
-}
+{ "direct_file": "direct.txt", "proxy_file": "proxy.txt" }
 ```
 
-**完整模式：**
+完整模式：
 
 ```json
-"routing": {
-  "direct_file": "direct.txt",
-  "proxy_file": "proxy.txt"
-}
+"routing": { "direct_file": "direct.txt", "proxy_file": "proxy.txt" }
 ```
 
-也可通过命令行指定：
+> 配置中的相对路径（`direct_file`、`proxy_file`、`ca_path` 等）会先按当前工作目录查找，找不到时自动回退到 `easyss` 可执行文件所在目录（macOS 下为 `.app` 旁），因此从 Finder 双击、开机自启等方式启动也能正常读取。
 
-```bash
-./easyss -direct-file direct.txt -proxy-file proxy.txt
-```
-
-`direct.txt` 示例（直连白名单，匹配到则不走代理）：
+`direct.txt` 示例（匹配到则不走代理）：
 
 ```text
 39.156.66.10
-110.242.68.66
-106.11.84.3
 206.0.68.0/23
 baidu.com
-taobao.com
-your-custom-domain.com
-*cn-*                    # glob 通配符：匹配所有包含 "cn-" 的域名
-regexp:^.*\.mycdn\.com$  # 正则表达式：匹配 mycdn.com 及其子域名
+# glob：匹配所有包含 "cn-" 的域名
+*cn-*
+# 正则：匹配 mycdn.com 及其子域名
+regexp:^.*\.mycdn\.com$
 ```
 
-`proxy.txt` 示例（代理白名单，匹配到则强制走代理）：
+`proxy.txt` 示例（匹配到则强制走代理）：
 
 ```text
-1.2.3.4
 10.0.0.0/8
 google.com
-twitter.com
-*google*                 # glob 通配符：匹配所有包含 "google" 的域名
-regexp:^.*\.youtube\..*$ # 正则表达式：匹配包含 .youtube. 的域名
+# glob：匹配所有包含 "google" 的域名
+*google*
+# 正则：匹配包含 .youtube. 的域名
+regexp:^.*\.youtube\..*$
 ```
 
 **匹配规则：**
 
-* 每行自动识别类型（按优先级）：
-    1. `regexp:` 前缀 → Go 正则表达式匹配
-    2. 包含 `*` → glob 通配符匹配（`*` 匹配任意字符序列）
-    3. IP → 精确匹配
-    4. CIDR → 网段匹配
-    5. 其他 → 域名匹配（支持子域名）
-* 域名支持子域名匹配（如配置 `google.com`，则 `www.google.com`、`mail.google.com` 也会匹配）
-* 路由优先级：自定义直连 > 自定义代理 > auto/geo 规则
+* 每行按优先级识别：`regexp:` 正则 → 含 `*` 的 glob → CIDR → IP → 域名（支持子域名）。
+* 空行与以 `#` 开头的整行注释会被跳过，不支持行尾注释（`#` 可能是正则/glob 的一部分）；匹配大小写不敏感。
+* 域名支持子域名匹配；IP 归一化后比较（`::ffff:1.2.3.4` 与 `1.2.3.4` 等价）。
+* 路由优先级：自定义直连 > 自定义代理 > auto/geo 规则。
+* 无法编译的规则会记启动告警并跳过（服务端 `next_proxy_file` 中的同样错误会让启动失败），告警带行号。
 
 ### 手机客户端
 
-手机客户端EasyssTun.apk文件可直接在[release页面](https://github.com/nange/easyss/releases)下载。
+手机客户端 [EasyssTun.apk](https://github.com/nange/easyss/releases) 可直接下载，源码见 [nange/EasyssTun](https://github.com/nange/EasyssTun)。
 
-源码地址：[https://github.com/nange/EasyssTun](https://github.com/nange/EasyssTun)
-
-注意: 可将常用的国内大流量APP勾选上跳过，这样可减少电量消耗。当然不选也没关系，Easyss会自动判断该直连还是走代理。
+可将常用的国内大流量 APP 勾选为跳过以减少电量消耗；不选也没关系，Easyss 会自动判断该直连还是走代理。
 
 ### 服务器端
 
-和客户端一样, 同样先创建配置文件`config.json`，并配置文件和二进制`easyss-server`放同一目录中。
-
-**服务端配置文件示例：**
+与客户端一样，创建配置文件 `config.json` 并与二进制 `easyss-server` 放在同一目录。最简配置：
 
 ```json
 {
   "version": 3,
   "server": {
-    "listen": ":443",
-    "domain": "your-domain.com",
+    "host": "your-domain.com",
+    "port": 443,
     "password": "your-password"
   },
   "log": {
@@ -343,241 +255,144 @@ regexp:^.*\.youtube\..*$ # 正则表达式：匹配包含 .youtube. 的域名
 }
 ```
 
-> **注意**：`server.domain` 需要填**你自己的真实域名**（如 `example.com`），且该域名已解析到本服务器 IP。除非你配置了自定义证书（`cert_path` + `key_path` 都填写），否则此项**必填**——留空会导致启动时自动获取 Let's Encrypt 证书失败。
+> **注意**：`server.host` 填**你自己的真实域名**（需已解析到本服务器 IP），或**公网 IPv4 字面量**（即"不用域名"的 IP-only 模式，见下文）；除非同时配置了自定义证书（`cert_path` + `key_path`），否则此项**必填**。留空、填私有/保留地址或 IPv6 字面量都会在启动时报错。
 
-以上为最简配置，其他所有可配置字段（fallback、shaper、transport、next_proxy、pprof 等）均有默认值，按需配置即可。执行以下命令可查看完整配置示例：
-
-```bash
-./easyss-server -show-config-example
-```
+其余字段（fallback、shaper、transport、next_proxy、pprof 等）均有默认值，按需配置；`./easyss-server -show-config-example` 可查看完整示例。
 
 **参数说明：**
 
 | 参数 | 必填 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `server.listen` | 是 | - | 服务器监听地址，如 `:443` |
-| `server.domain` | 条件必填 | - | 服务器域名。**默认必填**：需填写已解析到本服务器 IP 的真实域名，用于自动获取 Let's Encrypt 证书；仅当同时配置了 `cert_path` 和 `key_path`（自定义证书）时才可留空 |
+| `server.host` | 条件必填 | - | 服务器域名或公网 IPv4 字面量，即自动申请证书时提交给 Let's Encrypt 的标识符：域名需已解析到本机 IP，公网 IP 走 IP-only 模式。留空需同时配置 `cert_path` 与 `key_path`；私有/保留地址或 IPv6 字面量会报错 |
+| `server.port` | 否 | 443 | 监听端口，默认所有网卡 |
+| `server.bind` | 否 | 空 | 可选监听网卡地址（主机名或 IP，不含端口）；旧键 `server.listen` 的主机部分会自动映射到这里 |
 | `server.password` | 是 | - | 通信加密密钥 |
 | `server.allowed_methods` | 否 | aes-256-gcm, chacha20-poly1305 | 允许的加密方式列表 |
-| `server.cert_path` | 否 | - | 自定义证书文件路径（不为空则使用自定义证书） |
-| `server.key_path` | 否 | - | 自定义证书密钥文件路径 |
-| `server.email` | 否 | 随机生成 | 用于自动获取证书的邮箱地址 |
-| `fallback.target` | 否 | - | 回落目标，自动识别类型：<br>**空**: 使用内置主题页面<br>**URL** (`http://`或`https://`开头): 反向代理到上游 HTTP 服务<br>**目录**: 根据 URL path 匹配 HTML 文件（如 `/about` → `about.html`）<br>**文件**: 所有路径返回同一 HTML 页面 |
-| `fallback.preserve_host` | 否 | false | 仅对 `fallback.target` 为 URL 生效。<br>**false**: 转发给上游的 Host 头设为上游主机（默认，适合 GitHub 等会校验 Host 的公网站点）<br>**true**: 透传客户端原始 Host 给上游（适合本地 nginx 依赖 `server_name` 做虚拟主机路由的场景） |
-| `fallback.cdn_domains` | 否 | [] | 仅对 `fallback.target` 为 URL 生效。<br>配置需要通过代理中转的 CDN 域名列表（如 `["github.githubassets.com"]`）。HTML 和 CSP 中引用这些域名的绝对 URL 会被重写为 `/__cdn__/<host>/...` 路径前缀形式，浏览器请求时走代理转发到对应 CDN，避免直连 CDN 暴露真实 IP 或被 CSP 拦截 |
-| `shaper.batch_window_ms` | 否 | 3 | 流量整形批处理窗口，单位毫秒，范围 1-10 |
-| `shaper.cover_budget_ratio` | 否 | 0.03 | cover traffic 占真实流量的预算比例，设为 0 或负数使用默认值，范围 (0, 1] |
-| `shaper.cover_budget_cap` | 否 | 16384 | cover traffic 最大累积预算，单位字节，默认 16KB |
-| `transport.protocols` | 否 | h2 | 支持的传输协议列表，目前仅支持 `h2`，配置其他值启动时报错；未来可同时启用多个（如 h2 + h3） |
-| `transport.h2_max_frame_size` | 否 | 16777215 | 服务端 HTTP/2 最大帧大小（16MB-1），0 使用默认值 |
-| `transport.h2_recv_buf_conn` | 否 | 4194304 | 服务端连接级上行窗口（4MB），0 使用默认值 |
-| `transport.h2_recv_buf_stream` | 否 | 1048576 | 服务端流级上行窗口（1MB），0 使用默认值 |
+| `server.cert_path` | 否 | - | 自定义证书路径，**必须与 `key_path` 成对配置**，只配一个会报错 |
+| `server.key_path` | 否 | - | 自定义证书密钥路径，**必须与 `cert_path` 成对配置** |
+| `server.email` | 否 | 随机生成 | 自动申请证书用的邮箱 |
+| `fallback.target` | 否 | - | 回落目标，自动识别：空 = 内置主题页面；URL = 反向代理到上游 HTTP 服务；目录 = 按 URL path 匹配 HTML；文件 = 所有路径返回同一页面 |
+| `fallback.preserve_host` | 否 | false | 仅 URL 模式生效。false：转发给上游的 Host 为上游主机（适合 GitHub 等校验 Host 的站点）；true：透传客户端原始 Host（适合依赖 `server_name` 的本地 nginx） |
+| `fallback.cdn_domains` | 否 | [] | 仅 URL 模式生效。需经代理中转的 CDN 域名列表，HTML/CSP 中这些域名的绝对 URL 会被重写为 `/__cdn__/<host>/...` |
 | `pprof_enabled` | 否 | false | 是否启用 pprof 调试服务（127.0.0.1:6060） |
-| `timeout` | 否 | 30 | 基础超时时间，单位秒，取值范围 15-60（越界取边界值）；TCP/UDP 空闲、拨号、DNS 响应与 h2 连接空闲均由它派生（见客户端"`timeout` 派生规则"） |
+| `timeout` | 否 | 30 | 基础超时时间，秒，范围 15-60；各项空闲/拨号/DNS 超时都由它派生，语义同客户端 |
 
-> **fallback 使用示例**：
+> **自定义证书**：服务器在私有网络（无公网域名/IP）时可使用自签证书：配置 `server.cert_path` + `server.key_path`（必须成对）。证书 SAN 必须包含客户端要连接的地址，客户端需把 CA 证书填到 `servers[].ca_path`，`sn` 留空；`build/certs` 有 cfssl 示例。
+
+> **兼容性**：旧键 `server.domain` 等价于 `host`，`server.listen`（如 `:443`、`127.0.0.1:443`）会拆成 `port` 与可选的 `bind`；新旧键同时出现会报错。升级是单向兼容。
+
+> **窗口与调优**：服务端 HTTP/2 的 `transport.h2_max_frame_size`、`h2_recv_buf_conn` / `h2_recv_buf_stream`（连接级/流级上行窗口）与 `shaper.*`（流量整形）均可配置，默认值适配绝大多数网络，完整字段见 `-show-config-example`。上传速度上不去时可先调大上行窗口，**连接级窗口应 ≥ 流级窗口**；下载窗口由客户端决定，不可配。
+
+> **fallback 示例**：
 >
 > ```json
-> // 1. 空值 → 内置主题页面（默认）
-> "fallback": { "target": "" }
->
-> // 2. 反向代理到本地 nginx（透传原始 Host，匹配 server_name 路由）
-> "fallback": {
->   "target": "http://127.0.0.1:8080",
->   "preserve_host": true
-> }
->
-> // 3. 反向代理到公网站点（如 GitHub）
-> //    自动重写 Host 头避免 301，并重写 HTML 中的绝对 URL，
-> //    修复 release assets 等动态加载的 CSP 问题
-> //    配置 CDN 域名让静态资源也走代理
-> "fallback": {
->   "target": "https://github.com",
->   "cdn_domains": ["githubassets.com", "githubusercontent.com"]
-> }
-> // preserve_host 默认 false 即可
->
-> // 4. 单文件 → 所有路径返回同一页面
-> "fallback": { "target": "/var/www/fallback.html" }
->
-> // 5. 目录 → 按 URL path 匹配 HTML 文件
-> "fallback": { "target": "/var/www/fallback/" }
+> "fallback": { "target": "" }                                              // 内置主题页面（默认）
+> "fallback": { "target": "http://127.0.0.1:8080", "preserve_host": true }  // 反代到本地 nginx
+> "fallback": { "target": "https://github.com", "cdn_domains": ["githubassets.com"] } // 反代到公网站点
+> "fallback": { "target": "/var/www/fallback/" }                            // 目录：/about → about.html，未匹配 → 404.html
 > ```
 >
-> **URL 模式行为说明**：当 `fallback.target` 为 URL 时，反向代理会自动执行以下处理，无需额外配置：
->
-> * 设置上游 Host 头（避免 GitHub 等站点返回 301 到规范主机）
-> * 重写 3xx `Location` 响应头中指向上游的绝对 URL 为客户端面向地址
-> * 重写 HTML 响应体和 `Content-Security-Policy` 头中指向上游的绝对 URL（如 turbo-frame 的 `src`），使页面内动态请求留在代理上，避免 CSP 拦截
-> * 重写 `Set-Cookie` 的 `Domain` 属性，使浏览器接受 cookie（修复 CSRF 422）
-> * 重写请求 `Origin`/`Referer` 头为上游地址（修复 CSRF 422）
-> * 对上游请求 `Accept-Encoding` 与客户端取交集，gzip 响应自动解压后重写、再按客户端能力重新压缩
-> * 配置了 `fallback.cdn_domains` 时，HTML/CSP 中引用这些 CDN 域名的 URL 被重写为 `/__cdn__/<host>/...`，浏览器请求经代理转发到对应 CDN
->
-> **目录模式**：目录结构如下（优先级: 反向代理 > 目录 > 单文件 > 内置主题）：
->
-> ```
-> /var/www/fallback/
-> ├── index.html          → /
-> ├── about.html          → /about
-> ├── contact.html        → /contact
-> ├── 404.html            → 未匹配路径
-> └── blog/
->     ├── index.html      → /blog
->     └── post1.html      → /blog/post1
-> ```
+> URL 模式会自动处理上游 Host 头、`Location`/HTML/CSP 中的绝对 URL、`Set-Cookie` 的 `Domain`、`Origin`/`Referer`，以及 `Accept-Encoding` 协商与 gzip 重写，无需额外配置。目录模式优先级：反向代理 > 目录 > 单文件 > 内置主题。
 
-执行:
+执行：
 
 ```sh
-./easyss-server  # 前台运行
-nohup ./easyss-server > easyss-server.log 2>&1  # 后台运行
+./easyss-server                                   # 前台运行
+nohup ./easyss-server > easyss-server.log 2>&1    # 后台运行
 ```
 
-**注意：在没有使用自定义证书情况下，服务器的443端口必须对外可访问，用于自动获取服务器域名证书的TLS校验使用；
-同时需要sudo权限运行`easyss-server`。如果需要支持`ping`命令，也需要sudo权限运行`easyss-server`。**
+**注意：未使用自定义证书时，服务器的 443 端口必须对外可访问，用于自动签发与续期的 TLS 校验（无论 `server.host` 填的是域名还是公网 IP），且需长期保持可达。`easyss-server` 需要 sudo 权限运行；如需支持 `ping`（ICMP），同样需要 sudo。**
 
-#### docker部署
+#### 不用域名（IP-only）：用公网 IP 自动申请证书
 
+服务器有**公网 IPv4** 且公网 443 可直接访问时，无需域名：把 `server.host` 填成该 IP，`easyss-server` 会自动向 Let's Encrypt 申请并续期一张 **IP 地址证书**。
+
+```json
+{
+  "version": 3,
+  "server": {
+    "host": "203.0.114.1",
+    "port": 443,
+    "password": "your-password"
+  }
+}
+```
+
+客户端填同一个 IP 即可（完整模式 `servers[].host`、简化模式 `server`），`sn` 留空——证书里就是 IP。
+
+Let's Encrypt 对 IP 证书的几条硬性规定：
+
+* **短生命周期**：有效期约 160 小时，服务端会自动续期，无需干预；但**不要删 `certmagic/` 证书目录**——反复重签会撞速率限制（同一 IP 每 7 天最多 5 张，ARI 协调的续期不计入）。
+* **只能用 tls-alpn-01 验证**：公网 443 在首次签发与每次续期时都要能被 Let's Encrypt 访问；`server.port` 不是 443 时需把公网 443 转发到它。
+* **必须是公网地址**：私有/保留/CGNAT 地址（如 `10.x`、`192.168.x`、`100.64.0.0/10`）无法签发，这类部署请用自定义证书；`host` 填这类地址会启动报错。IPv6 字面量暂不支持。
+* 证书会进入 CT 日志（可用 crt.sh 搜索该 IP）；客户端访问该 IP 时不发送 SNI。
+
+#### Docker 部署
+
+```sh
 docker run -d --name easyss --network host nange/docker-easyss:latest -p yourport -k yourpassword -s yourdomain.com
-
-### 自定义证书
-
-默认情况下，`easyss-server`端部署时配置了域名，则会自动从`Let's Encrypt`获取tls证书，用户无需操心证书配置。
-但这要求我们必须有自己的域名，这加大了使用Easyss的难度。如果我们没有自己的域名，也可以通过自定义tls证书来使用Easyss。
-
-#### 生成自定义证书
-
-可根据自己的需求，使用`openssl`等工具生成自定义证书。也可以参考： `./scripts/self_signed_certs` 目录示例，使用`cfssl`生成自定义证书。
-示例就是使用IP而不是域名生成自定义证书，这样就可以无域名使用Easyss了。
-
-### 自更新
-
-客户端（含 headless 无托盘版）与服务端均支持 `selfupdate` 子命令：从 GitHub 检查最新 release，并**原地替换当前二进制**；也可用 `--version <tag>` 指定安装某个具体版本。替换完成后不会自动重启，需要手动（或由 systemd/supervisor 等）重启进程使新版本生效。
-
-托盘版客户端（`easyss`）启动约 1 分钟后会自动检查一次更新，此后**每约 24 小时（带随机抖动）再检查一次**，只要进程在运行就会持续检查（macOS 上用户常常长时间不退出程序，仅靠启动时检查会错过后续发布的版本）。若检测到新版本，会**同时通过以下方式提醒一次**（每次启动都会重新提醒，直至升级完成）：
-
-* **托盘图标徽标**：图标右上角出现常驻绿色圆点，鼠标悬停显示「发现新版本 X，点击托盘菜单更新」。该通道不依赖系统通知开关，即使关闭系统通知或开启专注助手也依然可见；升级成功后徽标自动消失。
-* **托盘菜单项**：显示「发现新版本 X，点击更新」并常驻（不再自动消失），点击即开始下载安装。
-* **系统通知**：弹一次气泡/通知（尽力而为；若系统禁用了通知可能不显示，此时徽标与菜单项仍然可见）。
-
-已发现新版本但用户未升级时，徽标、菜单项与悬停提示会常驻；周期检查只会把它们刷新为**最新**发现的版本，同一个版本不会每 24 小时重复弹一次系统通知（若期间又发布了更新的版本，则会针对新版本再次提醒）。
-
-手动点击托盘菜单的「检查更新」时，结果**除了菜单项外还会弹一次系统通知**（「已是最新版本(X)」或「检查更新失败：…」），因为菜单项的提示文字会在 4 秒后自动复位，不弹通知的话用户需重新打开菜单才能确认结果。
-
-```sh
-# 仅检查是否有新版本
-./easyss selfupdate --check
-./easyss-server selfupdate --check
-
-# 下载并替换二进制（不重启）
-./easyss selfupdate
-./easyss-headless selfupdate
-./easyss-server selfupdate
-
-# 安装指定版本（调试时可重装当前版本或回退到旧版本）
-./easyss selfupdate --version v3.0.0
-./easyss-server selfupdate --version v3.0.0
-
-# 仅确认指定版本存在，且当前平台有对应发布包（不下载）
-./easyss selfupdate --version v3.0.0 --check
 ```
-
-* `--proxy-port <port>`：若本机同时运行了 easyss 客户端，可指定其 HTTP 代理端口，更新请求优先走本地代理，失败自动回退直连（默认直连）。
-* `--version <tag>`：安装该 release tag 对应的版本，**tag 必须与 release tag 完全一致**（例如 `v3.0.0`、`v3.1.0-rc1`、`nightly-1a2b3c4`），不做 `v` 前缀补全。指定版本时**不与本地版本比较**，因此可以重装当前版本或回退到更旧的版本（调试用）；tag 不存在时以退出码 1 结束并提示。该版本若没有当前平台的发布包，同样以退出码 1 结束。
-* 运行 `<bin> --help`（或 `<bin> selfupdate --help`）可查看各命令的完整参数说明。
-* Windows 下替换时原二进制会保留为 `.old`，下次正常启动时自动清理；Linux/macOS 直接原子替换。
-* Windows 托盘版（`easyss.exe`）因编译时隐藏控制台窗口，CLI 输出不可见，可通过重定向或退出码判断结果；服务端 Windows 版不受影响。
 
 ## 高级用法
 
-### 服务器部署在反向代理(或CDN)之后
+### 服务器部署在反向代理（或 CDN）之后
 
-Easyss v3 基于 HTTP/2 作为传输层协议，天然兼容反向代理和 CDN 部署。
+Easyss v3 以 HTTP/2 作为传输层，天然兼容反向代理和 CDN 部署：把 Nginx、Cloudflare 等反向代理的流量转发到 `easyss-server` 的监听端口，客户端填反向代理的地址和端口即可，无需额外设置。
 
-将 Nginx、Cloudflare 等反向代理配置为将流量转发到 `easyss-server` 的监听端口即可。
-客户端配置中填写反向代理的地址和端口，无需额外设置。
+### 配置 Cloudflare 优选 IP
 
-### 配置Cloudflare优选IP
+可将 Cloudflare CDN 作为反向代理并把流量转发给 Easyss，配合优选 IP 通常能改善访问速度。简化模式把 `server` 配为优选 IP、`sn` 配为 Cloudflare 后台的域名；完整模式对应 `servers[].host` 与 `servers[].sn`。
 
-可以把Cloudflare CDN作为反向代理，再将流量转发给Easyss,这样在很多时候能够改善我们的网络访问速度。
-使用Cloudflare CDN通常会配合其优选IP同时使用，这样可以大幅提高访问速度和降低网络延迟。
+与 IP-only 模式相反：那里 `sn` 必须留空（证书里就是 IP），这里 `sn` 必须是域名（证书是 Cloudflare 为你的域名签发的）。
 
-在简化模式中，将 `server` 字段配置为优选IP，`sn` 字段配置为Cloudflare后台管理的域名即可。
-在完整模式中，将 `servers[].address` 配置为优选IP，`servers[].sn` 配置为对应的域名。
+### 作为透明代理部署在路由器或软路由上
 
-### 作为透明代理将Easyss部署在路由器或者软路由上
+将 Easyss 部署在路由器/软路由上，可让家里或公司网络自动透明代理，无需在终端设备安装客户端。简化模式设置 `enable_tun2socks: true` 和 `enable_forward_dns: true`，完整模式设置 `local.enable_tun2socks` 与 `local.enable_forward_dns`。
 
-直接将Easyss部署在路由器或者软路由上，可实现家里或公司网络自动透明代理，无需在终端设备上安装Easyss客户端。
+两个开关缺一不可，且 `socks_port` 必须有效（`enable_forward_dns` 的查询要靠 TUN 回到本机 SOCKS5 再按域名分流；缺 `socks_port` 时启动直接失败）：
 
-在简化模式中设置 `enable_tun2socks: true` 和 `enable_forward_dns: true`。
-在完整模式中设置 `local.enable_tun2socks: true` 和 `local.enable_forward_dns: true`。
-也可通过命令行 `-enable-tun2socks=true` 开启全局代理。
+* `enable_tun2socks`：在本机建立全局透明代理（TUN 网卡 + 路由表），让经过这台主机的流量按域名/GeoIP 分流后走代理。
+* `enable_forward_dns`：在本机所有网卡的 53 端口提供 DNS 转发（UDP、双栈），供 LAN 设备当解析器使用。
 
-两个开关各自负责一件事，缺一不可：
+**`enable_forward_dns` 只为"路由器透明代理"存在，运行时必须保持 TUN 开启。** LAN 设备发给路由器自身的 DNS 查询在内核里本地投递，不会进 TUN，所以由这个转发器接住再向上游发一次：上游是公网解析器，地址落在 TUN 的默认路由内，查询因此重新进入 TUN，经代理侧的 DNS 拦截按域名分流（该屏蔽的屏蔽、该直连的直连）。转发器自身不屏蔽、不缓存。转发器逐条读运行期 TUN 状态：TUN 未生效（没开、启动失败、被托盘关掉）时对所有 LAN 查询回 REFUSED，而不是降级成物理网卡上的直连解析（DNS 泄漏）。启动期只校验 `socks_port > 0`；TUN 由运行期闸门把关，因为托盘切换服务器/重启时会先把 TUN 偏好临时置 false 再起核心。
 
-* `enable_tun2socks`：在本机建立全局透明代理（TUN 网卡 + 路由表），让**经过这台主机的流量**
-  按域名/GeoIP 分流后走代理。
-* `enable_forward_dns`：在本机**所有网卡的 53 端口**上提供 DNS 转发服务（UDP，双栈——
-  同时接受 IPv4 与 IPv6 查询），供 **LAN 设备**当解析器使用。它只做转发，不做屏蔽/缓存
-  策略；LAN 设备的解析结果由它代查后返回。
+还需在路由器上完成两件事：
 
-因此还需要在路由器上完成两件事：
+1. 把 LAN 侧（DHCP 下发）的 DNS 指向这台路由器的 LAN IP（如 `192.168.1.1`）。只改 DNS 而网关不指向它时，设备能解析域名但连接不经过这台主机，也就不会被代理。
+2. 放行 UDP 53（**不要在公网侧放行**，否则就是开放解析器）。
 
-1. **把 LAN 侧（DHCP 下发）的 DNS 指向这台路由器的 LAN IP**，例如 `192.168.1.1`。
-   只把 DNS 指过来而网关不指向它时，设备能正常解析域名，但**连接不会经过这台主机，
-   也就不会被代理**——透明代理的前提始终是流量本身经过它（网关指向它，或自行配置
-   NAT/透明重定向规则）。
-2. 放行 UDP 53（监听的 53 端口对所有网卡开放，**不要在公网侧放行**，否则就是一个开放解析器）。
+若 53 端口被占用，Easyss 会启动失败，常见占用者是 `dnsmasq` 与 `systemd-resolved`，需先停用它们的 DNS 监听（如 dnsmasq 设 `port=0` 只保留 DHCP）。该转发只监听 UDP 53：LAN 客户端因截断应答改用 TCP 53 重试的查询不会被应答，受影响的环境请让客户端直连上游解析器，或用 dnsmasq 承接 TCP 查询后再转发到本服务。
 
-若 53 端口已被占用，Easyss 会启动失败并提示端口冲突，常见占用者是 `dnsmasq` 与
-`systemd-resolved`，需要先停用它们的 DNS 监听（例如 dnsmasq 设 `port=0` 只保留 DHCP）
-再启动 Easyss。
+TUN 网卡的 MTU 由 `tun_mtu` 统一控制（默认 1500，钳制到 [1280, 9000]）；调大（如 8500）可减少包数与系统调用，但会抬高本机 UDP/ICMP 报文的尺寸上限，默认值对绝大多数网络已足够。
 
-已知限制：该转发服务只监听 UDP 53。LAN 客户端若收到截断应答（`TC` 置位，例如 DNSSEC
-或记录很多的域名）而改用 TCP 53 重试，这部分查询不会被应答——这是为了保持实现简单而
-有意留下的取舍；受影响的环境请让 LAN 客户端直连上游解析器，或另行用 dnsmasq 之类的
-工具承接 TCP 查询并转发到本服务。
-
-根据情况判断是否需要开启ip转发:
+视需要开启 IP 转发：
 
 ```bash
-# 编辑配置文件
-vi /etc/sysctl.conf
-
-# 找到并取消注释（或添加）以下行：
+# /etc/sysctl.conf
 net.ipv4.ip_forward = 1
-
-# 如果需要IPv6转发，也取消注释：
-net.ipv6.conf.all.forwarding = 1
-
-# 重新加载配置
+net.ipv6.conf.all.forwarding = 1   # 需要 IPv6 转发时一并开启
 sysctl -p
 ```
 
 ### 服务端链式代理
 
-服务端(`easyss-server`)支持将请求再次转发给下一个代理(目前只支持`socks5`)。
-
-在完整模式服务端配置中指定 `next_proxy`：
+服务端（`easyss-server`）支持把请求再次转发给下一级代理（目前仅支持 SOCKS5），在服务端配置中指定 `next_proxy`：
 
 ```json
 {
-    "next_proxy": {
-        "url": "socks5://your-ip:your-port",
-        "next_proxy_file": "next_proxy.txt",
-        "enable_udp": false,
-        "all_host": false
-    }
+  "next_proxy": {
+    "url": "socks5://your-ip:your-port",
+    "next_proxy_file": "next_proxy.txt",
+    "enable_udp": false,
+    "all_host": false
+  }
 }
 ```
 
-* `next_proxy.url`: 下一级代理地址，格式 `socks5://ip:port`
-* `next_proxy.next_proxy_file`: 指定走链式代理的 IP/CIDR/域名列表文件，每行一条记录，可混放
-* `next_proxy.enable_udp`: 是否转发UDP请求（需要下一级代理支持）
-* `next_proxy.all_host`: 是否对所有请求走链式代理
-
-如果未指定 `next_proxy_file`，则仅按 `all_host` 规则决定是否走链式代理。
+* `next_proxy.url`：下一级代理地址，格式 `socks5://ip:port`
+* `next_proxy.next_proxy_file`：走链式代理的 IP/CIDR/域名列表文件，格式与客户端 `direct_file`/`proxy_file` 一致；区别是无法编译的规则会让服务端**启动失败**（而不是只记告警）
+* `next_proxy.enable_udp`：是否转发 UDP（需下一级代理支持 UDP ASSOCIATE）。开启前请确认，否则这些 UDP 目标会全部超时（TUN 模式下表现为所有域名都解析不出来）
+* `next_proxy.all_host`：是否对所有请求走链式代理；未指定 `next_proxy_file` 时仅按它决定
 
 ## LICENSE
 

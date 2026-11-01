@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nange/easyss/v3/config"
+	"github.com/nange/easyss/v3/crypto"
 	"github.com/nange/easyss/v3/protocol"
 	"github.com/nange/easyss/v3/shaper"
 	"github.com/nange/easyss/v3/transport"
@@ -29,9 +31,8 @@ func (s *mockStream) Write(p []byte) (int, error) {
 func (s *mockStream) CloseWrite() error { return nil }
 func (s *mockStream) Close() error      { return nil }
 
-// awaitableStream 是实现了三个可选引导接口的测试流（transport.ResponseAwaiter/
-// ConnLiveness/ConnInvalidator），用来验证代理层的引导状态机：判死重试、判活后
-// 继续等待，以及调用顺序（失效连接必须先于关闭流）。
+// awaitableStream 实现 ResponseAwaiter/ConnLiveness/ConnInvalidator 三个可选接口，
+// 用来驱动引导状态机：判死重试、判活后继续等、以及取消时不失效连接。
 type awaitableStream struct {
 	mockStream
 
@@ -90,20 +91,18 @@ var (
 	_ transport.ConnInvalidator = (*awaitableStream)(nil)
 )
 
-// alwaysDeadline 模拟"窗口到点且连接不可往返"：AwaitResponse 直接报告窗口超时，
-// 判活返回"无法判定"。
+// alwaysDeadline 模拟窗口到点且连接不可往返：AwaitResponse 直接报告超时。
 func alwaysDeadline(context.Context) error { return context.DeadlineExceeded }
 
-// TestOpenAndBootstrap_DeadlineRetriesOnFreshConnection 验证引导阶段的判死重试：
-// 等待窗口到点且判活无法确认时，失效并关闭本流所在的连接、丢弃其余空闲连接，
-// 然后在新的连接上重试，应用侧只看到一次成功的引导。
+// TestOpenAndBootstrap_DeadlineRetriesOnFreshConnection 验证判死重试：窗口到点且无法
+// 判活时，按代失效并关闭本流所在连接，直接在新连接上重试，不再动全局空闲连接。
 func TestOpenAndBootstrap_DeadlineRetriesOnFreshConnection(t *testing.T) {
 	first := &awaitableStream{await: alwaysDeadline}
 	second := &awaitableStream{}
 	tr := &mockTransport{streams: []transport.Stream{first, second}}
 	h := newTestStreamHandler(tr)
 
-	bs, err := h.openAndBootstrap(context.Background(), "/v3/tcp", protocol.ProtoTCP, "example.com:443", protocol.MethodAES256GCM, nil)
+	bs, err := h.openAndBootstrap(context.Background(), testTCPRequest("example.com:443"))
 	if err != nil {
 		t.Fatalf("expected success after retry, got: %v", err)
 	}
@@ -112,23 +111,23 @@ func TestOpenAndBootstrap_DeadlineRetriesOnFreshConnection(t *testing.T) {
 	if tr.openCalls() != 2 {
 		t.Errorf("expected 2 Open calls, got %d", tr.openCalls())
 	}
-	if _, alive, invalidates, closes := first.counters(); invalidates != 1 || closes != 1 || alive != 1 {
-		t.Errorf("first stream: invalidates=%d closes=%d alive=%d, want 1/1/1 (probed then judged dead)", invalidates, closes, alive)
+	if await, alive, invalidates, closes := first.counters(); await != 1 || alive != 1 || invalidates != 1 || closes != 1 {
+		t.Errorf("first stream: await=%d alive=%d invalidates=%d closes=%d, want 1/1/1/1 (no settle wait with per-generation invalidation)",
+			await, alive, invalidates, closes)
 	}
-	if tr.closeIdleCalls() != 1 {
-		t.Errorf("expected 1 CloseIdle call after judging the connection dead, got %d", tr.closeIdleCalls())
+	if got := tr.closeIdleCalls(); got != 0 {
+		t.Errorf("CloseIdle calls = %d, want 0 (per-generation invalidation is enough)", got)
 	}
 }
 
-// TestOpenAndBootstrap_LateResponseKeepsAliveConnection 验证判活的用途：等待窗口
-// 到点但同连接探测确认可往返（服务端只是还在解析目标域名）时不重试、不关连接，
-// 交回中继继续等——这正是"慢"与"死"的分界。
+// TestOpenAndBootstrap_LateResponseKeepsAliveConnection 验证判活的用途：探测确认同
+// 连接可往返（服务端只是还在解析目标域名）时不重试、不关连接——"慢"与"死"的分界。
 func TestOpenAndBootstrap_LateResponseKeepsAliveConnection(t *testing.T) {
 	first := &awaitableStream{await: alwaysDeadline, alive: true, aliveKnown: true}
 	tr := &mockTransport{streams: []transport.Stream{first}}
 	h := newTestStreamHandler(tr)
 
-	bs, err := h.openAndBootstrap(context.Background(), "/v3/tcp", protocol.ProtoTCP, "example.com:443", protocol.MethodAES256GCM, nil)
+	bs, err := h.openAndBootstrap(context.Background(), testTCPRequest("example.com:443"))
 	if err != nil {
 		t.Fatalf("expected the alive connection to be kept, got: %v", err)
 	}
@@ -145,15 +144,15 @@ func TestOpenAndBootstrap_LateResponseKeepsAliveConnection(t *testing.T) {
 	}
 }
 
-// TestOpenAndBootstrap_TransportErrorRetriesImmediately 验证传输层错误（连接在
-// 写入/响应阶段就坏了）立即换连接重试，不必等满窗口，也不做判活探测。
+// TestOpenAndBootstrap_TransportErrorRetriesImmediately 验证传输层错误立即换连接重试，
+// 不等满窗口，也不做判活探测。
 func TestOpenAndBootstrap_TransportErrorRetriesImmediately(t *testing.T) {
 	first := &awaitableStream{await: func(context.Context) error { return errors.New("connection reset by peer") }}
 	second := &awaitableStream{}
 	tr := &mockTransport{streams: []transport.Stream{first, second}}
 	h := newTestStreamHandler(tr)
 
-	bs, err := h.openAndBootstrap(context.Background(), "/v3/tcp", protocol.ProtoTCP, "example.com:443", protocol.MethodAES256GCM, nil)
+	bs, err := h.openAndBootstrap(context.Background(), testTCPRequest("example.com:443"))
 	if err != nil {
 		t.Fatalf("expected success after retry, got: %v", err)
 	}
@@ -167,9 +166,8 @@ func TestOpenAndBootstrap_TransportErrorRetriesImmediately(t *testing.T) {
 	}
 }
 
-// TestOpenAndBootstrap_ExhaustedAttemptsReportError 验证尝试次数耗尽后把最后一次
-// 的失败交给应用，并且每次放弃都丢弃了其余空闲连接（否则后续请求会逐个再踩一遍
-// 旧网络上的死连接）。
+// TestOpenAndBootstrap_ExhaustedAttemptsReportError 验证次数耗尽后把最后一次失败交给
+// 应用，且每次判死都按代失效——否则后续请求会逐个再踩一遍旧网络的死连接。
 func TestOpenAndBootstrap_ExhaustedAttemptsReportError(t *testing.T) {
 	streams := make([]transport.Stream, 0, bootstrapMaxAttempts)
 	for range bootstrapMaxAttempts {
@@ -178,7 +176,7 @@ func TestOpenAndBootstrap_ExhaustedAttemptsReportError(t *testing.T) {
 	tr := &mockTransport{streams: streams}
 	h := newTestStreamHandler(tr)
 
-	_, err := h.openAndBootstrap(context.Background(), "/v3/tcp", protocol.ProtoTCP, "example.com:443", protocol.MethodAES256GCM, nil)
+	_, err := h.openAndBootstrap(context.Background(), testTCPRequest("example.com:443"))
 	if err == nil {
 		t.Fatal("expected an error after exhausting attempts, got nil")
 	}
@@ -188,13 +186,19 @@ func TestOpenAndBootstrap_ExhaustedAttemptsReportError(t *testing.T) {
 	if tr.openCalls() != bootstrapMaxAttempts {
 		t.Errorf("expected %d Open calls, got %d", bootstrapMaxAttempts, tr.openCalls())
 	}
-	if got, want := tr.closeIdleCalls(), bootstrapMaxAttempts-1; got != want {
-		t.Errorf("CloseIdle calls = %d, want %d (one per retry)", got, want)
+	if got := tr.closeIdleCalls(); got != 0 {
+		t.Errorf("CloseIdle calls = %d, want 0 (per-generation invalidation is enough)", got)
+	}
+	for i, stream := range streams {
+		first := stream.(*awaitableStream)
+		if _, _, invalidates, _ := first.counters(); invalidates != 1 {
+			t.Errorf("stream %d invalidates = %d, want 1", i, invalidates)
+		}
 	}
 }
 
-// TestOpenAndBootstrap_ContextCanceledNoRetry 验证上层取消（核心停止、本地连接
-// 已断）时立即上报 ctx 错误，不做重试，也不丢弃连接池。
+// TestOpenAndBootstrap_ContextCanceledNoRetry 验证上层取消时立即上报 ctx 错误，
+// 不重试也不丢弃连接池。
 func TestOpenAndBootstrap_ContextCanceledNoRetry(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	first := &awaitableStream{await: func(context.Context) error {
@@ -204,7 +208,7 @@ func TestOpenAndBootstrap_ContextCanceledNoRetry(t *testing.T) {
 	tr := &mockTransport{streams: []transport.Stream{first}}
 	h := newTestStreamHandler(tr)
 
-	_, err := h.openAndBootstrap(ctx, "/v3/tcp", protocol.ProtoTCP, "example.com:443", protocol.MethodAES256GCM, nil)
+	_, err := h.openAndBootstrap(ctx, testTCPRequest("example.com:443"))
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected context.Canceled, got: %v", err)
 	}
@@ -214,21 +218,20 @@ func TestOpenAndBootstrap_ContextCanceledNoRetry(t *testing.T) {
 	if tr.closeIdleCalls() != 0 {
 		t.Errorf("expected no CloseIdle call after cancellation, got %d", tr.closeIdleCalls())
 	}
-	// 取消不是判死：只关闭本流，绝不能失效连接——这条连接是健康的，且被同槽位
-	// 其他在飞流共享，关掉它会连带中断它们。
+	// 取消不是判死：只关本流，绝不失效连接——它健康且被同槽位的在飞流共享。
 	if _, _, invalidates, closes := first.counters(); invalidates != 0 || closes != 1 {
 		t.Errorf("first stream: invalidates=%d closes=%d, want 0/1", invalidates, closes)
 	}
 }
 
-// TestOpenAndBootstrap_ResponseReadyNoRetry 验证"响应已就绪"（含服务端拒绝）不
-// 触发任何重试或连接失效：分类交给首次 Read。
+// TestOpenAndBootstrap_ResponseReadyNoRetry 验证"响应已就绪"（含服务端拒绝）不触发
+// 重试或连接失效，分类交给首次 Read。
 func TestOpenAndBootstrap_ResponseReadyNoRetry(t *testing.T) {
 	first := &awaitableStream{await: func(context.Context) error { return nil }}
 	tr := &mockTransport{streams: []transport.Stream{first}}
 	h := newTestStreamHandler(tr)
 
-	bs, err := h.openAndBootstrap(context.Background(), "/v3/tcp", protocol.ProtoTCP, "example.com:443", protocol.MethodAES256GCM, nil)
+	bs, err := h.openAndBootstrap(context.Background(), testTCPRequest("example.com:443"))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -242,66 +245,73 @@ func TestOpenAndBootstrap_ResponseReadyNoRetry(t *testing.T) {
 	}
 }
 
-// TestOpenAndBootstrap_SettlesBeforeDroppingIdleConnections 验证判死路径的动作
-// 顺序：失效连接 → 关闭流 → 等本流 RoundTrip 收敛 → CloseIdle()。顺序反了
-// （尤其是 CloseIdle 提前）会让 CloseIdleConnections 漏掉这条仍被在飞流占用的
-// 连接，重试的 Open 会再次拿到它，白费一次尝试。
-func TestOpenAndBootstrap_SettlesBeforeDroppingIdleConnections(t *testing.T) {
-	settledAfterClose := false
-	first := &awaitableStream{}
-	first.await = func(context.Context) error {
-		if _, _, _, closes := first.counters(); closes == 1 {
-			settledAfterClose = true
-		}
-		return context.DeadlineExceeded
-	}
+// awaiterStream 只实现 ResponseAwaiter：没有按代失效能力时，判死重试必须退回
+// "等本流收敛 → 全局 CloseIdle" 的老路径，否则重试可能再次拿到正在死的连接。
+type awaiterStream struct {
+	mockStream
+
+	mu         sync.Mutex
+	awaitCalls int
+}
+
+func (s *awaiterStream) AwaitResponse(context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.awaitCalls++
+	return context.DeadlineExceeded
+}
+
+func (s *awaiterStream) awaits() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.awaitCalls
+}
+
+func TestOpenAndBootstrap_FallsBackToCloseIdleWithoutInvalidator(t *testing.T) {
+	first := &awaiterStream{}
 	second := &awaitableStream{}
 	tr := &mockTransport{streams: []transport.Stream{first, second}}
 	tr.onCloseIdle = func() {
-		if await, _, _, _ := first.counters(); await < 2 {
-			t.Error("CloseIdle must run after the dead stream settled")
+		if got := first.awaits(); got < 2 {
+			t.Errorf("CloseIdle ran before the dead stream settled (awaits=%d)", got)
 		}
 	}
 	h := newTestStreamHandler(tr)
 
-	bs, err := h.openAndBootstrap(context.Background(), "/v3/tcp", protocol.ProtoTCP, "example.com:443", protocol.MethodAES256GCM, nil)
+	bs, err := h.openAndBootstrap(context.Background(), testTCPRequest("example.com:443"))
 	if err != nil {
 		t.Fatalf("expected success after retry, got: %v", err)
 	}
 	defer bs.stream.Close() //nolint:errcheck
 
-	if !settledAfterClose {
-		t.Error("the dead stream must be closed before the settle wait")
+	if got := tr.closeIdleCalls(); got != 1 {
+		t.Errorf("CloseIdle calls = %d, want 1 (fallback for a transport without invalidation)", got)
 	}
-	if _, _, invalidates, closes := first.counters(); invalidates != 1 || closes != 1 {
-		t.Errorf("first stream: invalidates=%d closes=%d, want 1/1", invalidates, closes)
+	if got := first.awaits(); got != 2 {
+		t.Errorf("first stream awaits = %d, want 2 (window + settle)", got)
 	}
 }
 
-// TestOpenAndBootstrap_ResponseWindowIsBounded 验证等待窗口真的被应用于
-// AwaitResponse：一个在窗口到点前不会自己返回的流，最终仍由引导窗口打断。
+// TestOpenAndBootstrap_ResponseWindowIsBounded 验证引导窗口真的作用到 AwaitResponse：
+// 在窗口到点前不会自己返回的流，最终仍由该窗口打断。
 func TestOpenAndBootstrap_ResponseWindowIsBounded(t *testing.T) {
 	const window = 20 * time.Millisecond
 	old := bootstrapResponseTimeout
 	bootstrapResponseTimeout = window
 	t.Cleanup(func() { bootstrapResponseTimeout = old })
 
-	// 第一次 AwaitResponse 是引导等待窗口；后续调用是判死后的 settle 等待，
-	// 只记录第一次的耗时。
+	// 第一次 AwaitResponse 是引导等待窗口，后续是判死后的 settle，只记第一次耗时。
 	windowEnded := make(chan time.Duration, 1)
 	var recordOnce sync.Once
 	await := func(ctx context.Context) error {
 		<-ctx.Done()
 
-		// 窗口起点必须由 deadline 反推，而不是在 AwaitResponse 内部取 now：
-		// 窗口由 awaitBootstrapResponse 里的 context.WithTimeout 创建，两者之间
-		// 还隔着一次接口调用与并发原语开销，定时器却只在 deadline 之后触发，
-		// 因此"从调用内部起算"量出的值恒小于窗口，只靠定时器过冲掩盖。Windows
-		// 上该开销会被调度放大到毫秒级（实测 18.3ms < 20ms），断言便会偶发失败。
+		// 窗口起点必须由 deadline 反推：窗口在 awaitBootstrapResponse 的
+		// context.WithTimeout 处创建，与这里的接口调用之间还有开销，从调用内部起算
+		// 量出的值恒小于窗口；Windows 上该开销被调度放大到毫秒级，断言会偶发失败。
 		deadline, ok := ctx.Deadline()
 		if !ok {
-			// 没有 deadline 就没法衡量窗口：直接失败，而不是让 <-ctx.Done()
-			// 永远阻塞（那只会把失败变成测试超时挂起）。
+			// 没有 deadline 就无从衡量窗口：直接失败，别让 <-ctx.Done() 挂起成测试超时。
 			return errors.New("AwaitResponse was called without the bootstrap window")
 		}
 		recordOnce.Do(func() { windowEnded <- time.Since(deadline.Add(-window)) })
@@ -314,7 +324,7 @@ func TestOpenAndBootstrap_ResponseWindowIsBounded(t *testing.T) {
 	tr := &mockTransport{streams: streams}
 	h := newTestStreamHandler(tr)
 
-	_, err := h.openAndBootstrap(context.Background(), "/v3/tcp", protocol.ProtoTCP, "example.com:443", protocol.MethodAES256GCM, nil)
+	_, err := h.openAndBootstrap(context.Background(), testTCPRequest("example.com:443"))
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("expected context.DeadlineExceeded, got: %v", err)
 	}
@@ -334,7 +344,7 @@ type mockTransport struct {
 	closeIdleCount int
 	streams        []transport.Stream
 	openErrs       []error
-	// onCloseIdle 在 CloseIdle 递增计数后被调用，供用例断言判死路径的动作顺序。
+	// onCloseIdle 在计数递增后回调，供用例断言无按代失效时的回退顺序。
 	onCloseIdle func()
 }
 
@@ -383,7 +393,11 @@ func newTestStreamHandler(tr transport.Transport) *StreamHandler {
 	for i := range key {
 		key[i] = byte(i + 1)
 	}
-	return NewStreamHandler(tr, key, shaper.Config{}, 0)
+	return NewStreamHandler(tr, key, shaper.Config{}, config.Timeouts{})
+}
+
+func testTCPRequest(target string) streamRequest {
+	return tcpStreamRequest(target, protocol.MethodAES256GCM)
 }
 
 func TestOpenAndBootstrap_SuccessFirstTry(t *testing.T) {
@@ -394,7 +408,7 @@ func TestOpenAndBootstrap_SuccessFirstTry(t *testing.T) {
 	}
 	h := newTestStreamHandler(tr)
 
-	bs, err := h.openAndBootstrap(context.Background(), "/v3/tcp", protocol.ProtoTCP, "example.com:443", protocol.MethodAES256GCM, nil)
+	bs, err := h.openAndBootstrap(context.Background(), testTCPRequest("example.com:443"))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -416,7 +430,7 @@ func TestOpenAndBootstrap_RetryOnErrClosedPipe(t *testing.T) {
 	}
 	h := newTestStreamHandler(tr)
 
-	bs, err := h.openAndBootstrap(context.Background(), "/v3/tcp", protocol.ProtoTCP, "example.com:443", protocol.MethodAES256GCM, nil)
+	bs, err := h.openAndBootstrap(context.Background(), testTCPRequest("example.com:443"))
 	if err != nil {
 		t.Fatalf("expected success after retry, got: %v", err)
 	}
@@ -438,7 +452,7 @@ func TestOpenAndBootstrap_NoRetryOnNonClosedPipeErr(t *testing.T) {
 	}
 	h := newTestStreamHandler(tr)
 
-	_, err := h.openAndBootstrap(context.Background(), "/v3/tcp", protocol.ProtoTCP, "example.com:443", protocol.MethodAES256GCM, nil)
+	_, err := h.openAndBootstrap(context.Background(), testTCPRequest("example.com:443"))
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -460,7 +474,7 @@ func TestOpenAndBootstrap_AllRetriesFail(t *testing.T) {
 	}
 	h := newTestStreamHandler(tr)
 
-	_, err := h.openAndBootstrap(context.Background(), "/v3/tcp", protocol.ProtoTCP, "example.com:443", protocol.MethodAES256GCM, nil)
+	_, err := h.openAndBootstrap(context.Background(), testTCPRequest("example.com:443"))
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -479,7 +493,7 @@ func TestOpenAndBootstrap_OpenFailureNoRetry(t *testing.T) {
 	}
 	h := newTestStreamHandler(tr)
 
-	_, err := h.openAndBootstrap(context.Background(), "/v3/tcp", protocol.ProtoTCP, "example.com:443", protocol.MethodAES256GCM, nil)
+	_, err := h.openAndBootstrap(context.Background(), testTCPRequest("example.com:443"))
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -491,7 +505,7 @@ func TestOpenAndBootstrap_OpenFailureNoRetry(t *testing.T) {
 	}
 }
 
-// saltCapturingTransport 包装一个 Transport，并记录每次 Open 调用中的 Salt。
+// saltCapturingTransport 包装 Transport 并记录每次 Open 的 Salt。
 type saltCapturingTransport struct {
 	inner transport.Transport
 	mu    sync.Mutex
@@ -509,6 +523,8 @@ func (t *saltCapturingTransport) CloseIdle()                      {}
 func (t *saltCapturingTransport) Stats() transport.TransportStats { return transport.TransportStats{} }
 func (t *saltCapturingTransport) Close() error                    { return t.inner.Close() }
 
+// TestOpenAndBootstrap_FreshSaltPerAttempt 验证每次尝试都重新生成 salt，服务端的重放
+// 保护因此不会把重试当成重放。
 func TestOpenAndBootstrap_FreshSaltPerAttempt(t *testing.T) {
 	tr := &mockTransport{
 		streams: []transport.Stream{
@@ -519,7 +535,7 @@ func TestOpenAndBootstrap_FreshSaltPerAttempt(t *testing.T) {
 	wrapped := &saltCapturingTransport{inner: tr}
 	h := newTestStreamHandler(wrapped)
 
-	bs, err := h.openAndBootstrap(context.Background(), "/v3/tcp", protocol.ProtoTCP, "example.com:443", protocol.MethodAES256GCM, nil)
+	bs, err := h.openAndBootstrap(context.Background(), testTCPRequest("example.com:443"))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -535,5 +551,87 @@ func TestOpenAndBootstrap_FreshSaltPerAttempt(t *testing.T) {
 	}
 	if wrapped.salts[0] == wrapped.salts[1] {
 		t.Error("expected different salts for each retry attempt")
+	}
+}
+
+// TestBootstrapRecordFitsWriteLimit 固定"手工拼装的引导记录一定能被加密层接受"：引导
+// 记录是唯一不走整形器的明文写入路径，没有单帧校验也没有预冲刷边界，合并判据与填充
+// 预算必须与 WriteRecord 的上限自洽，否则大包会在 UDP 交换中途被拒。断言直接对着真实
+// writer，并固定超限的额外帧由拼装函数自己拒绝。
+func TestBootstrapRecordFitsWriteLimit(t *testing.T) {
+	const target = "example.com:443"
+	const method = protocol.MethodAES256GCM
+	datagram := func(size int) []protocol.Frame {
+		return []protocol.Frame{protocol.NewFrameDATAGRAM(make([]byte, size))}
+	}
+	build := func(extra []protocol.Frame) ([]byte, error) {
+		t.Helper()
+		return buildBootstrapPlaintext(udpStreamRequest(target, method).withFrames(extra...))
+	}
+	write := func(plaintext []byte) error {
+		t.Helper()
+		key := make([]byte, 32)
+		for i := range key {
+			key[i] = byte(i + 1)
+		}
+		sk, err := crypto.NewStreamKeys(key, []byte("1234567890123456"), "/v3/udp")
+		if err != nil {
+			t.Fatalf("stream keys: %v", err)
+		}
+		w, err := sk.BootstrapWriter(io.Discard)
+		if err != nil {
+			t.Fatalf("bootstrap writer: %v", err)
+		}
+		return w.WriteRecord(plaintext)
+	}
+
+	maxPayload := bootstrapMaxPayload(target)
+	for _, size := range []int{0, 1, 1400, maxPayload - 1, maxPayload} {
+		plaintext, err := build(datagram(size))
+		if err != nil {
+			t.Fatalf("payload=%d: 判据说可以合并，拼装却拒绝了：%v", size, err)
+		}
+		if len(plaintext) > protocol.MaxWriteRecordPlaintext {
+			t.Fatalf("payload=%d: 明文 %d 超过写入上限 %d",
+				size, len(plaintext), protocol.MaxWriteRecordPlaintext)
+		}
+		if err := write(plaintext); err != nil {
+			t.Fatalf("payload=%d: 判据说可以合并，加密层却拒绝了：%v", size, err)
+		}
+	}
+
+	// 判据边界正好贴着写入上限：再多 1 字节连填充也放不下，拼装函数必须自己拒绝。
+	if _, err := build(datagram(maxPayload + 1)); err == nil {
+		t.Fatal("超出判据的载荷必须被拼装函数拒绝")
+	}
+	// 同一个越界长度也要确认加密层确实不收：三者夹的是同一条线。
+	over := protocol.EncodeFrames([]protocol.Frame{
+		protocol.NewFrameHANDSHAKE(protocol.Handshake{
+			Version: protocol.Version3,
+			Proto:   protocol.ProtoUDP,
+			Method:  method,
+			Target:  target,
+		}),
+		protocol.NewFrameDATAGRAM(make([]byte, maxPayload+1)),
+	})
+	if err := write(over); err == nil {
+		t.Fatal("超出判据的载荷本应无法写入引导记录")
+	}
+
+	// 填充长度随机（1~63 字节），距上限 60 字节的载荷约有四成次数会被顶过上限，
+	// 故重复 200 次才抓得住。余量从判据反推而非写死，上限调整后仍压在同一个位置。
+	nearLimit := maxPayload - 60
+	for i := range 200 {
+		plaintext, err := build(datagram(nearLimit))
+		if err != nil {
+			t.Fatalf("第 %d 次：%v", i, err)
+		}
+		if len(plaintext) > protocol.MaxWriteRecordPlaintext {
+			t.Fatalf("第 %d 次：填充把明文顶到 %d，超过上限 %d",
+				i, len(plaintext), protocol.MaxWriteRecordPlaintext)
+		}
+		if err := write(plaintext); err != nil {
+			t.Fatalf("第 %d 次：%v", i, err)
+		}
 	}
 }

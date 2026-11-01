@@ -7,28 +7,23 @@ import (
 	"time"
 )
 
-// resetSystemDNSCache 清除缓存的系统 DNS 服务器，使测试注入的 sysDNSFunc
-// 结果不会泄漏到其他测试。
-func resetSystemDNSCache() {
-	systemDNSMu.Lock()
-	systemDNSCached = nil
-	systemDNSTime = time.Time{}
-	systemDNSMu.Unlock()
-}
+// systemServersFunc 让测试用一段函数替代系统 DNS 发现，不必构造带缓存的 systemDNS。
+type systemServersFunc func() []string
+
+func (f systemServersFunc) Servers() []string { return f() }
+
+func (f systemServersFunc) Invalidate() {}
 
 func TestSystemDNSServers(t *testing.T) {
+	t.Parallel()
+
 	calls := 0
-	old := sysDNSFunc
-	sysDNSFunc = func() ([]string, error) {
+	s := newSystemDNS(func() ([]string, error) {
 		calls++
 		return []string{"192.168.1.1", "2400:3200::1"}, nil
-	}
-	t.Cleanup(func() {
-		sysDNSFunc = old
-		resetSystemDNSCache()
 	})
 
-	got := SystemDNSServers()
+	got := s.Servers()
 	want := []string{"192.168.1.1:53", "[2400:3200::1]:53"}
 	if len(got) != len(want) {
 		t.Fatalf("expected %v, got %v", want, got)
@@ -40,24 +35,110 @@ func TestSystemDNSServers(t *testing.T) {
 	}
 
 	// 结果已缓存：第二次调用不应重新发现
-	SystemDNSServers()
+	s.Servers()
 	if calls != 1 {
 		t.Fatalf("expected 1 discovery call, got %d", calls)
 	}
 }
 
-func TestSystemDNSServersError(t *testing.T) {
-	old := sysDNSFunc
-	sysDNSFunc = func() ([]string, error) {
-		return nil, errors.New("discovery failed")
-	}
-	t.Cleanup(func() {
-		sysDNSFunc = old
-		resetSystemDNSCache()
+func TestSystemDNSServersCachesEmptyResult(t *testing.T) {
+	t.Parallel()
+
+	calls := 0
+	s := newSystemDNS(func() ([]string, error) {
+		calls++
+		return nil, nil
 	})
 
-	if got := SystemDNSServers(); got != nil {
+	if got := s.Servers(); len(got) != 0 {
+		t.Fatalf("expected empty, got %v", got)
+	}
+	s.Servers()
+	if calls != 1 {
+		t.Fatalf("an empty discovery result must be cached, got %d calls", calls)
+	}
+}
+
+func TestSystemDNSServersError(t *testing.T) {
+	t.Parallel()
+
+	s := newSystemDNS(func() ([]string, error) {
+		return nil, errors.New("discovery failed")
+	})
+
+	if got := s.Servers(); got != nil {
 		t.Fatalf("expected nil, got %v", got)
+	}
+}
+
+// TestSystemDNSInvalidateThrottled 守住节流锚点：缓存刚过期时换 WAN，发现与失败落在同一次
+// 查询里，锚在发现时间会把这次最该生效的作废吞掉；之后的重复作废必须按窗口节流，否则网络
+// 真断时每条查询都会 spawn 一次发现。
+func TestSystemDNSInvalidateThrottled(t *testing.T) {
+	t.Parallel()
+
+	calls := 0
+	discovered := []string{"192.168.1.1"}
+	s := newSystemDNS(func() ([]string, error) {
+		calls++
+		return discovered, nil
+	})
+
+	if got := s.Servers(); len(got) != 1 || got[0] != "192.168.1.1:53" {
+		t.Fatalf("expected the discovered list, got %v", got)
+	}
+
+	discovered = []string{"10.0.0.2"}
+	s.Invalidate()
+	if got := s.Servers(); len(got) != 1 || got[0] != "10.0.0.2:53" {
+		t.Fatalf("the first invalidation must take effect right after discovery, got %v", got)
+	}
+	if calls != 2 {
+		t.Fatalf("expected a rediscovery after the first invalidation, got %d calls", calls)
+	}
+
+	// 窗口内重复作废：不得再花一次发现。
+	s.Invalidate()
+	if got := s.Servers(); len(got) != 1 || got[0] != "10.0.0.2:53" || calls != 2 {
+		t.Fatalf("invalidate must be throttled inside the window (calls=%d, got %v)", calls, got)
+	}
+
+	// 窗口外作废重新生效。
+	s.invalidatedAt = time.Now().Add(-systemDNSRediscoverInterval)
+	discovered = []string{"192.168.1.1"}
+	s.Invalidate()
+	if got := s.Servers(); len(got) != 1 || got[0] != "192.168.1.1:53" {
+		t.Fatalf("expected the rediscovered list after the window, got %v", got)
+	}
+	if calls != 3 {
+		t.Fatalf("expected 3 discoveries, got %d", calls)
+	}
+}
+
+// TestSystemDNSInvalidateRevivesEmptyCache 守住"发现失败也缓存"不能变成恢复障碍：
+// 换网后 DHCP 就绪了，空缓存被作废就该重新发现，而不是继续空着。
+func TestSystemDNSInvalidateRevivesEmptyCache(t *testing.T) {
+	t.Parallel()
+
+	calls := 0
+	s := newSystemDNS(func() ([]string, error) {
+		calls++
+		if calls == 1 {
+			return nil, errors.New("interface not ready")
+		}
+		return []string{"10.0.0.2"}, nil
+	})
+
+	if got := s.Servers(); len(got) != 0 {
+		t.Fatalf("expected an empty list, got %v", got)
+	}
+	// 空列表刚填上就失败：首次作废立刻生效，不用等节流窗口。
+	s.Invalidate()
+	if got := s.Servers(); len(got) != 1 || got[0] != "10.0.0.2:53" {
+		t.Fatalf("expected the rediscovered list, got %v", got)
+	}
+	if calls != 2 {
+		t.Fatalf("expected a rediscovery after invalidation, got %d calls", calls)
 	}
 }
 

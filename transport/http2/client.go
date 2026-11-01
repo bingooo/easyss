@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"runtime"
 	"slices"
 	"strconv"
@@ -17,31 +18,27 @@ import (
 
 	utls "github.com/refraction-networking/utls"
 
-	sharedconfig "github.com/nange/easyss/v3/config"
+	"github.com/nange/easyss/v3/config"
 	"github.com/nange/easyss/v3/log"
 	"github.com/nange/easyss/v3/stats"
 	"github.com/nange/easyss/v3/transport"
 )
 
-// maxGrowEvents 限制通过 TransportStats.GrowEvents 暴露的近期槽位增长事件环形
-// 缓冲大小——足以把连接数跳变归因到触发它的请求，同时避免无界的内存增长。
 const maxGrowEvents = 16
 
-// http2Transport 是 HTTP/2 客户端机制的门面：流由 slotScheduler 映射到连接上，
-// 每连接的状态（降级、轮换）由 slotLifecycle 驱动。该类型只负责把两者
-// 连接起来并对外提供 HTTP 能力。
 type http2Transport struct {
 	sched     *slotScheduler
 	lifecycle *slotLifecycle
 
 	serverURL string
 
-	// liveness 在某个槽位的连接上做一次轻量存活探测（HEAD /v3/probe），供
-	// 代理层区分"连接已死"与"服务端还在解析目标域名"。未配置探测令牌时为 nil。
-	liveness func(ctx context.Context, slot *transportSlot) (alive, ok bool)
+	// liveness 在指定那一代连接上做存活探测（HEAD /v3/probe），供代理层区分连接已死与
+	// 服务端仍在解析目标域名。必须探测流自己那一代；未配置探测令牌时为 nil。
+	liveness func(ctx context.Context, gen *slotTransport) (alive, ok bool)
 
-	// growEvents 是近期槽位增长事件的有界环形缓冲，最旧的在最前；
-	// 以最新优先的顺序快照进 TransportStats.GrowEvents。由 growMu 保护。
+	slowRTT *slowRTTLogLimiter
+
+	// 增长事件的有界环形缓冲，最旧在前，由 growMu 保护。
 	growEvents []transport.GrowEvent
 	growMu     sync.Mutex
 
@@ -49,27 +46,23 @@ type http2Transport struct {
 	cancel context.CancelFunc
 }
 
-// 槽位数量与流阈值上限定义在共享 config 包中（MaxConnCountMax、
-// MaxStreamThreshold），这样客户端配置的钳制与传输层的防护总是保持一致；
-// 理由详见 config/types.go。
-
 type Config struct {
 	ServerURL         string
 	TLSConfig         *utls.Config
 	MaxSlotCount      int
 	StreamThreshold   int
 	PrioritySlotRatio float64
-	ConnLifetime      time.Duration // 连接轮换前的最大存活时长（0：回退 DefaultConnLifetime）
-	ConnMaxBytes      int64         // 轮换前连接在任一方向承载的最大字节数（0：使用默认值）
-	Timeout           time.Duration
-	DialContext       func(ctx context.Context, network, addr string) (net.Conn, error)
-	// ProbeToken 是服务端 /v3/probe 端点的能力令牌（由主密钥派生）。
-	// 为空则禁用主动探测，只保留被动式降级检测。
+	// Timeouts 由调用方派生：Base 派生空闲与 h2 ping，Dial 是单次 TCP 拨号上限，
+	// IdleConn 是 net/http 的空闲连接阈值，ConnLifetime 是轮换前的最大存活时长。
+	// 零值只由 config.Timeouts.Normalize 填充。
+	Timeouts     config.Timeouts
+	ConnMaxBytes int64 // 轮换前连接在任一方向承载的最大字节数（0 表示默认值）
+	DialContext  func(ctx context.Context, network, addr string) (net.Conn, error)
+	// ProbeToken 是 /v3/probe 的能力令牌（由主密钥派生）；为空则禁用主动探测。
 	ProbeToken string
 }
 
-// New 构建传输层。返回的错误是契约性的：nil 的 TLSConfig 无法完成拨号
-// （newSlot 会克隆它），因此在这里直接拒绝，而不是在第一次 Open 时 panic。
+// New 构建传输层。nil 的 TLSConfig 会让 newSlot 克隆时 panic，直接拒绝。
 func New(cfg Config) (transport.Transport, error) {
 	if cfg.TLSConfig == nil {
 		return nil, errors.New("http2: TLSConfig is required")
@@ -79,68 +72,62 @@ func New(cfg Config) (transport.Transport, error) {
 	if maxSlots < 1 {
 		maxSlots = 6
 	}
-	if maxSlots > sharedconfig.MaxConnCountMax {
-		maxSlots = sharedconfig.MaxConnCountMax
+	if maxSlots > config.MaxConnCountMax {
+		maxSlots = config.MaxConnCountMax
 	}
 	threshold := int32(cfg.StreamThreshold)
 	if threshold < 1 {
 		threshold = 8
 	}
-	if threshold > sharedconfig.MaxStreamThreshold {
-		threshold = sharedconfig.MaxStreamThreshold
+	if threshold > config.MaxStreamThreshold {
+		threshold = config.MaxStreamThreshold
 	}
 
 	ratio := cfg.PrioritySlotRatio
 	if ratio <= 0 || ratio > 1 {
-		ratio = sharedconfig.DefaultPrioritySlotRatio
+		ratio = config.DefaultPrioritySlotRatio
 	}
 	prioritySlots := min(max(int(float64(maxSlots)*ratio), 1), maxSlots)
 
-	timeout := cfg.Timeout
-	if timeout <= 0 {
-		timeout = time.Duration(sharedconfig.DefaultTimeout) * time.Second
-	}
+	timeouts := cfg.Timeouts.Normalize()
 
 	dialCtx := cfg.DialContext
 	if dialCtx == nil {
 		dialCtx = defaultDialContext
 	}
 
-	connLifetime := cfg.ConnLifetime
-	if connLifetime <= 0 {
-		connLifetime = sharedconfig.DefaultConnLifetime
-	}
 	connMaxBytes := cfg.ConnMaxBytes
 	if connMaxBytes <= 0 {
-		connMaxBytes = sharedconfig.DefaultConnMaxBytes
+		connMaxBytes = config.DefaultConnMaxBytes
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	// 预分配并初始化所有槽位。Transport 是廉价的 struct；
-	// 真正的 TCP 连接由 Go 的 http.Transport 惰性建立。
-	// 每个池内的稳定索引由 newScheduler 分配。
 	slots := make([]*transportSlot, maxSlots)
 	for i := range slots {
-		slots[i] = newSlot(cfg.TLSConfig, timeout, dialCtx, connLifetime)
+		slots[i] = newSlot(cfg.TLSConfig, timeouts, dialCtx)
 	}
 
 	sched := newScheduler(maxSlots, slots, threshold, prioritySlots)
 
+	slowRTT := newSlowRTTLogLimiter()
+
 	lc := &slotLifecycle{
 		sched:        sched,
-		connLifetime: connLifetime,
+		connLifetime: timeouts.ConnLifetime,
 		connMaxBytes: connMaxBytes,
+		idleTimeout:  timeouts.IdleConn,
+		slowRTT:      slowRTT,
 	}
-	var liveness func(ctx context.Context, slot *transportSlot) (alive, ok bool)
+	var liveness func(ctx context.Context, gen *slotTransport) (alive, ok bool)
 	if cfg.ProbeToken != "" {
 		prober := &slotProber{
-			serverURL:   cfg.ServerURL,
-			token:       cfg.ProbeToken,
-			payloadSize: int64(sharedconfig.ProbePayloadSize),
+			serverURL: cfg.ServerURL,
+			token:     cfg.ProbeToken,
+			slowRTT:   slowRTT,
 		}
 		lc.probeFunc = prober.probe
-		// 同一个探测端点也用于"判活"：HEAD 只花一个 RTT，不需下载载荷。
+		// 同一端点也用于判活：HEAD 只花一个 RTT。
 		liveness = prober.alive
 	}
 
@@ -149,6 +136,7 @@ func New(cfg Config) (transport.Transport, error) {
 		lifecycle: lc,
 		serverURL: cfg.ServerURL,
 		liveness:  liveness,
+		slowRTT:   slowRTT,
 		ctx:       ctx,
 		cancel:    cancel,
 	}
@@ -156,36 +144,52 @@ func New(cfg Config) (transport.Transport, error) {
 	return tr, nil
 }
 
-func newSlot(utlsCfg *utls.Config, timeout time.Duration, dialContext func(context.Context, string, string) (net.Conn, error), connLifetime time.Duration) *transportSlot {
+func newSlot(utlsCfg *utls.Config, timeouts config.Timeouts, dialContext func(context.Context, string, string) (net.Conn, error)) *transportSlot {
 	if dialContext == nil {
 		dialContext = defaultDialContext
 	}
 
 	slot := &transportSlot{}
+	// 工厂使判死与回收能换上配置相同的空池。
+	slot.newGen = func() *slotTransport {
+		gen := &slotTransport{slot: slot}
+		gen.tr = buildTransport(slot, gen, utlsCfg, timeouts, dialContext)
+		return gen
+	}
+	slot.gen.Store(slot.newGen())
+	return slot
+}
 
+// buildTransport 构建一代连接池（MaxConnsPerHost=1）及其拨号路径，并把连接写进
+// gen.conn 使身份与池同源。判死会重建一代，因此这里必须是纯配置。
+func buildTransport(slot *transportSlot, gen *slotTransport, utlsCfg *utls.Config, timeouts config.Timeouts, dialContext func(context.Context, string, string) (net.Conn, error)) *http.Transport {
 	protos := &http.Protocols{}
 	protos.SetHTTP2(true)
 	protos.SetUnencryptedHTTP2(true)
 
 	tr := &http.Transport{
 		TLSClientConfig: &tls.Config{
-			NextProtos: sharedconfig.NextProtos,
+			NextProtos: config.NextProtos,
 		},
 		Protocols: protos,
 		HTTP2: &http.HTTP2Config{
-			MaxReadFrameSize:              sharedconfig.HTTP2ClientMaxReadFrameSize,
-			MaxReceiveBufferPerConnection: sharedconfig.HTTP2ClientReceiveBufferPerConnection,
-			MaxReceiveBufferPerStream:     sharedconfig.HTTP2ClientReceiveBufferPerStream,
-			MaxDecoderHeaderTableSize:     sharedconfig.HTTP2ClientMaxDecoderHeaderTableSize,
-			SendPingTimeout:               2 * timeout,
-			PingTimeout:                   timeout / 3,
+			MaxReadFrameSize:              config.HTTP2ClientMaxReadFrameSize,
+			MaxReceiveBufferPerConnection: config.HTTP2ClientReceiveBufferPerConnection,
+			MaxReceiveBufferPerStream:     config.HTTP2ClientReceiveBufferPerStream,
+			MaxDecoderHeaderTableSize:     config.HTTP2ClientMaxDecoderHeaderTableSize,
+			SendPingTimeout:               2 * timeouts.Base,
+			PingTimeout:                   timeouts.Base / 3,
+			// 每条流的 shaper 写最终都排进这条连接唯一的写循环；没有上界的网络写
+			// 会让一个停住的对端把整条连接上的流和收尾路径一起钉住。
+			WriteByteTimeout: timeouts.Base,
 		},
 		ForceAttemptHTTP2:      true,
 		MaxConnsPerHost:        1,
-		IdleConnTimeout:        6 * timeout,
-		MaxResponseHeaderBytes: sharedconfig.HTTP2ClientMaxResponseHeaderBytes,
+		IdleConnTimeout:        timeouts.IdleConn,
+		MaxResponseHeaderBytes: config.HTTP2ClientMaxResponseHeaderBytes,
 		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			dialCtx, cancel := context.WithTimeout(ctx, timeout/2)
+			// 拨号预算只包住 TCP 建连，TLS 握手由 ctx 约束。
+			dialCtx, cancel := context.WithTimeout(ctx, timeouts.Dial)
 			defer cancel()
 
 			tcpConn, err := dialContext(dialCtx, network, addr)
@@ -210,35 +214,43 @@ func newSlot(utlsCfg *utls.Config, timeout time.Duration, dialContext func(conte
 				_ = uconn.Close()
 				return nil, fmt.Errorf("server negotiated %q, want h2", proto)
 			}
-			// 新连接会重置轮换状态：生命周期截止时间（含每连接抖动）、
-			// 已承载字节数和 expiring 标记都从零开始。
-			slot.resetConn(connLifetime)
+			// 只有仍是当前一代时才重置轮换状态：新一代的轮换状态不能被迟到的拨号抹掉。
+			if slot.generation() == gen {
+				slot.resetConn(timeouts.ConnLifetime)
+			} else {
+				// 落在已回收的一代上，不参与健康循环与轮换，直到自身空闲超时。
+				log.Debug("[TRANSPORT] dial landed on a retired generation",
+					"slot", slot.idx)
+			}
 
-			// 记录这条连接的身份，使判死路径能精确关闭承载活跃流的连接
-			// （http.Transport 自己关不掉它）。只有这里写入指针；清除一律走
-			// CAS（trackedConn.Close、http2Stream.InvalidateConn）。
+			// 用 Swap 而非 Store：归还非 nil 说明这一代已登记过连接——连接满流时
+			// net/http 会丢掉 persistConn 再拨一条，MaxConnsPerHost=1 挡不住。
 			sc := &slotConn{c: uconn}
-			slot.conn.Store(sc)
-			return &trackedConn{Conn: uconn, slot: slot, self: sc}, nil
+			if gen.conn.Swap(sc) != nil {
+				stats.RecordSecondConnInGeneration()
+				log.Warn("[TRANSPORT] second connection dialed in one generation",
+					"slot", slot.idx,
+					"active_streams", slot.active.Load())
+			}
+			return &trackedConn{Conn: uconn, gen: gen, self: sc}, nil
 		},
 	}
-	slot.t = tr
-	return slot
+	return tr
 }
 
-// trackedConn 是 DialTLSContext 返回给 net/http 的连接：转发关闭是它的契约
-// （net/http 回收连接时调用），但清除槽位指针必须走 CAS——net/http 关闭的
-// 可能是一条早已被轮换掉的连接，绝不能把新连接的指针清掉。
+// trackedConn 是 DialTLSContext 返回给 net/http 的连接，转发关闭是它的契约。关闭即整代
+// 作废；清身份与换代走 CAS，因为 net/http 关闭的可能是一条早已被轮换掉的连接。
 type trackedConn struct {
 	net.Conn
-	slot *transportSlot
+	gen  *slotTransport
 	self *slotConn
 }
 
 func (c *trackedConn) Close() error {
-	err := c.Conn.Close()
-	c.slot.conn.CompareAndSwap(c.self, nil)
-	return err
+	// 先换届再关：uTLS 的 Close 会先发 close_notify，对端不响应时最坏要等到写截止时间
+	// （5s）。这期间旧身份若还在，迟到的拨号会在同一代里再拨一条（second_conn_in_generation）。
+	c.gen.slot.retireGeneration(c.gen, c.self)
+	return c.Conn.Close()
 }
 
 func defaultDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -253,12 +265,13 @@ func (t *http2Transport) Open(ctx context.Context, req transport.OpenRequest) (t
 		return nil, t.ctx.Err()
 	}
 
+	// 待机回来的第一个请求常在醒来后立刻到达，早于第一个健康周期，因此发现挂起不能
+	// 只靠定时器。采样器与健康循环共享，谁先看到都只算一次。
+	t.lifecycle.observeSuspend(time.Now())
+
 	stats.RecordStreamOpened()
 
 	if pool, live := t.sched.grow(req.HighPriority); pool != nil {
-		// 该请求确实触发了槽位扩容：把这次增长归因于它。并发的扩容者会在
-		// 调度器的写锁上串行化并在锁内重新评估，因此只有真正执行了激活的
-		// 请求才会走到这个分支。
 		poolName := "bulk"
 		if pool == t.sched.priority {
 			poolName = "priority"
@@ -278,7 +291,9 @@ func (t *http2Transport) Open(ctx context.Context, req transport.OpenRequest) (t
 
 	t.sched.mu.RLock()
 	slot := t.sched.pick(req.HighPriority)
-	slot.active.Add(1)
+	if slot.active.Add(1) == 1 {
+		slot.idleSince.Store(0)
+	}
 	if req.HighPriority {
 		stats.RecordStreamOpenedPriority()
 	} else {
@@ -286,42 +301,28 @@ func (t *http2Transport) Open(ctx context.Context, req transport.OpenRequest) (t
 	}
 	t.sched.mu.RUnlock()
 
+	// 复核放在槽位计数 +1 之后：复核期间该槽位算"在用"，不会被回收或退役摘掉。
+	if slot.reverify.Load() {
+		t.reverifySlot(ctx, slot)
+	}
+
 	parentCtx := ctx
 	ctx, cancel := context.WithCancel(parentCtx)
 
-	go func() {
-		select {
-		case <-t.ctx.Done():
-			cancel()
-		case <-parentCtx.Done():
-			cancel()
-		case <-ctx.Done():
-		}
-	}()
+	// AfterFunc 只注册回调，不像每流一个 goroutine 那样常驻；流的 done 会 stop 它们。
+	stopTransportCancel := context.AfterFunc(t.ctx, cancel)
+	stopParentCancel := context.AfterFunc(parentCtx, cancel)
 
 	pr, pw := io.Pipe()
-	url := t.serverURL + req.Endpoint
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, pr)
-	if err != nil {
-		pw.Close() //nolint:errcheck
-		cancel()
-		slot.active.Add(-1)
-		stats.RecordStreamClosed()
-		return nil, err
-	}
-	httpReq.Header.Set("User-Agent", chromeUserAgent())
-	httpReq.Header.Set("Content-Type", "application/octet-stream")
-	httpReq.Header.Set("Cache-Control", "no-store")
-	if req.Salt != "" {
-		httpReq.Header.Set("x-es", req.Salt)
-	}
 
 	var stream *http2Stream
 	doneOnce := sync.OnceFunc(func() {
-		// 恰好释放一次槽位的 heavy 标记（doneOnce 最多执行一次），
-		// 使槽位重新可以承接新的流。
+		stopTransportCancel()
+		stopParentCancel()
 		stream.releaseHeavy()
-		slot.active.Add(-1)
+		if slot.active.Add(-1) == 0 {
+			slot.idleSince.Store(time.Now().UnixNano())
+		}
 		stats.RecordStreamClosed()
 		cancel()
 	})
@@ -333,17 +334,47 @@ func (t *http2Transport) Open(ctx context.Context, req transport.OpenRequest) (t
 		done:      doneOnce,
 		slot:      slot,
 		liveness:  t.liveness,
+		slowRTT:   t.slowRTT,
 		startTime: time.Now(),
+		// 请求身份只用于日志归因，不参与调度或协议决策。
+		endpoint: req.Endpoint,
+		target:   req.Target,
+	}
+	// 身份由 h2 在写出请求前经 GotConn 回报；没有它，失效只能按"这一代的当前连接"猜，
+	// 同代重拨出的新连接会被连带关掉。
+	stream.trace.GotConn = stream.noteConn
+
+	url := t.serverURL + req.Endpoint
+	httpReq, err := http.NewRequestWithContext(
+		httptrace.WithClientTrace(ctx, &stream.trace), "POST", url, pr)
+	if err != nil {
+		stopTransportCancel()
+		stopParentCancel()
+		pw.Close() //nolint:errcheck
+		cancel()
+		if slot.active.Add(-1) == 0 {
+			slot.idleSince.Store(time.Now().UnixNano())
+		}
+		stats.RecordStreamClosed()
+		return nil, err
+	}
+	httpReq.Header.Set("User-Agent", chromeUserAgent())
+	httpReq.Header.Set("Content-Type", "application/octet-stream")
+	httpReq.Header.Set("Cache-Control", "no-store")
+	if req.Salt != "" {
+		httpReq.Header.Set("x-es", req.Salt)
 	}
 
 	go func() {
-		resp, err := slot.t.RoundTrip(httpReq)
+		// 池在提交这一刻取用；这条流落在哪条连接上由 trace 的 GotConn 单独记录。
+		gen := slot.generation()
+		stream.gen.Store(gen)
+		resp, err := gen.tr.RoundTrip(httpReq)
 		if err != nil {
 			_ = pw.CloseWithError(err)
 		}
-		// 拒绝会以普通 HTTP 错误状态码应答（408/400/404/405/429...）：
-		// 响应体将是 fallback/错误页面，而不是加密记录。立即以明确的错误
-		// 让流失败，这样记录读取器永远不会误解析拒绝响应体。
+		// 拒绝的响应体是 fallback/错误页面而非加密记录，必须立即失败，否则记录
+		// 读取器会把页面误解析为加密数据。
 		if err == nil && resp.StatusCode != http.StatusOK {
 			rejectErr := &transport.HandshakeRejectedError{StatusCode: resp.StatusCode, Status: resp.Status}
 			_ = resp.Body.Close()
@@ -351,31 +382,81 @@ func (t *http2Transport) Open(ctx context.Context, req transport.OpenRequest) (t
 			err = rejectErr
 			_ = pw.CloseWithError(err)
 		}
-		// 落定结果：同时供 Read 消费、供 AwaitResponse 观察，以及供 Write
-		// 在管道写入失败时呈现根本原因。
 		stream.deliver(roundTripResult{resp: resp, err: err})
 	}()
 
 	return stream, nil
 }
 
-// protoOfEndpoint 把代理端点路径映射为简短协议名，用于增长事件日志；
-// 未知路径原样返回。
+// reverifySlot 用一次 HEAD /v3/probe 复核带挂起嫌疑的槽位：时钟离差只产生嫌疑，判死
+// 必须由真实往返给出，假阳性只花一个 RTT。探测跑在 context.WithoutCancel 上。
+func (t *http2Transport) reverifySlot(ctx context.Context, slot *transportSlot) {
+	slot.reverifyMu.Lock()
+	defer slot.reverifyMu.Unlock()
+	if !slot.reverify.Load() {
+		return
+	}
+
+	gen := slot.generation()
+	if gen == nil || t.liveness == nil {
+		// 无对象可复核或没有判活手段：清掉标记，避免后续开流反复进入这里。
+		slot.reverify.Store(false)
+		return
+	}
+	// 按开始复核时的身份 CAS 失效；HEAD 未必跑在它上面（同代可能已有两条连接，见 probe.alive）。
+	probed := gen.conn.Load()
+	if probed == nil {
+		slot.reverify.Store(false)
+		return
+	}
+	if ctx.Err() != nil {
+		// 调用方已取消不代表连接已死，保留嫌疑交给下一次开流。
+		return
+	}
+
+	verifyCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), config.SuspendReverifyTimeout)
+	defer cancel()
+	defer slot.reverify.Store(false)
+
+	alive, known := t.liveness(verifyCtx, gen)
+	if !known {
+		return
+	}
+	if alive {
+		stats.RecordSuspendReverifyAlive()
+		log.Debug("[TRANSPORT] suspend reverify: connection still usable",
+			"slot", slot.idx,
+			"active_streams", slot.active.Load())
+		return
+	}
+	if slot.invalidateConnIf(gen, probed, "suspend reverify failed") {
+		stats.RecordSuspendReverifyReplaced()
+		return
+	}
+	// 失效落空说明这一代已经不持有被探测的连接：池里拿不到能再预约一条流的连接时 net/http
+	// 就会重拨（流数到限、tooIdle、GOAWAY 后 MarkDead 都算，旧连接未必已死），新连接顶替了
+	// 身份并应答了这次 HEAD，槽位已经自愈，换代只会把这条好连接关掉。
+	if cur := gen.conn.Load(); cur != nil && cur != probed {
+		log.Info("[TRANSPORT] suspend reverify: connection replaced during the probe",
+			"slot", slot.idx,
+			"active_streams", slot.active.Load())
+	}
+}
+
 func protoOfEndpoint(endpoint string) string {
 	switch endpoint {
-	case sharedconfig.EndpointTCP:
+	case config.EndpointTCP:
 		return "tcp"
-	case sharedconfig.EndpointUDP:
+	case config.EndpointUDP:
 		return "udp"
-	case sharedconfig.EndpointICMP:
+	case config.EndpointICMP:
 		return "icmp"
+	case config.EndpointProbe:
+		return "probe"
 	}
 	return endpoint
 }
 
-// recordGrowEvent 把一个槽位增长事件追加到有界环形缓冲中，
-// 超出 maxGrowEvents 时丢弃最旧的。Stats 会以最新优先的顺序把
-// 该环形缓冲快照进 TransportStats.GrowEvents。
 func (t *http2Transport) recordGrowEvent(pool string, live int32, req transport.OpenRequest) {
 	ev := transport.GrowEvent{
 		Time:     time.Now(),
@@ -393,26 +474,22 @@ func (t *http2Transport) recordGrowEvent(pool string, live int32, req transport.
 }
 
 func (t *http2Transport) CloseIdle() {
-	// 关闭两个池所有槽位上的空闲 TCP 连接。槽位数组元素会被 shrink/retire
-	// 在调度器写锁下交换修改，因此要在读锁下读取数组。
+	// 槽位数组由 shrink/retire 在写锁下交换修改，必须持读锁遍历。
 	t.sched.mu.RLock()
 	for _, pool := range []*slotPool{t.sched.priority, t.sched.bulk} {
 		for _, s := range pool.slots {
-			s.t.CloseIdleConnections()
+			s.transport().CloseIdleConnections()
 		}
 	}
 	t.sched.mu.RUnlock()
 
-	// 通过退役空闲槽位来缩减 liveCount（任意位置，交换删除）。
 	t.sched.mu.Lock()
 	defer t.sched.mu.Unlock()
 	t.sched.shrinkIdleLocked()
 }
 
 func (t *http2Transport) Stats() transport.TransportStats {
-	// 持有调度器读锁以保证快照一致：shrink（交换删除）和 grow 会在写锁下
-	// 修改池的 liveCount 与活跃槽位区间，因此不加锁的渲染可能读到过期的
-	// liveCount，报告的 conns_status 条目数会多于 Conns。
+	// 读锁保证快照一致：不加锁会渲染出多于 Conns 的条目。
 	t.sched.mu.RLock()
 	defer t.sched.mu.RUnlock()
 
@@ -439,9 +516,6 @@ func (t *http2Transport) Stats() transport.TransportStats {
 	ts.PriorityConnsStatus = slotStatusString(t.sched.priority, pLive)
 	ts.BulkConnsStatus = slotStatusString(t.sched.bulk, bLive)
 
-	// 以最新优先的顺序快照近期的增长事件。环形缓冲有自己的互斥锁
-	// （recordGrowEvent 不持有调度器锁），因此与上面持有的读锁不存在
-	// 锁顺序问题。
 	t.growMu.Lock()
 	for _, v := range slices.Backward(t.growEvents) {
 		ts.GrowEvents = append(ts.GrowEvents, v)
@@ -450,11 +524,6 @@ func (t *http2Transport) Stats() transport.TransportStats {
 	return ts
 }
 
-// slotStatus 根据槽位的健康标记以及当前承载的流数量推导其连接状态。
-// 多个标记用 "+" 连接，以免隐藏任何状态（跨越连接生命周期的重下载既是
-// heavy 又是 expiring）。无标记且承载至少一条流的槽位是 "active"；
-// 无标记且无流的槽位是空闲连接，渲染为 "idle"，这样满是连接槽位
-// 但流很少的池不会被误认为是活跃流量。
 func slotStatus(s *transportSlot, active int) string {
 	var parts []string
 	if s.heavy.Load() > 0 {
@@ -475,13 +544,8 @@ func slotStatus(s *transportSlot, active int) string {
 	return strings.Join(parts, "+")
 }
 
-// slotStatusString 把一个池的活跃槽位渲染为 "<index>:<active streams>:<status>"，
-// 外面包上括号，例如 "[0:3:degraded, 1:2:expiring, 2:1:active, 3:1:heavy]"。
-// 无流承载的健康槽位渲染为 "0:idle"（空闲连接），这样因突发流量而扩大的池
-// 与真正的活跃流量可以区分。条目按稳定的槽位身份排序（retire 的交换删除会
-// 打乱活跃顺序），然后从 0 重新编号，因此渲染出的索引始终连续、无跳号。
-// 活跃集合为空时渲染为 "[]"。live 必须是调用方在调度器锁下快照的池
-// liveCount 值，这样渲染出的条目数始终与 Conns 一致。
+// slotStatusString 渲染 "[0:3:degraded, 1:2:expiring]"；live 必须是调度器锁下快照的
+// liveCount，条目数才与 Conns 一致。
 func slotStatusString(pool *slotPool, live int) string {
 	if live > pool.maxSlots {
 		live = pool.maxSlots
@@ -504,8 +568,7 @@ func slotStatusString(pool *slotPool, live int) string {
 	if len(entries) == 0 {
 		return "[]"
 	}
-	// 无论活跃顺序如何被打乱，都按稳定的槽位索引排序，
-	// 然后把条目编号为 0..n-1，使输出索引永不跳号。
+	// retire 的交换删除会打乱活跃顺序，按稳定索引排序后重新编号。
 	slices.SortFunc(entries, func(a, b entry) int { return a.idx - b.idx })
 
 	var b strings.Builder
@@ -526,13 +589,12 @@ func slotStatusString(pool *slotPool, live int) string {
 
 func (t *http2Transport) Close() error {
 	t.cancel()
-	// 在调度器读锁下读取活跃槽位区间：shrink/retire 在写锁下交换删除槽位，
-	// 因此不加锁地遍历活跃区间会与这些交换产生竞争。
+	// shrink/retire 在写锁下交换删除槽位，遍历活跃区间必须持读锁。
 	t.sched.mu.RLock()
 	for _, pool := range []*slotPool{t.sched.priority, t.sched.bulk} {
 		live := int(pool.liveCount.Load())
 		for _, s := range pool.slots[:live] {
-			s.t.CloseIdleConnections()
+			s.transport().CloseIdleConnections()
 		}
 	}
 	t.sched.mu.RUnlock()

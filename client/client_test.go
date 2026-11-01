@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
-	"github.com/nange/easyss/v3/client/config"
+	clientconfig "github.com/nange/easyss/v3/client/config"
 	easydns "github.com/nange/easyss/v3/client/dns"
 	"github.com/nange/easyss/v3/client/router"
 	"github.com/stretchr/testify/assert"
@@ -55,13 +55,15 @@ func startLocalDNSServer(t *testing.T) (string, func()) {
 }
 
 func TestResolveServerIPV6IPServer(t *testing.T) {
-	cfg := &config.ClientConfig{
-		Servers: []*config.ServerProfile{{Address: "2001:db8::1", Default: true}},
+	t.Parallel()
+
+	cfg := &clientconfig.ClientConfig{
+		Servers: []*clientconfig.ServerProfile{{Host: "2001:db8::1", Default: true}},
 	}
 	assert.Equal(t, "2001:db8::1", resolveServerIPV6(context.Background(), cfg))
 
-	cfg = &config.ClientConfig{
-		Servers: []*config.ServerProfile{{Address: "1.2.3.4", Default: true}},
+	cfg = &clientconfig.ClientConfig{
+		Servers: []*clientconfig.ServerProfile{{Host: "1.2.3.4", Default: true}},
 	}
 	assert.Equal(t, "", resolveServerIPV6(context.Background(), cfg))
 }
@@ -69,13 +71,13 @@ func TestResolveServerIPV6IPServer(t *testing.T) {
 func TestResolveServerIPV6BoundedByContext(t *testing.T) {
 	// 黑洞直连 DNS 服务器会让每次解析都失败；上下文截止时间必须约束整个解析过程，
 	// 而不是让每次查询 5 秒的超时拖慢启动。
-	old := config.DirectDNSServers
-	config.DirectDNSServers = []string{"127.0.0.1:1"}
-	defer func() { config.DirectDNSServers = old }()
+	old := clientconfig.DirectDNSServers
+	clientconfig.DirectDNSServers = []string{"127.0.0.1:1"}
+	defer func() { clientconfig.DirectDNSServers = old }()
 	easydns.MarkBuiltinDNSAvailable()
 
-	cfg := &config.ClientConfig{
-		Servers: []*config.ServerProfile{{Address: "proxy.example.com", Default: true}},
+	cfg := &clientconfig.ClientConfig{
+		Servers: []*clientconfig.ServerProfile{{Host: "proxy.example.com", Default: true}},
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
@@ -90,13 +92,13 @@ func TestResolveServerIPV6WithLocalDNS(t *testing.T) {
 	addr, shutdown := startLocalDNSServer(t)
 	defer shutdown()
 
-	old := config.DirectDNSServers
-	config.DirectDNSServers = []string{addr}
-	defer func() { config.DirectDNSServers = old }()
+	old := clientconfig.DirectDNSServers
+	clientconfig.DirectDNSServers = []string{addr}
+	defer func() { clientconfig.DirectDNSServers = old }()
 	easydns.MarkBuiltinDNSAvailable()
 
-	cfg := &config.ClientConfig{
-		Servers: []*config.ServerProfile{{Address: "test.local", Default: true}},
+	cfg := &clientconfig.ClientConfig{
+		Servers: []*clientconfig.ServerProfile{{Host: "test.local", Default: true}},
 	}
 	got := resolveServerIPV6(context.Background(), cfg)
 	assert.Equal(t, net.ParseIP("::1").String(), got)
@@ -105,7 +107,7 @@ func TestResolveServerIPV6WithLocalDNS(t *testing.T) {
 // TestRefreshServerIPV6 覆盖 RefreshServerIPV6 的短路路径与"降级启动后重新
 // 解析"的正向路径：只有当前值为空、服务器是域名且 IPv6 规则未禁用时才查询。
 func TestRefreshServerIPV6(t *testing.T) {
-	newClient := func(t *testing.T, cfg *config.ClientConfig) *Client {
+	newClient := func(t *testing.T, cfg *clientconfig.ClientConfig) *Client {
 		t.Helper()
 		rt, err := router.New(router.Config{
 			ProxyRule: router.ParseProxyRule(cfg.Routing.ProxyRule),
@@ -114,10 +116,10 @@ func TestRefreshServerIPV6(t *testing.T) {
 		require.NoError(t, err)
 		return &Client{cfg: cfg, router: rt}
 	}
-	domainCfg := func(rule string) *config.ClientConfig {
-		return &config.ClientConfig{
-			Servers: []*config.ServerProfile{{Address: "proxy.example.com", Default: true}},
-			Routing: config.RoutingConfig{IPV6Rule: rule},
+	domainCfg := func(rule string) *clientconfig.ClientConfig {
+		return &clientconfig.ClientConfig{
+			Servers: []*clientconfig.ServerProfile{{Host: "proxy.example.com", Default: true}},
+			Routing: clientconfig.RoutingConfig{IPV6Rule: rule},
 		}
 	}
 
@@ -125,15 +127,16 @@ func TestRefreshServerIPV6(t *testing.T) {
 	var nilClient *Client
 	assert.Equal(t, "", nilClient.RefreshServerIPV6())
 
-	// 已有解析结果：直接返回，不重新查询。
+	// 已有解析结果：不重新查询，但仍刷新本机 IPv6 出口。
 	c := newClient(t, domainCfg("auto"))
 	c.router.SetIPV6Info(false, "2001:db8::1")
 	assert.Equal(t, "2001:db8::1", c.RefreshServerIPV6())
+	assert.Equal(t, "2001:db8::1", c.router.ServerIPV6())
 
 	// 服务器是字面 IPv4：无需解析。
-	c = newClient(t, &config.ClientConfig{
-		Servers: []*config.ServerProfile{{Address: "1.2.3.4", Default: true}},
-		Routing: config.RoutingConfig{IPV6Rule: "auto"},
+	c = newClient(t, &clientconfig.ClientConfig{
+		Servers: []*clientconfig.ServerProfile{{Host: "1.2.3.4", Default: true}},
+		Routing: clientconfig.RoutingConfig{IPV6Rule: "auto"},
 	})
 	assert.Equal(t, "", c.RefreshServerIPV6())
 
@@ -145,18 +148,45 @@ func TestRefreshServerIPV6(t *testing.T) {
 	addr, shutdown := startLocalDNSServer(t)
 	defer shutdown()
 
-	old := config.DirectDNSServers
-	config.DirectDNSServers = []string{addr}
-	defer func() { config.DirectDNSServers = old }()
+	old := clientconfig.DirectDNSServers
+	clientconfig.DirectDNSServers = []string{addr}
+	defer func() { clientconfig.DirectDNSServers = old }()
 	easydns.MarkBuiltinDNSAvailable()
 
-	cfg := &config.ClientConfig{
-		Servers: []*config.ServerProfile{{Address: "test.local", Default: true}},
-		Routing: config.RoutingConfig{IPV6Rule: "auto"},
+	cfg := &clientconfig.ClientConfig{
+		Servers: []*clientconfig.ServerProfile{{Host: "test.local", Default: true}},
+		Routing: clientconfig.RoutingConfig{IPV6Rule: "auto"},
 	}
 	c = newClient(t, cfg)
 	assert.Equal(t, net.ParseIP("::1").String(), c.RefreshServerIPV6())
 	assert.Equal(t, net.ParseIP("::1").String(), c.router.ServerIPV6())
+}
+
+// TestRefreshServerIPV6ReprobesNetworking 固定"开 TUN 前重测本机 IPv6 出口"：networking 是
+// 启动快照，换网后再开 TUN 若不刷新，auto 策略与 TUN 的 IPv6 接管会继续沿用旧网络。
+func TestRefreshServerIPV6ReprobesNetworking(t *testing.T) {
+	t.Parallel()
+
+	rt, err := router.New(router.Config{IPV6Rule: router.IPV6RuleAuto})
+	require.NoError(t, err)
+	rt.SetIPV6Info(false, "2001:db8::1")
+	require.True(t, rt.ShouldIPV6Disable())
+
+	c := &Client{
+		cfg: &clientconfig.ClientConfig{
+			Servers: []*clientconfig.ServerProfile{{Host: "proxy.example.com", Default: true}},
+			Routing: clientconfig.RoutingConfig{IPV6Rule: "auto"},
+		},
+		router: rt,
+	}
+
+	c.sys.ipv6Networking = func() bool { return true }
+	assert.Equal(t, "2001:db8::1", c.RefreshServerIPV6())
+	assert.False(t, rt.ShouldIPV6Disable())
+
+	c.sys.ipv6Networking = func() bool { return false }
+	assert.Equal(t, "2001:db8::1", c.RefreshServerIPV6())
+	assert.True(t, rt.ShouldIPV6Disable())
 }
 
 // newDialTestClient 构造一个用于拨号测试的客户端：TUN 关闭（走普通 net.Dialer），
@@ -166,9 +196,9 @@ func newDialTestClient(t *testing.T, ipv6Rule, serverAddr string) *Client {
 	rt, err := router.New(router.Config{IPV6Rule: router.ParseIPV6Rule(ipv6Rule)})
 	require.NoError(t, err)
 	return &Client{
-		cfg: &config.ClientConfig{
-			Servers: []*config.ServerProfile{{Address: serverAddr, Default: true}},
-			Routing: config.RoutingConfig{IPV6Rule: ipv6Rule},
+		cfg: &clientconfig.ClientConfig{
+			Servers: []*clientconfig.ServerProfile{{Host: serverAddr, Default: true}},
+			Routing: clientconfig.RoutingConfig{IPV6Rule: ipv6Rule},
 		},
 		router:       rt,
 		serverDomain: serverAddr,
@@ -179,6 +209,8 @@ func newDialTestClient(t *testing.T, ipv6Rule, serverAddr string) *Client {
 // 解析时，传输层仍然能连上——它拨的是预解析注入的字面 IP（而 TLS 的 SNI 仍来自
 // addr 里的域名）。
 func TestDialWithConfigUsesServerIPs(t *testing.T) {
+	t.Parallel()
+
 	ln, err := net.Listen("tcp4", "127.0.0.1:0")
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = ln.Close() })
@@ -196,9 +228,11 @@ func TestDialWithConfigUsesServerIPs(t *testing.T) {
 	assert.Equal(t, ln.Addr().String(), conn.RemoteAddr().String())
 }
 
-// TestDialWithConfigFallsBackWhenServerIPsFail 验证缓存地址过期时的自愈：拨预解析
-// 地址失败后丢弃它并回退到域名拨号（系统解析器），而不是一直拨旧地址。
+// TestDialWithConfigFallsBackWhenServerIPsFail 验证预解析地址拨不通时，本次回退到
+// 域名拨号（系统解析器），但预解析结果本身保留。
 func TestDialWithConfigFallsBackWhenServerIPsFail(t *testing.T) {
+	t.Parallel()
+
 	ln, err := net.Listen("tcp4", "127.0.0.1:0")
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = ln.Close() })
@@ -215,13 +249,49 @@ func TestDialWithConfigFallsBackWhenServerIPsFail(t *testing.T) {
 	require.NoError(t, err, "the domain dial must take over after the stale ip fails")
 	defer conn.Close() //nolint:errcheck
 
-	// 失败后缓存地址被丢弃，后续拨号不再尝试旧地址。
-	assert.Nil(t, c.serverIPs.Load(), "stale pre-resolved ips must be dropped")
+	// 失败不丢弃：一次失败可能只是瞬态，丢了它此后就只剩下系统解析器。
+	require.NotNil(t, c.serverIPs.Load(), "a failed dial must not drop the pre-resolved ips")
+	assert.Equal(t, []string{"127.0.0.2"}, *c.serverIPs.Load())
+}
+
+// TestDialWithConfigKeepsServerIPsAcrossFailures 验证失败后**下一次**拨号仍然优先
+// 尝试预解析的字面地址，而不是已经永久退化成系统解析器：后者正是原实现在一次瞬态
+// 失败（网络切换、接口绑定过期）之后的行为。
+func TestDialWithConfigKeepsServerIPsAcrossFailures(t *testing.T) {
+	t.Parallel()
+
+	c := newTestClient(t, true) // TUN 模式：dialAddr 走可注入的绑定拨号
+	c.serverDomain = "server.invalid"
+	c.SetServerIPs([]string{"10.255.255.1"})
+
+	var pinnedDials, domainDials int
+	c.sys.dialBound = func(_ *Client, _ context.Context, _ string, addr string) (net.Conn, error) {
+		host, _, _ := net.SplitHostPort(addr)
+		if host == "10.255.255.1" {
+			pinnedDials++
+			return nil, errors.New("pinned address is stale")
+		}
+		domainDials++
+		return &net.TCPConn{}, nil
+	}
+
+	for i := 1; i <= 2; i++ {
+		conn, err := c.dialWithConfig(context.Background(), "tcp", "server.invalid:443")
+		require.NoError(t, err, "dial %d: the domain fallback must still succeed", i)
+		require.NotNil(t, conn)
+	}
+
+	assert.Equal(t, 2, pinnedDials, "every dial must still try the pre-resolved ip first")
+	assert.Equal(t, 2, domainDials)
+	require.NotNil(t, c.serverIPs.Load(), "a failed dial must not drop the pre-resolved ips")
+	assert.Equal(t, []string{"10.255.255.1"}, *c.serverIPs.Load())
 }
 
 // TestWithDomainFallbackReserve 验证 pin 阶段总预算的切分：只有在总预算大于一次
 // 拨号预算（serverIPDialTimeout）时才提前扣掉它，保证域名回退至少有一次机会。
 func TestWithDomainFallbackReserve(t *testing.T) {
+	t.Parallel()
+
 	t.Run("no deadline is left untouched", func(t *testing.T) {
 		ctx, cancel := withDomainFallbackReserve(context.Background())
 		defer cancel()
@@ -266,16 +336,15 @@ func TestWithDomainFallbackReserve(t *testing.T) {
 // 的部分，域名回退才有机会成功。没有这层预留，域名回退会复用同一个已过期的
 // context 在毫秒内失败——即使操作系统解析器完全可用。
 func TestDialWithConfigReservesBudgetForDomainFallback(t *testing.T) {
-	origBound := boundDialContext
-	t.Cleanup(func() { boundDialContext = origBound })
+	t.Parallel()
 
-	c := newTestClient(t, true) // TUN 模式：dialAddr 走可注入的 boundDialContext
+	c := newTestClient(t, true) // TUN 模式：dialAddr 走可注入的绑定拨号
 	c.serverDomain = "server.invalid"
 	c.SetServerIPs([]string{"10.255.255.1"})
 
 	var domainDials int
 	pinnedBudget := make(chan error, 1)
-	boundDialContext = func(_ *Client, ctx context.Context, _ string, addr string) (net.Conn, error) {
+	c.sys.dialBound = func(_ *Client, ctx context.Context, _ string, addr string) (net.Conn, error) {
 		host, _, _ := net.SplitHostPort(addr)
 		if host == "10.255.255.1" {
 			<-ctx.Done() // 黑洞：只收不回，一直等到 pin 阶段预算耗尽
@@ -302,18 +371,18 @@ func TestDialWithConfigReservesBudgetForDomainFallback(t *testing.T) {
 	if err := <-pinnedBudget; err == nil {
 		t.Fatal("the pinned dial must have failed on an exhausted budget")
 	}
-	assert.Nil(t, c.serverIPs.Load(), "the failed pre-resolved address must be dropped")
+	require.NotNil(t, c.serverIPs.Load(), "a failed dial must not drop the pre-resolved ips")
+	assert.Equal(t, []string{"10.255.255.1"}, *c.serverIPs.Load())
 }
 
 // TestDialServerIPsStopsWhenBudgetExhausted 验证 pin 阶段预算耗尽后不再逐个尝试
 // 剩余字面地址：它们只会各记一次瞬时失败，剩余预算要留给域名回退。
 func TestDialServerIPsStopsWhenBudgetExhausted(t *testing.T) {
-	origBound := boundDialContext
-	t.Cleanup(func() { boundDialContext = origBound })
+	t.Parallel()
 
 	c := newTestClient(t, true)
 	var calls int
-	boundDialContext = func(_ *Client, _ context.Context, _, _ string) (net.Conn, error) {
+	c.sys.dialBound = func(_ *Client, _ context.Context, _, _ string) (net.Conn, error) {
 		calls++
 		return nil, errors.New("unreachable")
 	}

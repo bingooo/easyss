@@ -5,25 +5,9 @@ import (
 	"runtime"
 	"testing"
 
-	sharedconfig "github.com/nange/easyss/v3/config"
+	"github.com/nange/easyss/v3/config"
 	"github.com/stretchr/testify/assert"
 )
-
-func TestSysSupportPowershell(t *testing.T) {
-	if runtime.GOOS != "windows" {
-		t.SkipNow()
-	}
-	s := SysSupportPowershell()
-	assert.True(t, s)
-}
-
-func TestSysPowershellMajorVersion(t *testing.T) {
-	if runtime.GOOS != "windows" {
-		t.SkipNow()
-	}
-	v := SysPowershellMajorVersion()
-	assert.GreaterOrEqual(t, v, 0)
-}
 
 func TestSysGatewayAndDevice(t *testing.T) {
 	gw, dev, err := SysGatewayAndDevice()
@@ -91,18 +75,15 @@ func TestIsTunIface(t *testing.T) {
 	// 基于名称的匹配是确定性的，并且会在任何 OS 地址查询之前短路。
 	// 无论测试运行在哪个平台，两个平台的默认名称都必须被识别。
 	for _, name := range []string{
-		sharedconfig.DefaultTunDeviceName,
-		sharedconfig.DefaultTunDeviceNameDarwin,
+		config.DefaultTunDeviceName,
+		config.DefaultTunDeviceNameDarwin,
 	} {
 		if !IsTunIface(&net.Interface{Name: name}) {
 			t.Fatalf("expected %s to be recognized as the TUN device", name)
 		}
 	}
-	// 给合成的接口一个不可能存在的 Index：在 darwin 上 Index 为 0
-	// 会使 Addrs() 返回所有主机接口的地址（包括 easyss TUN 设备
-	// 启动时的 198.18.0.1），这会错误地触发下面的子网匹配。
-	// 不存在的 Index 会让 Addrs() 在所有平台上返回空，
-	// 因此无论主机接口状态如何，这个反向断言都成立。
+	// Index 取一个不可能存在的值：darwin 上 Index 为 0 会让 Addrs() 返回所有主机
+	// 接口的地址（含 TUN 的 198.18.0.1），反向断言就失去意义了。
 	if IsTunIface(&net.Interface{Name: "Ethernet", Index: 1 << 24}) {
 		t.Fatal("expected a plain interface name to not be recognized")
 	}

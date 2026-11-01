@@ -8,15 +8,12 @@ import (
 	"testing"
 	"time"
 
-	sharedconfig "github.com/nange/easyss/v3/config"
+	"github.com/nange/easyss/v3/config"
 	"github.com/nange/easyss/v3/transport"
 )
 
-// TestStatsConnsStatusConsistencyUnderShrink 用 shrinker goroutine
-// （模拟 closeIdleLoop）压力测试调度器，同时让一个 stats 读取 goroutine
-// （模拟 /stats 轮询）渲染每个池的 conns_status。若渲染出的条目数超过
-// 并发报告的每池 Conns 值，或任一池渲染出的索引不是从 0 连续递增，
-// 则测试失败。
+// TestStatsConnsStatusConsistencyUnderShrink 用 shrinker 与 stats 读取两个 goroutine
+// 压调度器：渲染出的 conns_status 条目数不得超过并发报告的每池 Conns 值，索引须从 0 连续递增。
 func TestStatsConnsStatusConsistencyUnderShrink(t *testing.T) {
 	slots := make([]*transportSlot, 6)
 	for i := range slots {
@@ -132,7 +129,7 @@ func TestGrowEventRingOrderAndCap(t *testing.T) {
 
 	for i := range maxGrowEvents + 4 {
 		tr.recordGrowEvent("bulk", int32(i), transport.OpenRequest{
-			Endpoint: sharedconfig.EndpointUDP,
+			Endpoint: config.EndpointUDP,
 			Target:   "8.8.8.8:53",
 		})
 	}
@@ -146,7 +143,7 @@ func TestGrowEventRingOrderAndCap(t *testing.T) {
 	if evs[0].Live != maxGrowEvents+3 {
 		t.Fatalf("head event live = %d, want %d (newest first)", evs[0].Live, maxGrowEvents+3)
 	}
-	if evs[0].Pool != "bulk" || evs[0].Endpoint != sharedconfig.EndpointUDP || evs[0].Target != "8.8.8.8:53" {
+	if evs[0].Pool != "bulk" || evs[0].Endpoint != config.EndpointUDP || evs[0].Target != "8.8.8.8:53" {
 		t.Fatalf("head event fields wrong: %+v", evs[0])
 	}
 	if evs[len(evs)-1].Live != 4 {
@@ -176,7 +173,7 @@ func TestGrowEventRingConcurrent(t *testing.T) {
 			default:
 			}
 			tr.recordGrowEvent("bulk", 3, transport.OpenRequest{
-				Endpoint: sharedconfig.EndpointTCP,
+				Endpoint: config.EndpointTCP,
 				Target:   "1.2.3.4:53",
 			})
 		}

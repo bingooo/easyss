@@ -11,7 +11,9 @@ import (
 )
 
 const (
-	MaxCipherRecordSize = protocol.MaxPlainRecordSize + 16 // 最大明文 + AEAD 认证标签
+	// MaxCipherRecordSize 是解码侧上限，按 protocol.MaxReadRecordPlaintext 加 AEAD 标签推导，
+	// 必须继续接受旧对端发来的满 64KB 明文；写入侧另由 MaxWriteRecordPlaintext 限定。
+	MaxCipherRecordSize = protocol.MaxReadRecordPlaintext + 16 // 最大明文 + AEAD 认证标签
 )
 
 type RecordWriter struct {
@@ -32,10 +34,12 @@ func NewRecordWriter(w io.Writer, enc Encryptor, counter *CounterNonce, aad []by
 		enc:      enc,
 		counter:  counter,
 		aad:      aad,
-		maxPlain: protocol.MaxPlainRecordSize,
+		maxPlain: protocol.MaxWriteRecordPlaintext,
 	}
 }
 
+// 长度前缀与密文必须一次写出：net/http 的 h2 transport 对每次 body Read 都 WriteData + flush，
+// 拆成两次写会多出 DATA 帧与 TLS 记录，也扰动 shaper 按 64KB 档位对齐的尺寸。
 func (rw *RecordWriter) WriteRecord(plaintext []byte) error {
 	if len(plaintext) > rw.maxPlain {
 		return fmt.Errorf("crypto: plaintext exceeds max %d bytes", rw.maxPlain)
@@ -48,38 +52,47 @@ func (rw *RecordWriter) WriteRecord(plaintext []byte) error {
 		return fmt.Errorf("crypto: ciphertext too large: %d bytes", cipherLen)
 	}
 
-	record := bytespool.Get(protocol.MaxCipherLenSize + cipherLen)
+	buf := bytespool.Get(protocol.MaxCipherLenSize + cipherLen)
+	// 密文必须与前缀共用同一块池缓冲，record 也必须切自 buf 而非回传的 ciphertext——
+	// 后者只保证长度，Seal 若另分配过就会写出去残留数据。
+	ciphertext, err := rw.enc.EncryptInto(
+		buf[protocol.MaxCipherLenSize:protocol.MaxCipherLenSize], plaintext, rw.aad, nonce[:])
+	if err != nil {
+		bytespool.MustPut(buf)
+		return fmt.Errorf("crypto: encrypt record: %w", err)
+	}
+
+	record := buf[:protocol.MaxCipherLenSize+len(ciphertext)]
 	record[0] = byte(cipherLen >> 16)
 	record[1] = byte(cipherLen >> 8)
 	record[2] = byte(cipherLen)
 
-	ciphertext, err := rw.enc.EncryptInto(record[protocol.MaxCipherLenSize:], plaintext, rw.aad, nonce[:])
-	if err != nil {
-		bytespool.MustPut(record)
-		return fmt.Errorf("crypto: encrypt record: %w", err)
-	}
-
-	recordLen := protocol.MaxCipherLenSize + len(ciphertext)
-	n, err := rw.w.Write(record[:recordLen])
-	bytespool.MustPut(record)
+	err = writeFully(rw.w, record)
+	bytespool.MustPut(buf)
 	if err != nil {
 		return fmt.Errorf("crypto: write record: %w", err)
 	}
-	if n != recordLen {
-		return io.ErrShortWrite
-	}
 
-	stats.RecordBytesSent(recordLen)
+	stats.RecordBytesSent(len(record))
 	stats.RecordRecordWritten()
 
 	return nil
 }
 
-// Flush 在底层写入器支持刷新时立即触发一次刷新（例如带 4KB bufio 缓冲的
-// HTTP/2 ResponseWriter）。WriteRecord 不会自动 flush；调用方（通常是
-// shaper）负责在小记录后调用 Flush。对于大于 HTTP/2 bufio 缓冲（4KB）的
-// 记录，Go HTTP/2 服务器已经通过 chunkWriter 直接发送数据，Flush 成为
-// 空操作。
+// writeFully 写出全部字节，短写归一为 io.ErrShortWrite：部分写出后该流已不可信，只能整体报错。
+func writeFully(w io.Writer, p []byte) error {
+	n, err := w.Write(p)
+	if err != nil {
+		return err
+	}
+	if n != len(p) {
+		return io.ErrShortWrite
+	}
+	return nil
+}
+
+// Flush 在底层写入器支持刷新时立即触发一次（例如带 4KB bufio 缓冲的 HTTP/2
+// ResponseWriter）。WriteRecord 不会自动 flush，调用方（shaper）负责在小记录后调用它。
 func (rw *RecordWriter) Flush() {
 	if flusher, ok := rw.w.(recordFlusher); ok {
 		flusher.Flush()

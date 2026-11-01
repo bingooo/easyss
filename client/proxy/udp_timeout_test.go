@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -94,7 +95,7 @@ func waitExchangeReaped(t *testing.T, s *Socks5Server, key string) {
 	}
 }
 
-// TestUDPExchangeDNSResponseTimeout 验证当 DNS 响应读空闲超时（dnsOptions.RespTimeout）
+// TestUDPExchangeDNSResponseTimeout 验证当 DNS 响应读空闲超时（dnsInterceptor.respTimeout）
 // 到期后，没有服务器响应的
 // 代理 DNS 交换会被关闭（流被关闭、键被移除），这样静默的上游 DNS 服务器就无法堆积
 // HTTP/2 流和 receiveLoop 协程。
@@ -153,4 +154,25 @@ func TestUDPExchangeNoTimeoutWhenDisabled(t *testing.T) {
 	// 收尾：关闭交换使阻塞的 receiveLoop 退出并清理键，然后等待协程结束。
 	ue.Close() //nolint:errcheck
 	waitExchangeReaped(t, srv, key)
+}
+
+// TestUDPResponseTimeoutSkipsFreshExchange 钉住回调的"回看最近收包"分支：AfterFunc 的
+// 回调一旦开始执行，Reset 无法取消它；刚收到数据报的交换不得被这次超时关掉，否则后续
+// Send 只会得到 ErrClosed，查询被静默丢弃。
+func TestUDPResponseTimeoutSkipsFreshExchange(t *testing.T) {
+	const timeout = time.Second
+	ue := &UDPExchange{stream: newBlockingStream()}
+	var lastRecv atomic.Int64
+
+	lastRecv.Store(time.Now().UnixNano())
+	newUDPResponseTimeout(ue, "fresh", timeout, &lastRecv)()
+	if ue.closed.Load() {
+		t.Fatal("a freshly active exchange must not be closed by a late timeout callback")
+	}
+
+	lastRecv.Store(time.Now().Add(-2 * timeout).UnixNano())
+	newUDPResponseTimeout(ue, "idle", timeout, &lastRecv)()
+	if !ue.closed.Load() {
+		t.Fatal("an idle exchange must be closed by the timeout callback")
+	}
 }

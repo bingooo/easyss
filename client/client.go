@@ -13,10 +13,10 @@ import (
 	"time"
 
 	"github.com/libp2p/go-netroute"
-	"github.com/nange/easyss/v3/client/config"
+	clientconfig "github.com/nange/easyss/v3/client/config"
 	"github.com/nange/easyss/v3/client/dns"
 	"github.com/nange/easyss/v3/client/router"
-	"github.com/nange/easyss/v3/client/tsnet"
+	"github.com/nange/easyss/v3/config"
 	"github.com/nange/easyss/v3/crypto"
 	"github.com/nange/easyss/v3/log"
 	"github.com/nange/easyss/v3/transport"
@@ -26,7 +26,8 @@ import (
 )
 
 type Client struct {
-	cfg           *config.ClientConfig
+	// cfg 是本会话的配置快照，client.New 之后只读：调用方用 copy-on-write 发布新快照。
+	cfg           *clientconfig.ClientConfig
 	router        *router.Router
 	transport     transport.Transport
 	masterKey     []byte
@@ -34,39 +35,37 @@ type Client struct {
 	bound         atomic.Value // boundIface：直连拨号器当前绑定的接口
 	closeIdleDone chan struct{}
 	closeOnce     sync.Once
-	// closed 记录传输层已被拆除：Close 幂等，第二次调用不再重复拆一次。
-	closed atomic.Bool
+	closed        atomic.Bool
 
-	// serverDomain 是服务端域名（服务端地址是字面 IP 时为空）；serverIPs 是
-	// runner 预解析成功后注入的地址。dialWithConfig 优先拨这些字面 IP 而不是
-	// 把域名交给操作系统解析器，因此系统解析器坏掉/被污染时也能连上服务端
-	// （见 SetServerIPs）。
+	// tunMode 是"路由表可能指向 TUN"：直连拨号据此绑定物理接口，未绑定就会回环进隧道。
+	// 它从 adopt 起为 true、拆除删完路由才清，比"引擎已开始转发"宽一个启停窗口。
+	tunMode atomic.Bool
+
+	// tunForwarding 是"引擎已开始转发"：forward DNS 只在它成立时放行上游查询，
+	// 否则查询只能从物理网卡直连解析。与 tunMode 的安全方向相反，不能合并。
+	tunForwarding atomic.Bool
+
+	// serverDomain 是服务端域名（字面 IP 时为空）；serverIPs 是 runner 预解析后注入的地址，
+	// dialWithConfig 优先拨它们，系统 DNS 坏掉或被污染时也能连上。
 	serverDomain string
 	serverIPs    atomic.Pointer[[]string]
 
-	// fileWarn 记录加载自定义直连/代理规则文件时出现的非致命错误，
-	// 以启动警告的形式呈现（参见 StartupWarning）。
-	// 客户端仍会使用内置规则继续运行。
 	fileWarn error
 
 	mu sync.RWMutex
+
+	// sys 是直连拨号的系统依赖；零值回落到生产实现。
+	sys sysDeps
 }
 
-// boundIface 记录直连拨号器当前绑定的接口，
-// 以便刷新循环检测到变更（名称或索引）时重建拨号器。
 type boundIface struct {
 	name  string
 	index int
 }
 
-// detectDialIface 返回 TUN 模式下直连拨号应绑定的接口：物理默认路由接口。
-// 在 Windows 上，它从路由表读取 0.0.0.0/0 默认路由（跳过 easyss TUN
-// 设备——TUN 激活时该设备拥有自己的默认路由）。在 darwin 和 linux 上，
-// 它探测 0.0.0.1，该地址不会被 easyss TUN 路由（所有平台均从 1.0.0.0/8
-// 开始）覆盖，因此即使在 TUN 路由激活时，查找结果也是物理默认接口——
-// 绑定到 easyss TUN 设备本身会造成路由环路。Windows 无法使用该探测：
-// 其路由查找会直接拒绝 0.0.0.0/8 目标。可在测试中覆盖。
-var detectDialIface = func() (*net.Interface, error) {
+// 探测目标取 0.0.0.1 而非公网地址：TUN 的路由从 1.0.0.0/8 起，该网段永远路由到物理
+// 接口，绑到 TUN 设备会形成环路。
+func detectDefaultIface() (*net.Interface, error) {
 	iface, _, err := util.SysDefaultRoute()
 	if err != nil {
 		iface, err = probeDialIface()
@@ -92,8 +91,7 @@ var detectDialIface = func() (*net.Interface, error) {
 	return nil, fmt.Errorf("default interface %s has no global unicast address", iface.Name)
 }
 
-// probeDialIface 通过探测 0.0.0.0/8 中的目标来查找默认路由接口，
-// 该网段不会被 easyss TUN 路由（所有平台均从 1.0.0.0/8 开始）覆盖。
+// 改读路由表：Windows 拒绝 0.0.0.0/8 目标，拨不出去。
 func probeDialIface() (*net.Interface, error) {
 	r, err := netroute.New()
 	if err != nil {
@@ -109,24 +107,18 @@ func probeDialIface() (*net.Interface, error) {
 	return iface, nil
 }
 
-// tunDeviceNameFromConfig 从原始 tun_config JSON 中返回 TUN 设备名
-// （如果存在）。设备名用于识别 easyss TUN 接口，使直连拨号器绝不绑定到它。
 func tunDeviceNameFromConfig(raw json.RawMessage) string {
-	if len(raw) == 0 {
-		return ""
-	}
-	var cfg struct {
-		Device string `json:"device"`
-	}
-	if err := json.Unmarshal(raw, &cfg); err != nil {
+	cfg, err := clientconfig.ParseTunConfig(raw)
+	if err != nil {
+		// 加载期已按同一形状校验，这里出错只可能是内存里的配置被直接改写。
+		log.Warn("[CLIENT] parse local.tun_config", "err", err)
 		return ""
 	}
 	return cfg.Device
 }
 
-// isTunIface 报告 iface 是否为 easyss TUN 设备。直连拨号器绝不能绑定到它：
-// 发往 TUN 设备的数据包会被 tun2socks 捕获并转发回本地代理，代理的拨号
-// 又会重新进入 TUN 设备——形成无限请求循环。
+// 直连拨号器绝不能绑定 easyss TUN 设备：包会被 tun2socks 捕获转发回本地代理，
+// 代理拨号又进 TUN，形成无限请求循环。
 func (c *Client) isTunIface(iface *net.Interface) bool {
 	if util.IsTunIface(iface) {
 		return true
@@ -138,25 +130,62 @@ func (c *Client) isTunIface(iface *net.Interface) bool {
 	return name != "" && iface.Name == name
 }
 
-// listInterfaces 枚举系统接口。它是包级变量，
-// 以便测试注入确定性的接口集合。
-var listInterfaces = net.Interfaces
+// sysDeps 是直连拨号与 IPv6 探测的系统依赖：接口探测、地址读取、IPv6 出口判断与绑定拨号。
+// 字段为 nil 时回落到生产实现，零值 Client 因此也可用；测试只覆盖自己需要的那几项。
+type sysDeps struct {
+	detectIface     func() (*net.Interface, error)
+	listInterfaces  func() ([]net.Interface, error)
+	ifaceAddrs      func(*net.Interface) ([]net.Addr, error)
+	bindUnsupported func() bool
+	ipv6Networking  func() bool
+	dialBound       func(*Client, context.Context, string, string) (net.Conn, error)
+}
 
-// ifaceAddrs 返回 iface 的地址。它是包级变量，
-// 以便测试为合成接口注入确定性的地址。
-var ifaceAddrs = func(iface *net.Interface) ([]net.Addr, error) { return iface.Addrs() }
+func (s sysDeps) iface() (*net.Interface, error) {
+	if s.detectIface == nil {
+		return detectDefaultIface()
+	}
+	return s.detectIface()
+}
 
-// ifaceBindUnsupported 报告平台是否无法将直连拨号器绑定到接口
-// （参见 util.SysDirectIfaceBindUnsupported）。它是包级变量，
-// 以便测试确定性地覆盖平台分支。
-var ifaceBindUnsupported = util.SysDirectIfaceBindUnsupported
+func (s sysDeps) interfaces() ([]net.Interface, error) {
+	if s.listInterfaces == nil {
+		return net.Interfaces()
+	}
+	return s.listInterfaces()
+}
 
-// initDirectDialer 将直连拨号器存入 c.dialer，并返回所绑定物理接口的
-// 名称（未绑定时返回 ""）。在接口绑定不受支持的平台上（android：
-// netlink 被阻止，VpnService 只将选中的应用路由进 TUN），拨号器保持
-// 未绑定状态，且不执行任何检测或告警。
+func (s sysDeps) addrs(iface *net.Interface) ([]net.Addr, error) {
+	if s.ifaceAddrs == nil {
+		return iface.Addrs()
+	}
+	return s.ifaceAddrs(iface)
+}
+
+func (s sysDeps) unbindable() bool {
+	if s.bindUnsupported == nil {
+		return util.SysDirectIfaceBindUnsupported()
+	}
+	return s.bindUnsupported()
+}
+
+func (s sysDeps) hasIPV6() bool {
+	if s.ipv6Networking == nil {
+		return detectIPV6Networking()
+	}
+	return s.ipv6Networking()
+}
+
+func (s sysDeps) dial(c *Client, ctx context.Context, network, addr string) (net.Conn, error) {
+	if s.dialBound == nil {
+		return c.dialer.Load().DialContext(ctx, network, addr)
+	}
+	return s.dialBound(c, ctx, network, addr)
+}
+
+// android 上接口绑定不可用，此时返回空名称。
 func (c *Client) initDirectDialer() string {
-	if ifaceBindUnsupported() {
+	if c.sys.unbindable() {
 		c.dialer.Store(dialer.New())
 		return ""
 	}
@@ -171,14 +200,9 @@ func (c *Client) initDirectDialer() string {
 	return iface.Name
 }
 
-// startupDialIface 确定直连拨号器在启动时绑定的接口。它优先使用路由探测，
-// 但会拒绝 easyss TUN 设备（例如崩溃的 TUN 会话遗留的路由把探测重定向到
-// 它时），并回退到枚举物理接口。没有合适的接口时返回 nil，此时使用未绑定
-// 的拨号器。在接口绑定不受支持的平台上（android），initDirectDialer
-// 不会调用本函数——拨号器保持未绑定（参见
-// util.SysDirectIfaceBindUnsupported）。
+// 优先路由探测，但拒绝 easyss TUN 设备（崩溃的 TUN 会话可能留下把它重定向过去的陈旧路由）。
 func (c *Client) startupDialIface() *net.Interface {
-	iface, err := detectDialIface()
+	iface, err := c.sys.iface()
 	if err == nil && iface != nil && !c.isTunIface(iface) {
 		return iface
 	}
@@ -188,7 +212,7 @@ func (c *Client) startupDialIface() *net.Interface {
 		log.Warn("[CLIENT] detected easyss TUN device as default interface, falling back to interface enumeration", "iface", iface.Name)
 	}
 
-	ifaces, err := listInterfaces()
+	ifaces, err := c.sys.interfaces()
 	if err != nil {
 		log.Warn("[CLIENT] list interfaces failed", "err", err)
 		return nil
@@ -198,7 +222,7 @@ func (c *Client) startupDialIface() *net.Interface {
 		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 || c.isTunIface(iface) {
 			continue
 		}
-		addrs, err := ifaceAddrs(iface)
+		addrs, err := c.sys.addrs(iface)
 		if err != nil {
 			continue
 		}
@@ -212,26 +236,10 @@ func (c *Client) startupDialIface() *net.Interface {
 	return nil
 }
 
-// boundDialContext 通过绑定接口的直连拨号器拨号。它是包级变量，
-// 以便测试确定性地注入失败。
-var boundDialContext = func(c *Client, ctx context.Context, network, addr string) (net.Conn, error) {
-	return c.dialer.Load().DialContext(ctx, network, addr)
-}
-
-// serverIPDialTimeout 限定"拨预解析出来的某个字面地址"的单次尝试。服务端的 IP
-// 可能已经变化，某个地址也可能被黑洞：单次尝试必须有界，剩余预算留给回退到域名
-// 拨号（见 dialServerIPs）。
+// 限定"拨某个预解析字面地址"的单次尝试：地址可能已被黑洞，剩余预算要留给域名回退。
 const serverIPDialTimeout = 5 * time.Second
 
-// serverIPV6ResolveTimeout 约束 client.New 中同步的服务器 IPv6 解析，默认取
-// dns.PreResolveTimeout（与启动期预解析共用同一个总预算）。
-// 解析服务器的 AAAA 记录需要对直连 DNS 服务器做 DNS 往返；每个条目受
-// dns.ResolveItemTimeout 限制，因此不可达的服务器不会按"服务器数量 × 单次
-// 超时"叠加（在移动端最明显——VPN 不能在代理就绪之前上线）。
-// 超时时路由引擎只是把 IPv6 视为不可用（自动模式的保险默认）。可在测试中覆盖。
-var serverIPV6ResolveTimeout = dns.PreResolveTimeout
-
-func New(cfg *config.ClientConfig) (*Client, error) {
+func New(cfg *clientconfig.ClientConfig) (*Client, error) {
 	start := time.Now()
 
 	masterKey, err := crypto.DeriveMasterKey(cfg.DefaultServer().Password)
@@ -252,9 +260,8 @@ func New(cfg *config.ClientConfig) (*Client, error) {
 	serverIPV6 := ""
 	ipv6Networking := false
 	if router.ParseIPV6Rule(cfg.Routing.IPV6Rule) != router.IPV6RuleDisable {
-		// 约束整个解析过程（builtin + 系统 DNS 回退），使不可达的 DNS
-		// 服务器无法让每次查询都把启动拖住 5 秒。
-		ctx, cancel := context.WithTimeout(context.Background(), serverIPV6ResolveTimeout)
+		// 约束整个解析过程（内置 + 系统 DNS 回退），不可达的 DNS 不能把启动拖住。
+		ctx, cancel := context.WithTimeout(context.Background(), dns.PreResolveTimeout)
 		serverIPV6 = resolveServerIPV6(ctx, cfg)
 		cancel()
 		ipv6Networking = detectIPV6Networking()
@@ -276,17 +283,9 @@ func New(cfg *config.ClientConfig) (*Client, error) {
 
 	tlsCfg := cfg.UTLSConfig()
 
-	serverDomain := cfg.DefaultServer().Address
+	serverDomain := cfg.DefaultServer().Host
 	if util.IsIP(serverDomain) {
-		// 字面 IP 无需解析，也就没有 DNS pinning 可言。
 		serverDomain = ""
-	}
-
-	if cfg.Tsnet.Enable {
-		tsnet.Configure(cfg.Tsnet)
-		if err := tsnet.Start(rt); err != nil {
-			log.Error("[CLIENT] start tsnet failed", "err", err)
-		}
 	}
 
 	client := &Client{
@@ -298,6 +297,9 @@ func New(cfg *config.ClientConfig) (*Client, error) {
 		closeIdleDone: make(chan struct{}),
 	}
 	client.bound.Store(boundIface{})
+	// 播种直连拨号器的 TUN 状态：mobile 直接调用 runner.Run，没有托盘开关调 SetTunMode。
+	// tunForwarding 刻意不播种：没有会话发布"引擎已转发"时，forward DNS 必须保持拒答。
+	client.SetTunMode(cfg.Local.EnableTun2socks)
 
 	directIface := client.initDirectDialer()
 
@@ -312,9 +314,8 @@ func New(cfg *config.ClientConfig) (*Client, error) {
 		MaxSlotCount:      cfg.Transport.ConnCountMax,
 		StreamThreshold:   cfg.Transport.StreamThreshold,
 		PrioritySlotRatio: cfg.Transport.PrioritySlotRatio,
-		ConnLifetime:      cfg.ConnLifetimeDuration(),
+		Timeouts:          config.NewTimeouts(cfg.TimeoutDuration()),
 		ConnMaxBytes:      cfg.Transport.ConnMaxBytes,
-		Timeout:           cfg.TimeoutDuration(),
 		ProbeToken:        probeToken,
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return client.dialWithConfig(ctx, network, addr)
@@ -334,18 +335,8 @@ func New(cfg *config.ClientConfig) (*Client, error) {
 	return client, nil
 }
 
-// dialWithConfig 拨号传输层需要的服务端地址。当目标是服务端域名且已有预解析
-// 地址时优先拨这些字面 IP（DNS pinning，见 SetServerIPs）：服务端域名在
-// TLS/SNI 与证书校验里仍然是原域名（由传输层从 addr 派生），但解析这一步不再
-// 经过操作系统解析器，因此系统 DNS 坏掉或被污染时隧道依然可用。
-// TUN 模式激活时使用绑定接口的直连拨号器拨号（使 socket 绕过 TUN 设备），否则
-// 回退到普通的 net.Dialer。看似接口绑定过期的失败（休眠/唤醒、网络切换）会触发
-// 一次性拨号器刷新与重试。
+// 有预解析地址时优先拨字面 IP（DNS pinning），TLS 校验仍用原域名；TUN 模式走绑定接口的拨号器。
 func (c *Client) dialWithConfig(ctx context.Context, network, addr string) (net.Conn, error) {
-	if tsnet.IsEnabled() && tsnet.IsTailscaleTarget(addr) {
-		return tsnet.DialContext(ctx, network, addr)
-	}
-
 	if c.router.ShouldIPV6Disable() {
 		switch network {
 		case "tcp":
@@ -357,18 +348,16 @@ func (c *Client) dialWithConfig(ctx context.Context, network, addr string) (net.
 
 	if host, port, err := net.SplitHostPort(addr); err == nil {
 		if ips := c.serverDialIPs(host); len(ips) > 0 {
-			// 给域名回退预留一次机会：pin 阶段（可能包含多个被黑洞的字面地址）
-			// 不得吃掉整个拨号预算，否则失败的域名回退会复用同一个已过期的
-			// context 在毫秒内全部失败——即使操作系统解析器完全可用。
+			// 给域名回退预留一次机会：pin 阶段可能包含多个被黑洞的字面地址，不能吃掉整个拨号
+			// 预算，否则回退会复用同一个已过期的 context 在毫秒内全部失败。
 			pinnedCtx, cancelPinned := withDomainFallbackReserve(ctx)
 			conn, err := c.dialServerIPs(pinnedCtx, network, ips, port)
 			cancelPinned()
 			if err == nil {
 				return conn, nil
 			}
-			// 预解析的地址可能已经过期（服务端换了 IP）：丢弃它并回退到域名
-			// 拨号（操作系统解析器），使后续拨号重新解析而不是一直拨旧地址。
-			c.SetServerIPs(nil)
+			// 只把本次拨号回退给系统解析器，预解析结果保留：一次失败可能只是瞬态，丢掉它会让
+			// 进程此后只能依赖系统解析器，而 pinning 的意义正是系统 DNS 不可靠时仍能连上。
 			log.Warn("[CLIENT] dial server by pre-resolved ip failed, falling back to system resolver",
 				"server", host, "ips", ips, "err", err)
 		}
@@ -377,13 +366,7 @@ func (c *Client) dialWithConfig(ctx context.Context, network, addr string) (net.
 	return c.dialAddr(ctx, network, addr)
 }
 
-// withDomainFallbackReserve 返回"拨预解析字面地址"阶段应使用的 context：当调用方
-// 带了截止时间、且剩余预算大于一个 serverIPDialTimeout 时，把 pin 阶段的截止时间
-// 提前一个 serverIPDialTimeout（即一次完整拨号的预算），这样全部字面 IP 都失败
-// 后，域名回退至少还能拿到这段时间。与 dns.WithSystemDNSFallbackReserve 是同一种
-// 思路（那里为系统 DNS 兜底预留一个条目的预算）。
-//
-// 没有截止时间（调用方不设总预算）或剩余预算已不足预留量时原样返回，不做切分。
+// 把字面 IP 阶段的截止时间提前一个 serverIPDialTimeout，全部拨失败后域名回退还有预算。
 func withDomainFallbackReserve(ctx context.Context) (context.Context, context.CancelFunc) {
 	deadline, ok := ctx.Deadline()
 	if !ok {
@@ -396,8 +379,7 @@ func withDomainFallbackReserve(ctx context.Context) (context.Context, context.Ca
 	return context.WithDeadline(ctx, pinnedDeadline)
 }
 
-// serverDialIPs 返回可用于拨号的服务端字面 IP：仅当 host 正是服务端域名时。
-// 规则禁用 IPv6 时过滤掉 IPv6 地址（拨了也连不上）。
+// 仅当 host 正是服务端域名时返回字面 IP；规则禁用 IPv6 时过滤掉 IPv6 地址。
 func (c *Client) serverDialIPs(host string) []string {
 	if c.serverDomain == "" || !strings.EqualFold(host, c.serverDomain) {
 		return nil
@@ -416,15 +398,12 @@ func (c *Client) serverDialIPs(host string) []string {
 	return ips
 }
 
-// dialServerIPs 依次尝试预解析得到的字面 IP，返回第一个成功的连接。
-// 每个地址的尝试都有界（serverIPDialTimeout）；ctx 本身携带 pin 阶段的总预算
-// （见 withDomainFallbackReserve），预算耗尽即停止尝试，把剩余时间留给域名回退。
+// 每个字面 IP 的尝试都有界；ctx 耗尽即停，把剩余时间留给域名回退。
 func (c *Client) dialServerIPs(ctx context.Context, network string, ips []string, port string) (net.Conn, error) {
 	var lastErr error
 	for _, ip := range ips {
 		if ctx.Err() != nil {
-			// pin 阶段预算已耗尽：继续只会对剩下的地址各记一次瞬时失败
-			// （拨号根本没发生），把日志刷爆且毫无意义。
+			// pin 阶段预算已耗尽：继续只会对剩下的地址各记一次根本没发生的拨号失败。
 			if lastErr == nil {
 				lastErr = ctx.Err()
 			}
@@ -441,12 +420,10 @@ func (c *Client) dialServerIPs(ctx context.Context, network string, ips []string
 	return nil, lastErr
 }
 
-// dialAddr 拨一个具体地址（域名或字面 IP）。
 func (c *Client) dialAddr(ctx context.Context, network, addr string) (net.Conn, error) {
-	if c.cfg.Local.EnableTun2socks && c.dialer.Load() != nil {
-		// 强制特定 IP 版本，直连拨号器的 socket 绑定（IP_BOUND_IF）
-		// 才能生效。该拨号器只处理 "tcp4"/"udp4"，不处理双栈的
-		// "tcp"/"udp"。
+	if c.TunModeEnabled() && c.dialer.Load() != nil {
+		// 必须强制具体的 IP 版本，直连拨号器的 socket 绑定（IP_BOUND_IF）才生效：
+		// 它只处理 "tcp4"/"udp4"/"tcp6"/"udp6"，不处理双栈的 "tcp"/"udp"。
 		host, _, err := net.SplitHostPort(addr)
 		if err == nil {
 			if ip := net.ParseIP(host); ip != nil {
@@ -468,16 +445,15 @@ func (c *Client) dialAddr(ctx context.Context, network, addr string) (net.Conn, 
 			}
 		}
 
-		conn, err := boundDialContext(c, ctx, network, addr)
+		conn, err := c.sys.dial(c, ctx, network, addr)
 		if err == nil || !isInterfaceStaleError(err) {
 			return conn, err
 		}
 
-		// 绑定的接口过期了（休眠/唤醒、网络切换）：启动时捕获的接口
-		// 不再路由。重新检测默认接口、重建拨号器并重试一次。
+		// 绑定的接口过期了（休眠/唤醒、网络切换）：重建拨号器后重试一次。
 		log.Warn("[CLIENT] direct dial failed, refreshing interface binding", "addr", addr, "err", err)
 		if c.refreshDirectDialer() {
-			return boundDialContext(c, ctx, network, addr)
+			return c.sys.dial(c, ctx, network, addr)
 		}
 		return conn, err
 	}
@@ -488,9 +464,7 @@ func (c *Client) dialAddr(ctx context.Context, network, addr string) (net.Conn, 
 	return nd.DialContext(ctx, network, addr)
 }
 
-// SetServerIPs 记录服务端域名预解析得到的地址（由 runner 在预解析成功后注入，
-// 见 runner.Core.publishServerIPs）。传空列表表示丢弃：拨号随即回到由操作系统
-// 解析器解析域名的路径。
+// 传空列表表示丢弃预解析地址，拨号随即回到系统解析器。
 func (c *Client) SetServerIPs(ips []string) {
 	if len(ips) == 0 {
 		c.serverIPs.Store(nil)
@@ -500,25 +474,19 @@ func (c *Client) SetServerIPs(ips []string) {
 	c.serverIPs.Store(&addrs)
 }
 
-// refreshDirectDialer 在绑定变更（名称或索引）时重新检测默认接口并重建
-// 绑定接口的直连拨号器。报告拨号器是否被替换。检测失败时保留现有拨号器，
-// 使瞬态网络状态不会进一步降低连通性。在接口绑定不受支持的平台上
-// （android）是返回 false 的空操作。
+// 绑定变更（名称或索引）时重建；检测失败保留现有拨号器，避免瞬态网络进一步降低连通性。
 func (c *Client) refreshDirectDialer() bool {
-	if ifaceBindUnsupported() {
-		// 无法绑定直连拨号器的平台保持未绑定拨号器：没有可刷新的内容。
+	if c.sys.unbindable() {
 		return false
 	}
-	iface, err := detectDialIface()
+	iface, err := c.sys.iface()
 	if err != nil {
 		log.Warn("[CLIENT] refresh direct dialer: detect interface failed", "err", err)
 		return false
 	}
 	if c.isTunIface(iface) {
-		// 纵深防御：探测绝不应解析到 easyss TUN 设备（0.0.0.1 在 TUN
-		// 路由之外），但旧脚本或自定义 TUN 配置留下的陈旧路由可能把它
-		// 重定向到那里。绑定到它会让每次拨号都回环进 TUN 设备，
-		// 因此保留先前绑定的物理接口。
+		// 探测本不该解析到 easyss TUN 设备（0.0.0.1 在 TUN 路由之外），但陈旧路由可能把它
+		// 重定向过去；绑上去会让每次拨号都回环进 TUN，因此保留先前的物理接口绑定。
 		log.Warn("[CLIENT] refresh direct dialer: detected easyss TUN device, keeping previous binding",
 			"iface", iface.Name, "index", iface.Index)
 		return false
@@ -537,21 +505,14 @@ func (c *Client) refreshDirectDialer() bool {
 	return true
 }
 
-// dialerRefreshLoop 周期性重新检测默认接口，使直连拨号器的接口绑定在
-// 休眠/唤醒与网络切换后仍然有效：机器在不同网络上唤醒后，启动时捕获的
-// 接口可能过期，使每次直连拨号在重启前都失败。在 darwin 和 linux 上
-// 探测（0.0.0.1）位于 TUN 路由之外，在 Windows 上路由表查找会跳过
-// TUN 设备，因此检测总是解析到物理接口；refreshDirectDialer 另外拒绝
-// easyss TUN 设备，作为对旧脚本（覆盖 0.0.0.0/1）或自定义 TUN 配置
-// 留下的陈旧路由的防御。
-// 仅在 TUN 模式激活时运行（否则绑定的拨号器不被使用）。
+// 仅在 TUN 模式激活时运行，否则绑定的拨号器不被使用；重新检测让绑定在休眠/网络切换后依然有效。
 func (c *Client) dialerRefreshLoop() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ticker.C:
-			if c.cfg.Local.EnableTun2socks {
+			if c.TunModeEnabled() {
 				c.refreshDirectDialer()
 			}
 		case <-c.closeIdleDone:
@@ -560,8 +521,6 @@ func (c *Client) dialerRefreshLoop() {
 	}
 }
 
-// isInterfaceStaleError 报告 err 是否像绑定的接口过期了（接口被移除、
-// 宕机或不可达），以便重建拨号器并重试拨号。
 func isInterfaceStaleError(err error) bool {
 	if err == nil {
 		return false
@@ -580,49 +539,49 @@ func isInterfaceStaleError(err error) bool {
 	return false
 }
 
-func resolveServerIPV6(ctx context.Context, cfg *config.ClientConfig) string {
+func resolveServerIPV6(ctx context.Context, cfg *clientconfig.ClientConfig) string {
 	svr := cfg.DefaultServer()
 	if svr == nil {
 		return ""
 	}
-	if ip := net.ParseIP(svr.Address); ip != nil {
+	if ip := net.ParseIP(svr.Host); ip != nil {
 		if ip.To4() == nil {
-			return svr.Address
+			return svr.Host
 		}
 		return ""
 	}
 
-	if dns.BuiltinDNSAvailable() {
-		// 内置分支只能花掉总预算里除预留量以外的部分：黑洞内置 DNS（丢包而非
-		// 立即拒绝）会把整个预算耗在一次查询上，系统 DNS 兜底复用同一个已过期
-		// 的 ctx 就会在毫秒内全部失败（见 dns.WithSystemDNSFallbackReserve）。
+	// 惰性获取：判定只在熔断已置位时才调它，健康路径不必为每次解析付系统 DNS 发现的开销。
+	hasFailover := func() bool { return len(dns.SystemDNSServers()) > 0 }
+	route := dns.BuiltinRouteFor(hasFailover)
+	if route == dns.BuiltinRouteRetry {
+		log.Warn("[CLIENT] builtin dns breaker is armed but no system dns is available, retrying builtin servers",
+			"server", svr.Host)
+	}
+	if route != dns.BuiltinRouteSkip {
+		// 内置分支只能花掉总预算里除预留量以外的部分：黑洞内置 DNS（丢包而非立即拒绝）会把
+		// 预算耗在一次查询上，系统 DNS 兜底复用同一个已过期的 ctx 就会在毫秒内全部失败。
 		builtinCtx, cancelBuiltin := dns.WithSystemDNSFallbackReserve(ctx)
 		defer cancelBuiltin()
 
 		reachable := false
-		for _, dnsServer := range config.DirectDNSServers {
+		for _, dnsServer := range clientconfig.DirectDNSServers {
 			if builtinCtx.Err() != nil {
 				log.Warn("[CLIENT] server ipv6 resolution budget exhausted, skipping remaining builtin dns servers",
-					"server", svr.Address, "err", builtinCtx.Err())
+					"server", svr.Host, "err", builtinCtx.Err())
 				break
 			}
-			// 每个条目独立预算，避免一个黑洞服务器吃掉整个内置分支
-			// （见 dns.ResolveItemTimeout）。
 			itemCtx, cancelItem := context.WithTimeout(builtinCtx, dns.ResolveItemTimeout)
-			ips, err := dns.LookupIPV6FromContext(itemCtx, dnsServer, svr.Address)
+			ips, err := dns.LookupIPV6FromContext(itemCtx, dnsServer, svr.Host)
 			cancelItem()
 			if err != nil {
 				if ctx.Err() != nil {
-					log.Warn("[CLIENT] server ipv6 resolution timed out", "server", svr.Address, "err", ctx.Err())
+					log.Warn("[CLIENT] server ipv6 resolution timed out", "server", svr.Host, "err", ctx.Err())
 					return ""
 				}
 				continue
 			}
-			// 服务器应答了（可能为 NODATA），因此 builtin DNS
-			// 服务器可达
 			reachable = true
-			// 记录已确认可达的内置服务器，供 TUN 启动时挑选系统 DNS
-			// （见 dns.PreferredSystemDNS）。
 			dns.MarkBuiltinServerReachable(dnsServer)
 			if len(ips) == 0 {
 				continue
@@ -631,41 +590,37 @@ func resolveServerIPV6(ctx context.Context, cfg *config.ClientConfig) string {
 			return ips[0].String()
 		}
 		if !reachable {
-			// 只有存在系统 DNS 兜底时才熔断内置服务器：无兜底时熔断会让后续
-			// 解析在冷却期内直接跳过仍可能可用的内置服务器（Android 上系统
-			// DNS 对应用不可见，正是这种情形）。
-			if len(dns.SystemDNSServers()) > 0 {
+			// 只有存在系统 DNS 兜底时才熔断：无兜底时熔断会让冷却期内连仍可用的
+			// 内置服务器也跳过（Android 上系统 DNS 对应用不可见正是这种情形）。
+			if hasFailover() {
 				dns.MarkBuiltinDNSUnavailable()
 			}
-			log.Warn("[CLIENT] all builtin direct dns servers failed to resolve server ipv6, fallback to system dns", "server", svr.Address)
+			log.Warn("[CLIENT] all builtin direct dns servers failed to resolve server ipv6, fallback to system dns", "server", svr.Host)
 		}
 	}
 
-	// 所有 builtin 直连 DNS 服务器都不可用时，回退到系统 DNS 服务器
 	for _, dnsServer := range dns.SystemDNSServers() {
 		if ctx.Err() != nil {
 			log.Warn("[CLIENT] server ipv6 resolution budget exhausted, skipping remaining system dns servers",
-				"server", svr.Address, "err", ctx.Err())
+				"server", svr.Host, "err", ctx.Err())
 			break
 		}
 		itemCtx, cancelItem := context.WithTimeout(ctx, dns.ResolveItemTimeout)
-		ips, err := dns.LookupIPV6FromContext(itemCtx, dnsServer, svr.Address)
+		ips, err := dns.LookupIPV6FromContext(itemCtx, dnsServer, svr.Host)
 		cancelItem()
 		if err == nil {
-			// 记录已确认可达的系统 DNS，供"内置 DNS 全不可用"的网络里挑选
-			// TUN 系统解析器（见 dns.PreferredSystemDNS）。
 			dns.MarkSystemServerReachable(dnsServer)
 		}
 		if err != nil || len(ips) == 0 {
 			if ctx.Err() != nil {
-				log.Warn("[CLIENT] server ipv6 resolution timed out", "server", svr.Address, "err", ctx.Err())
+				log.Warn("[CLIENT] server ipv6 resolution timed out", "server", svr.Host, "err", ctx.Err())
 				return ""
 			}
 			continue
 		}
 		return ips[0].String()
 	}
-	log.Warn("[CLIENT] failed to resolve server ipv6 via all direct and system dns servers", "server", svr.Address)
+	log.Warn("[CLIENT] failed to resolve server ipv6 via all direct and system dns servers", "server", svr.Host)
 	return ""
 }
 
@@ -674,31 +629,30 @@ func detectIPV6Networking() bool {
 	return err == nil
 }
 
-// RefreshServerIPV6 在服务端 IPv6 信息仍为空时重新解析一次，并更新路由引擎。
-//
-// 启动时若网络尚未就绪（开机自启动的典型情况），client.New 里的解析会得到
-// 空值；降级启动后用户手动启用 TUN 时如果仍为空，平台脚本不会安装 IPv6 默认
-// 路由，IPv6 流量就会绕过隧道（见 scripts/create_tun_dev*.sh）。已有值、服务器
-// 是字面 IP、或 IPv6 规则为 disable 时直接返回，不做 DNS 查询。
+// 降级启动后启用 TUN 时补齐服务端 IPv6，并重测本机 IPv6 出口：networking 是启动快照，
+// 换网后 TUN 是否接管 IPv6（以及 auto 策略）都会失真。探测只是一次本地路由表查询。
 func (c *Client) RefreshServerIPV6() string {
 	if c == nil {
 		return ""
 	}
-	if ipv6 := c.router.ServerIPV6(); ipv6 != "" {
-		return ipv6
-	}
 	if router.ParseIPV6Rule(c.cfg.Routing.IPV6Rule) == router.IPV6RuleDisable {
 		return ""
 	}
-	if svr := c.cfg.DefaultServer(); svr == nil || net.ParseIP(svr.Address) != nil {
+
+	ipv6Networking := c.sys.hasIPV6()
+	if ipv6 := c.router.ServerIPV6(); ipv6 != "" {
+		c.router.SetIPV6Info(ipv6Networking, ipv6)
+		return ipv6
+	}
+	if svr := c.cfg.DefaultServer(); svr == nil || net.ParseIP(svr.Host) != nil {
+		c.router.SetIPV6Info(ipv6Networking, "")
 		return ""
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), serverIPV6ResolveTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), dns.PreResolveTimeout)
 	defer cancel()
 
 	serverIPV6 := resolveServerIPV6(ctx, c.cfg)
-	ipv6Networking := detectIPV6Networking()
 	c.router.SetIPV6Info(ipv6Networking, serverIPV6)
 
 	log.Info("[CLIENT] server ipv6 refreshed",
@@ -713,9 +667,7 @@ func (c *Client) Router() *router.Router {
 	return c.router
 }
 
-// StartupWarning 返回客户端初始化期间检测到的首个非致命警告
-// （例如加载失败的自定义直连/代理规则文件），初始化干净完成时返回 nil。
-// 客户端继续使用内置规则运行；调用方可以把警告呈现给用户。
+// 首个非致命警告（例如加载失败的自定义规则文件）；客户端仍用内置规则继续运行。
 func (c *Client) StartupWarning() error {
 	return c.fileWarn
 }
@@ -732,26 +684,19 @@ func (c *Client) MasterKey() []byte {
 	return c.masterKey
 }
 
-func (c *Client) Config() *config.ClientConfig {
+func (c *Client) Config() *clientconfig.ClientConfig {
 	return c.cfg
 }
 
-// Close 拆除客户端：停止空闲回收循环并关闭传输层。传输层无法重新打开，
-// 因此 Client 不能被重启——但 Close 本身是幂等的，重复调用返回 nil。
-//
-// 关闭顺序提醒：传输层被本地代理入口（StreamHandler）借用，调用方必须在关闭
-// 所有使用它的服务器之后再调用本方法（见 runner.Core.cleanup）。
+// 传输层无法重新打开，因此 Client 不能重启；调用方必须先关掉所有借用它的本地代理服务器。
 func (c *Client) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	c.closeOnce.Do(func() { close(c.closeIdleDone) })
 	if c.closed.Swap(true) {
-		// 第二次调用不得再拆一次传输层（拆一次是安全的，但"重复拆除"不是
-		// 本类型对外的契约，调用方也不该依赖它）。
 		return nil
 	}
-	_ = tsnet.Close()
 	return c.transport.Close()
 }
 
@@ -768,8 +713,30 @@ func (c *Client) closeIdleLoop() {
 	}
 }
 
+// 只更新路由引擎，不回写 cfg：配置快照不可变，持久化由 App 用 copy-on-write 完成。
 func (c *Client) SetProxyRule(rule string) {
 	pr := router.ParseProxyRule(rule)
-	c.cfg.Routing.ProxyRule = rule
 	c.router.SetProxyRule(pr)
+}
+
+// SetTunMode 发布"路由表可能指向 TUN"：引擎建立之前就要置位，拆除删完路由之后才清。
+// 桌面端由 session 在 tunMu 内按实际安装的引擎发布，不要再从配置快照读偏好覆盖它。
+func (c *Client) SetTunMode(on bool) {
+	c.tunMode.Store(on)
+}
+
+// TunModeEnabled 报告直连拨号是否必须绑定物理接口（不是引擎状态，也不是配置开关）。
+func (c *Client) TunModeEnabled() bool {
+	return c.tunMode.Load()
+}
+
+// SetTunForwarding 发布"引擎已开始转发"；只有 session 在 Manager.Start 成功后才置位。
+func (c *Client) SetTunForwarding(on bool) {
+	c.tunForwarding.Store(on)
+}
+
+// TunForwardingEnabled 报告 TUN 是否真的在承载流量。forward DNS 读它：不成立时上游查询
+// 只能从物理网卡直连解析（DNS 泄漏），必须拒答而不是降级。
+func (c *Client) TunForwardingEnabled() bool {
+	return c.tunForwarding.Load()
 }

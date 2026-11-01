@@ -1,6 +1,7 @@
 package shaper
 
 import (
+	"math/rand/v2"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -9,14 +10,11 @@ import (
 	"github.com/nange/easyss/v3/util/bytespool"
 )
 
-var (
-	coverRNG   = newSeededChaCha8()
-	coverRNGMu sync.Mutex
-)
-
 type coverInjector struct {
-	cfg              CoverConfig
-	mu               sync.Mutex
+	cfg Cover
+	mu  sync.Mutex
+	// rng 归本 injector 所有，在 ci.mu 下使用，避免所有流共用一把全局锁。
+	rng              *rand.ChaCha8
 	budget           float64
 	timer            *time.Timer
 	inject           func(f protocol.Frame) error
@@ -28,16 +26,15 @@ type coverInjector struct {
 	stopped          atomic.Bool
 }
 
-// newCoverInjector 为已规范化的配置构建 cover 流量注入器
-// （参见 Config.Normalize，它是 cover 默认值的唯一出处）。
-// BudgetRatio 为零时禁用 cover 流量。
-func newCoverInjector(cfg CoverConfig, inject func(protocol.Frame) error, isClosing func() bool) *coverInjector {
+// 配置必须已经过 Config.Normalize——cover 默认值的唯一出处；BudgetRatio 为零时禁用。
+func newCoverInjector(cfg Cover, inject func(protocol.Frame) error, isClosing func() bool) *coverInjector {
 	if cfg.BudgetRatio == 0 {
 		return nil
 	}
 
 	ci := &coverInjector{
 		cfg:              cfg,
+		rng:              newSeededChaCha8(),
 		inject:           inject,
 		isClosing:        isClosing,
 		minResetInterval: time.Duration(cfg.IdleTimeout) * time.Millisecond / 2,
@@ -117,11 +114,10 @@ func (ci *coverInjector) onIdle() {
 	ci.mu.Unlock()
 
 	payload := bytespool.Get(frameSize)[:frameSize]
-	// 包级 RNG 在多个流之间共享；math/rand/v2 的随机源不适合并发使用，
-	// 因此用互斥锁保护填充操作。
-	coverRNGMu.Lock()
-	_, _ = coverRNG.Read(payload)
-	coverRNGMu.Unlock()
+	// onIdle 可能在上一次回调的 unlock 之后再次触发，RNG 仍须串行化。
+	ci.mu.Lock()
+	_, _ = ci.rng.Read(payload)
+	ci.mu.Unlock()
 	// NewFrameWithPayload 直接包装池化缓冲区而不复制：整形器在追加该帧后
 	// 会将这个缓冲区原样归还池。
 	frame := protocol.NewFrameWithPayload(protocol.FrameCOVER, payload)
@@ -136,10 +132,8 @@ func (ci *coverInjector) coverFrameSizeRange() (minSize, maxSize int) {
 	cfgMin, cfgMax := ci.cfg.MinSize, ci.cfg.MaxSize
 	span := float64(cfgMax - cfgMin)
 
-	// 初始阶段以接近 cfgMin 的小尺寸为主，模拟空闲连接的小数据包特征；
-	// 随累计真实流量平滑过渡到接近真实 DATA 帧的尺寸分布。
-	// 默认配置（MinSize=128, MaxSize=1500）下：
-	//   ratio=0 -> [128, 509],  ratio=1 -> [512, 1500]
+	// 初始阶段以接近 cfgMin 的小尺寸模拟空闲连接，随累计真实流量平滑过渡到
+	// 接近真实 DATA 帧的尺寸分布，避免 cover 帧在流量画像上过于显眼。
 	const (
 		minSteadyRatio = 0.28
 		maxStartRatio  = 0.278

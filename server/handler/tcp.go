@@ -10,74 +10,51 @@ import (
 
 	"github.com/nange/easyss/v3/config"
 	"github.com/nange/easyss/v3/crypto"
-	"github.com/nange/easyss/v3/log"
 	"github.com/nange/easyss/v3/protocol"
 	"github.com/nange/easyss/v3/relay"
 	"github.com/nange/easyss/v3/server/nextproxy"
 	"github.com/nange/easyss/v3/shaper"
 	"github.com/nange/easyss/v3/stats"
-	"github.com/nange/easyss/v3/util/bytespool"
+	"github.com/nange/easyss/v3/util/netbuf"
 )
 
 type tcpHandler struct {
 	idleTimeout time.Duration
-	// dialContext 是仅供测试的直接拨号注入点；生产环境为 nil。
+	// 仅供测试注入直接拨号。
 	dialContext func(context.Context, string, string) (net.Conn, error)
 	dial        dialer
 }
 
-// newTCPHandler 用给定的空闲超时和基础超时创建 tcpHandler。
-// 拨号超时通过 config.DialTimeout 派生（base/3，限制在 [3s, 15s]），与客户端
-// 共用；KeepAlive 取完整的基础超时，这样长连接流由内核回收，而不会在对端
-// 消失后一直半开残留。
-func newTCPHandler(idleTimeout, timeout time.Duration, np *nextproxy.NextProxy) *tcpHandler {
-	if idleTimeout <= 0 {
-		idleTimeout = config.DefaultStreamIdleTimeout
-	}
-	if timeout <= 0 {
-		timeout = time.Duration(config.DefaultTimeout) * time.Second
-	}
-	directDialer := outboundDialer(config.DialTimeout(timeout), timeout)
-	h := &tcpHandler{idleTimeout: idleTimeout}
-	h.dial = dialer{
-		nextProxy:   np,
-		shouldProxy: np.ShouldProxy,
-		direct: func(ctx context.Context, network, target string) (net.Conn, error) {
-			// 测试注入点：生产环境为 nil。
-			if h.dialContext != nil {
-				return h.dialContext(ctx, network, target)
-			}
-			return dialOutbound(ctx, directDialer, network, target)
-		},
+// 零值已由 config.Timeouts.Normalize 填充；Base 用作 KeepAlive，长连接不会在对端消失后
+// 一直半开残留。
+func newTCPHandler(timeouts config.Timeouts, np *nextproxy.NextProxy, deps *outboundDeps) *tcpHandler {
+	directDialer := outboundDialer(timeouts.Dial, timeouts.Base)
+	h := &tcpHandler{idleTimeout: timeouts.StreamIdle}
+	h.dial = newDialer(np, np.ShouldProxy, deps)
+	h.dial.direct = func(ctx context.Context, network, target string) (net.Conn, error) {
+		if h.dialContext != nil {
+			return h.dialContext(ctx, network, target)
+		}
+		return h.dial.outbound(ctx, directDialer, network, target)
 	}
 	return h
 }
 
-// Handle 在客户端与目标之间中继 TCP 流，并以结构化结果返回中继字节数与退出
-// 原因（由 serveSession 统一记录，handler 自己不再打印"流已结束"）。
-// cancelRead 在中继终止（超时/错误/完成）时被调用；
-// 它会解除可能正阻塞在读取客户端数据（如 HTTP/2 请求体）上的拷贝 goroutine，
-// 从而在 handler 返回后不会有 goroutine 残留。
+// 返回前必须经 cancelRead 解除阻塞在客户端读上的拷贝 goroutine，否则会残留。
+// 内部不打印拨号/失败日志，失败阶段由 streamResult 的 err 携带。
 func (h *tcpHandler) Handle(ctx context.Context, dr *crypto.DecryptedReader, s2c shaper.Shaper, target string, cancelRead func()) (out streamResult) {
-	log.Info("[TCP_HANDLE] dialing target", "target", target)
 	targetConn, remote, err := h.dial.dialTarget(ctx, "tcp", target)
 	if err != nil {
-		log.Error("[TCP_HANDLE] dial failed", "target", target, "err", err)
-		sendRST(s2c)
-		return streamResult{Err: err}
+		return streamResult{Err: err, DialFailed: true}
 	}
 	defer targetConn.Close() //nolint:errcheck
-	log.Info("[TCP_HANDLE] target connected", "target", target, "remote", remote)
 	m := stats.NewStreamMeter("tcp_handle", target)
-	// 先取字节数再关闭 meter，使 handler 返回时 out.Bytes 已经是最终值
-	// （defer 按后进先出执行，这里注册的清理在返回前完成）。
+	// 后进先出：这里在返回前执行，out.Bytes 因此已是最终值。
 	defer func() {
 		out.Bytes = m.Bytes()
 		m.Close()
 	}()
 
-	// 中继的 onClose 既要解除客户端读取器阻塞（cancelRead），
-	// 也要关闭目标连接，因此这里把通用的 CloseBoth 与该回调组合在一起。
 	result := relay.Bidirectional(h.idleTimeout, func() {
 		if cancelRead != nil {
 			cancelRead()
@@ -90,12 +67,9 @@ func (h *tcpHandler) Handle(ctx context.Context, dr *crypto.DecryptedReader, s2c
 	out.Remote = remote
 	out.TimedOut = result.TimedOut
 	if result.TimedOut {
-		out.Err = fmt.Errorf("tcp stream idle timeout after %v", h.idleTimeout)
+		out.Err = fmt.Errorf("%w after %v", errStreamIdleTimeout, h.idleTimeout)
 	} else {
 		out.Err = result.Err
-	}
-	if out.needsRST() {
-		sendRST(s2c)
 	}
 	return out
 }
@@ -114,11 +88,8 @@ func (h *tcpHandler) copyFromClient(dr *crypto.DecryptedReader, dst net.Conn, si
 			if cw, ok := dst.(interface{ CloseWrite() error }); ok {
 				_ = cw.CloseWrite()
 			}
-			// FIN 是终止帧：客户端在它之后不会再发送任何帧
-			// （客户端的 copyLocalToRemote 在 flush FIN 后立即返回），
-			// 因此停止读取，而不是一直阻塞在 ReadFrame 上直到中继空闲超时。
-			// 中继仍会等待 target->client 方向，其空闲计时器仍然限定
-			// 流的生命周期。
+			// FIN 之后客户端不再发帧，直接停止读取而不是阻塞到空闲超时；中继仍等
+			// target->client 方向，其空闲计时器仍限定流的生命周期。
 			return nil
 		}
 		signalActivity()
@@ -131,16 +102,25 @@ func (h *tcpHandler) copyFromClient(dr *crypto.DecryptedReader, dst net.Conn, si
 }
 
 func (h *tcpHandler) copyFromTarget(src net.Conn, s2c shaper.Shaper, signalActivity func(), m *stats.StreamMeter) error {
-	buf := bytespool.Get(config.ServerTCPStreamBufferSize)
-	defer bytespool.MustPut(buf)
+	// 读缓冲按需增长，起点只占 4KB：无条件借满会让空闲流与心跳流各自白占 31KB。只按"这次
+	// 读满了"升档对 TCP 无损（短了只多几次 Read），UDP 不能这样——超长数据报会被静默截断。
+	r := netbuf.NewReader(protocol.MinRecordBufferSize, config.ServerTCPStreamBufferSize)
+	defer r.Release()
+
 	for {
 		m.SetState("read_target")
+		buf := r.Buf()
 		n, err := src.Read(buf)
 		if n > 0 {
 			signalActivity()
 			m.SetState("write_http2")
 			if wErr := s2c.PushData(buf[:n]); wErr != nil {
 				return wErr
+			}
+			// 必须在 PushData 之后：Grow 会把这块缓冲还池，而 buf[:n] 正指向它；先交给整形器
+			// （它在写锁内拷进明文缓冲）再换档，否则写入会落进已被别的流取走的缓冲。
+			if n == len(buf) {
+				r.Grow()
 			}
 			m.Add(n, "read_target")
 		}

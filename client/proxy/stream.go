@@ -21,45 +21,34 @@ import (
 	"github.com/nange/easyss/v3/stats"
 	"github.com/nange/easyss/v3/transport"
 	"github.com/nange/easyss/v3/util/bytespool"
+	"github.com/nange/easyss/v3/util/netbuf"
 )
 
 var ErrStreamIdleTimeout = errors.New("stream idle timeout")
 
 var ErrStreamReset = errors.New("stream reset by peer")
 
-// ErrServerRejectedHandshake 表示服务器以非加密载荷应答了引导（通常是握手解密
-// 失败后的伪装 fallback 页面），即握手在任何会话记录交换之前就被拒绝。常见原因：
-// master key 不匹配。
+// 服务端以非加密载荷应答引导（通常是 fallback 页），多半是 master key 不匹配。
 var ErrServerRejectedHandshake = errors.New("handshake rejected by server")
 
 var errLocalConnClosed = errors.New("local connection closed")
 
-// StreamHandler 建立并中继经隧道的流（TCP/UDP/ICMP）。
-//
-// 它没有 Close：这里不持有任何需要释放的资源，transport 是**借用**的——由
-// client.Client 创建并持有，其寿命覆盖所有使用它的入口，最终由
-// client.Client.Close 拆除（见 runner.Core.cleanup 的逆序关闭规则）。
-// 单条流/交换的资源由各自的所有者释放（session 关闭、UDPExchange.Close）。
+// 没有 Close：transport 由 client.Client 持有并拆除，单条流/交换的资源由各自所有者释放。
 type StreamHandler struct {
 	transport         transport.Transport
 	masterKey         []byte
 	shaperCfg         shaper.Config
 	streamIdleTimeout time.Duration
-	// drainIdle 限制一条流在即将被驱逐（到期/降级）的 slot 上可保持空闲的时长，
-	// 超过后中继提前关闭它；0 使用默认值 config.ExpiringStreamDrainIdle。它不作为
-	// 用户配置项暴露——保留为字段是为了让测试可以用较短的时长来验证 drain 行为。
+	// drainIdle 限制一条流在即将被驱逐的 slot 上可保持空闲的时长，0 用默认值。
 	drainIdle time.Duration
 }
 
-func NewStreamHandler(tr transport.Transport, masterKey []byte, shaperCfg shaper.Config, streamIdleTimeout time.Duration) *StreamHandler {
-	if streamIdleTimeout <= 0 {
-		streamIdleTimeout = config.DefaultStreamIdleTimeout
-	}
+func NewStreamHandler(tr transport.Transport, masterKey []byte, shaperCfg shaper.Config, timeouts config.Timeouts) *StreamHandler {
 	return &StreamHandler{
 		transport:         tr,
 		masterKey:         masterKey,
 		shaperCfg:         shaperCfg,
-		streamIdleTimeout: streamIdleTimeout,
+		streamIdleTimeout: timeouts.Normalize().StreamIdle,
 	}
 }
 
@@ -67,13 +56,69 @@ func (h *StreamHandler) Transport() transport.Transport {
 	return h.transport
 }
 
+// streamRequest 是一条流的不可变请求。endpoint 由 proto 唯一派生（见 newStreamRequest），
+// 调用方无法传入不匹配的组合；frames 是合并进引导记录的首批帧（TCP 首批数据 /
+// ICMP echo / UDP 首个数据报）。
+type streamRequest struct {
+	endpoint      string
+	proto         protocol.Proto
+	target        string
+	method        protocol.Method
+	frames        []protocol.Frame
+	batchWindowMS int
+}
+
+func tcpStreamRequest(target string, method protocol.Method) streamRequest {
+	return newStreamRequest(protocol.ProtoTCP, target, method)
+}
+
+func udpStreamRequest(target string, method protocol.Method) streamRequest {
+	return newStreamRequest(protocol.ProtoUDP, target, method)
+}
+
+func icmpStreamRequest(target string, method protocol.Method) streamRequest {
+	return newStreamRequest(protocol.ProtoICMP, target, method)
+}
+
+// endpoint 由 proto 唯一派生：配对只在这里存在，调用方无法再传入不匹配的组合。
+func newStreamRequest(proto protocol.Proto, target string, method protocol.Method) streamRequest {
+	req := streamRequest{proto: proto, target: target, method: method}
+	switch proto {
+	case protocol.ProtoTCP:
+		req.endpoint = config.EndpointTCP
+	case protocol.ProtoUDP:
+		req.endpoint = config.EndpointUDP
+	case protocol.ProtoICMP:
+		req.endpoint = config.EndpointICMP
+	}
+	return req
+}
+
+func (r streamRequest) withFrames(frames ...protocol.Frame) streamRequest {
+	r.frames = frames
+	return r
+}
+
+func (r streamRequest) withBatchWindow(ms int) streamRequest {
+	r.batchWindowMS = ms
+	return r
+}
+
+func (r streamRequest) firstPayloadBytes() int {
+	if len(r.frames) == 0 {
+		return 0
+	}
+	return len(r.frames[0].Payload)
+}
+
 func (h *StreamHandler) OpenTCPStream(ctx context.Context, target string, method protocol.Method, localConn net.Conn) error {
 	stats.RecordTCPConnection()
-	return h.openStream(ctx, config.EndpointTCP, protocol.ProtoTCP, target, method, localConn)
+	return h.openStream(ctx, tcpStreamRequest(target, method), localConn)
 }
 
 func (h *StreamHandler) OpenICMPStream(ctx context.Context, target string, echoPayload []byte, method protocol.Method) ([]byte, error) {
-	return h.icmpStream(ctx, config.EndpointICMP, protocol.ProtoICMP, target, echoPayload, method)
+	req := icmpStreamRequest(target, method).withFrames(protocol.NewFrameDATA(echoPayload))
+	return h.icmpStream(ctx, req)
 }
 
 type bootstrapSession struct {
@@ -82,23 +127,7 @@ type bootstrapSession struct {
 	salt   []byte
 }
 
-// 引导阶段的自愈参数。它们刻意是包级变量（而非常量），使测试可以把窗口缩短到
-// 毫秒级；生产路径只读。
-//
-//   - bootstrapResponseTimeout：写完引导记录后等待"服务端做了什么回应"的有界窗口。
-//     健康路径的响应头 ≈ 1 个路径 RTT，因此 4s 覆盖 RTT ≤ ~1s 的链路，又远小于
-//     中继空闲超时（8 × timeout，默认 240s）——判死不再依赖后者。
-//   - bootstrapLivenessTimeout：窗口到点后，在同一条连接上做一次存活探测的预算。
-//     探测用来把"连接已死"与"服务端还在解析目标域名/链路很慢"区分开，因此窗口
-//     可以取得小而不误伤慢服务端。
-//   - bootstrapSettleTimeout：判死重试前等待本流 RoundTrip 收敛的上限，使
-//     CloseIdle() 能可靠地把这条连接从 net/http 的池里摘掉（见 settleDeadStream）。
-//     正常在微秒级返回，这个上限只是防御性的。
-//
-// bootstrapMaxAttempts 是"应用尚未收到任何数据"这一阶段允许的总尝试次数：第 1 次
-// 通常踩在死连接上、第 2 次在判死路径（失效 + settle + 丢弃空闲连接）之后必然拿到
-// 新连接；第 3 次留给"网络正在切换中"的抖动。每次尝试都重新生成 salt，服务端的
-// 重放保护不会把重试当作重放（对它就是一条新流）。
+// 自愈参数：超时窗口刻意是变量而非常量，测试能缩到毫秒级；liveness 探测区分"连接已死"与"服务端还在解析域名"。
 const bootstrapMaxAttempts = 3
 
 var (
@@ -107,22 +136,35 @@ var (
 	bootstrapSettleTimeout   = 100 * time.Millisecond
 )
 
-func (h *StreamHandler) openAndBootstrap(ctx context.Context, endpoint string, proto protocol.Proto, target string, method protocol.Method, extraFrames []protocol.Frame) (*bootstrapSession, error) {
+// 手工拼装不经过整形器的预冲刷边界，必须自己校验额外帧的线上总长，保证明文能被 WriteRecord 接受。
+func buildBootstrapPlaintext(req streamRequest) ([]byte, error) {
 	hsFrame := protocol.NewFrameHANDSHAKE(protocol.Handshake{
 		Version: protocol.Version3,
-		Proto:   proto,
-		Method:  method,
-		Target:  target,
+		Proto:   req.proto,
+		Method:  req.method,
+		Target:  req.target,
 	})
-	frames := append([]protocol.Frame{hsFrame}, extraFrames...)
+	frames := append([]protocol.Frame{hsFrame}, req.frames...)
 
-	// 添加随机填充以隐藏引导记录中的目标主机名长度。否则，第一条记录的密文长度
-	// 会直接与 len(target) 相关。
-	if padFrame, ok := shaper.BuildPaddingFrame(encodedLen(frames)); ok {
+	// 先校验填充之前的长度：额外帧放不进一条记录时填充退避也救不回来。
+	if size := encodedLen(frames); size > protocol.MaxWriteRecordPlaintext {
+		return nil, fmt.Errorf("bootstrap record plaintext %d exceeds max %d bytes (target %q, %d extra frames)",
+			size, protocol.MaxWriteRecordPlaintext, req.target, len(req.frames))
+	}
+
+	// 随机填充掩盖目标主机名长度：否则首条记录的密文长度会直接与 len(target) 相关。
+	if padFrame, ok := shaper.BuildPaddingFrame(encodedLen(frames), protocol.MaxWriteRecordPlaintext); ok {
 		frames = append(frames, padFrame)
 	}
 
-	plaintext := protocol.EncodeFrames(frames)
+	return protocol.EncodeFrames(frames), nil
+}
+
+func (h *StreamHandler) openAndBootstrap(ctx context.Context, req streamRequest) (*bootstrapSession, error) {
+	plaintext, err := buildBootstrapPlaintext(req)
+	if err != nil {
+		return nil, err
+	}
 
 	var lastErr error
 	for attempt := 1; attempt <= bootstrapMaxAttempts; attempt++ {
@@ -133,16 +175,16 @@ func (h *StreamHandler) openAndBootstrap(ctx context.Context, endpoint string, p
 		saltB64 := base64.RawURLEncoding.EncodeToString(salt)
 
 		stream, err := h.transport.Open(ctx, transport.OpenRequest{
-			Endpoint:     endpoint,
+			Endpoint:     req.endpoint,
 			Salt:         saltB64,
-			HighPriority: isInteractivePort(target),
-			Target:       target,
+			HighPriority: isInteractivePort(req.target),
+			Target:       req.target,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("transport open: %w", err)
 		}
 
-		sk, err := crypto.NewStreamKeys(h.masterKey, salt, endpoint)
+		sk, err := crypto.NewStreamKeys(h.masterKey, salt, req.endpoint)
 		if err != nil {
 			stream.Close() //nolint:errcheck
 			return nil, fmt.Errorf("stream keys: %w", err)
@@ -157,15 +199,13 @@ func (h *StreamHandler) openAndBootstrap(ctx context.Context, endpoint string, p
 		if err := bootstrapWriter.WriteRecord(plaintext); err != nil {
 			stream.Close() //nolint:errcheck
 			lastErr = fmt.Errorf("write handshake: %w", err)
-			// 写失败说明管道已被 RoundTrip 的错误关闭，即连接在写入阶段就坏了。
-			// 只有这一种错误值得换连接重试（其它写入错误是确定性的，重试无用）；
-			// 上层已取消时同样不重试——取消不是判死，也不该顺手丢弃连接池。
+			// 管道被关闭说明连接在写入阶段就坏了，只有这一种写入错误值得换连接重试。上层已取消
+			// 时同样不重试：取消不是判死，也不该顺手丢弃连接池。
 			if attempt < bootstrapMaxAttempts && errors.Is(err, io.ErrClosedPipe) && ctx.Err() == nil {
 				log.Debug("[STREAM] bootstrap write failed, retrying on a new connection",
-					"attempt", attempt, "target", target, "err", err)
-				// 等本流收敛并丢掉其余空闲连接：它们多半也绑在旧网络上，否则
-				// 后续请求会逐个再踩一次死连接。判死瞬间做这件事，而不是等
-				// 240s 的池级回收（见 settleDeadStream 对顺序的说明）。
+					"attempt", attempt, "target", req.target, "err", err)
+				// 写失败不能断言是连接坏了（也可能是流级 RST），没有按代失效可用：只能等
+				// RoundTrip 收敛后靠全局回收丢掉这条正在死的连接，否则重试会再拿到它。
 				settleDeadStream(stream)
 				h.transport.CloseIdle()
 				continue
@@ -174,9 +214,7 @@ func (h *StreamHandler) openAndBootstrap(ctx context.Context, endpoint string, p
 		}
 		bootstrapWriter.Flush()
 
-		// 记录引导记录离开客户端的时刻：服务器在拨号源站之前就以响应头应答，
-		// 因此传输层可在其到达时记录纯 client<->server 路径的 RTT
-		// （参见 transport.BootstrapSentMarker）。
+		// 服务端在拨号源站之前就应答，传输层据此记录纯 client<->server 路径的 RTT。
 		if m, ok := stream.(transport.BootstrapSentMarker); ok {
 			m.MarkBootstrapSent()
 		}
@@ -184,55 +222,44 @@ func (h *StreamHandler) openAndBootstrap(ctx context.Context, endpoint string, p
 		err = h.awaitBootstrapResponse(ctx, stream)
 		if err == nil {
 			if attempt > 1 {
-				// 判死重试后恢复：这是"切网后应用无感自愈"在默认 Info 级别下的
-				// 可见证据。只记成功路径，因此持续断网时不会刷屏（失败由
-				// openStream 的 Error 覆盖）；逐次的重试决策仍记 Debug。
 				log.Info("[STREAM] bootstrap recovered on a new connection",
-					"target", target, "attempts", attempt)
+					"target", req.target, "attempts", attempt)
 			}
 			return &bootstrapSession{stream: stream, sk: sk, salt: salt}, nil
 		}
 		lastErr = err
 
-		// 上层取消（核心停止、本地连接已断、请求被放弃）：只关闭本流，**不得**
-		// 失效连接。取消不是判死——这条连接可能完全是健康的，而且被同槽位的
-		// 其他在飞流共享，关掉它会连带中断它们。因此这个检查必须排在
-		// invalidateDeadStream 之前。
+		// 上层取消：只关闭本流，不得失效连接——取消不是判死，这条连接可能健康且被同槽位
+		// 的其他在飞流共享。
 		if ctx.Err() != nil {
 			_ = stream.Close()
 			return nil, ctx.Err()
 		}
 
-		// 判死：失效这条连接（它仍承载着本流，http.Transport 的
-		// CloseIdleConnections 关不掉它），并丢掉其余空闲连接。只作用于本次请求
-		// 自己的连接，因此不会误杀刚重试建立的新连接。
-		invalidateDeadStream(stream)
+		// 判死：失效本流实际使用的那条连接（CloseIdleConnections 关不掉承载活跃流的连接）。
+		// 每条流各有自己的身份，下一次尝试新开的流不会被这次失效波及。
+		invalidated := invalidateDeadStream(stream)
 		_ = stream.Close()
 
 		if attempt < bootstrapMaxAttempts {
 			log.Debug("[STREAM] bootstrap timed out, retrying on a new connection",
-				"attempt", attempt, "target", target, "err", lastErr)
-			// 必须先等本流的 RoundTrip 收敛，再丢弃空闲连接（见 settleDeadStream）。
-			settleDeadStream(stream)
-			h.transport.CloseIdle()
+				"attempt", attempt, "target", req.target, "err", lastErr)
+			// 按代失效已经保证下一次 Open 换连接；其余槽位的死连接由各自的判死/健康路径
+			// 回收，这里故意不再全局丢空闲连接。只有不支持按代失效的传输层才退回全局回收，
+			// 且必须先等本流 RoundTrip 收敛，否则空闲扫描会漏掉这条正在死的连接。
+			if !invalidated {
+				settleDeadStream(stream)
+				h.transport.CloseIdle()
+			}
 			continue
 		}
 		return nil, lastErr
 	}
 
-	// 不可达：循环体内部总是会返回。
 	return nil, lastErr
 }
 
-// awaitBootstrapResponse 在引导阶段用一个有界窗口等待服务端的回应，并在窗口
-// 到点时用一次同连接探测区分"连接已死"与"服务端只是还没答复"（例如仍在解析
-// 目标域名）。返回 nil 表示可以继续（响应已就绪，或判活确认连接仍然可往返）；
-// 返回非 nil 表示这条连接应判死。
-//
-// 传输层未实现 transport.ResponseAwaiter 时不做任何等待，行为与既有实现完全一致。
-//
-// 状态清理的边界：这里只做"判死 + 重试"这类无状态动作，不触碰任何缓存、DNS
-// 熔断、可达记录或 pin——那些只影响最优性，不出现在可用性路径上。
+// 窗口到点时用一次同连接探测区分"连接已死"与"服务端还没答复"。
 func (h *StreamHandler) awaitBootstrapResponse(ctx context.Context, stream transport.Stream) error {
 	ra, ok := stream.(transport.ResponseAwaiter)
 	if !ok {
@@ -244,20 +271,17 @@ func (h *StreamHandler) awaitBootstrapResponse(ctx context.Context, stream trans
 	cancel()
 
 	if err == nil {
-		// 响应已就绪：成功或服务端拒绝（非 200 已被传输层转成
-		// HandshakeRejectedError）。拒绝的分类交给首次 Read，不应在这里重试。
+		// 响应已就绪：成功，或服务端拒绝（非 200 已被传输层转成 HandshakeRejectedError）。
 		return nil
 	}
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
 	if !errors.Is(err, context.DeadlineExceeded) {
-		// 传输层错误：连接在写入阶段或响应阶段就坏了，立即换连接，不必等满窗口。
 		return err
 	}
 
-	// 窗口到点：先问"这条连接还能不能往返"。服务端在解析目标域名之后才提交
-	// 响应头，因此"响应头迟到"不等于"连接已死"；判活成功就继续等（无回归）。
+	// 先问这条连接还能不能往返：服务端在解析目标域名之后才提交响应头，迟到不等于已死。
 	if cl, ok := stream.(transport.ConnLiveness); ok {
 		liveCtx, cancelLive := context.WithTimeout(ctx, bootstrapLivenessTimeout)
 		alive, known := cl.ConnAlive(liveCtx)
@@ -271,26 +295,19 @@ func (h *StreamHandler) awaitBootstrapResponse(ctx context.Context, stream trans
 	return err
 }
 
-// invalidateDeadStream 让传输层强制关闭本流所在的那条底层连接：判死重试必须
-// 换连接，而 http.Transport 的 CloseIdleConnections 不会关闭承载活跃流的连接。
-// 未实现 transport.ConnInvalidator 的传输层（测试桩、其他实现）保持现状。
-func invalidateDeadStream(stream transport.Stream) {
-	if inv, ok := stream.(transport.ConnInvalidator); ok {
-		inv.InvalidateConn()
+// 判死重试必须换连接，而 CloseIdleConnections 关不掉承载活跃流的连接。返回 false 表示
+// 传输层不支持按代失效，调用方只能退回全局 CloseIdle。
+func invalidateDeadStream(stream transport.Stream) bool {
+	inv, ok := stream.(transport.ConnInvalidator)
+	if !ok {
+		return false
 	}
+	inv.InvalidateConn()
+	return true
 }
 
-// settleDeadStream 用有界窗口等待一条已关闭的流的 RoundTrip 收敛。
-//
-// 判死路径必须在 CloseIdle() 之前等这一步：InvalidateConn 关掉底层连接后，
-// net/http 的读循环是异步感知并回收它的；在那之前这条连接仍被本流"占用"，
-// 而 CloseIdleConnections 只回收空闲连接——于是下一次 Open 会把这条正在死去的
-// 连接再次交付出来，引导记录写入立即以 io.ErrClosedPipe 失败，白白消耗一次尝试
-// （判死即换连接的核心保证也就不严格成立）。等本流的 RoundTrip 返回后，连接才
-// 真正转为空闲，CloseIdle() 能可靠地把它从池里摘掉。
-//
-// 实测这一步在本地约 25µs；未实现 transport.ResponseAwaiter 的传输层没有这个
-// 问题（也不会被等待）。
+// 等已关闭的流的 RoundTrip 收敛：没有按代失效能力时，只有这时 CloseIdle 才能丢掉这条
+// 正在死的连接。
 func settleDeadStream(stream transport.Stream) {
 	ra, ok := stream.(transport.ResponseAwaiter)
 	if !ok {
@@ -301,9 +318,7 @@ func settleDeadStream(stream transport.Stream) {
 	_ = ra.AwaitResponse(ctx)
 }
 
-// classifyFirstReadError 将由非加密服务器响应（例如握手被拒绝后的 fallback 页面）
-// 引起的首条记录读取失败映射为带诊断提示的 ErrServerRejectedHandshake。只有
-// 第一次读取会被分类：流中途的失败意味着真正的流损坏，而不是握手被拒绝。
+// 只分类第一次读取：流中途的失败意味着真正的流损坏，不是握手被拒。
 func classifyFirstReadError(err error) error {
 	if err == nil || errors.Is(err, ErrServerRejectedHandshake) {
 		return err
@@ -320,32 +335,26 @@ func classifyFirstReadError(err error) error {
 	return err
 }
 
-func (h *StreamHandler) icmpStream(ctx context.Context, endpoint string, proto protocol.Proto, target string, echoPayload []byte, method protocol.Method) ([]byte, error) {
-	log.Debug("[STREAM] icmp open", "endpoint", endpoint, "target", target)
+func (h *StreamHandler) icmpStream(ctx context.Context, req streamRequest) ([]byte, error) {
+	log.Debug("[STREAM] icmp open", "endpoint", req.endpoint, "target", req.target)
 
-	s, err := h.newSession(ctx, endpoint, proto, target, method,
-		[]protocol.Frame{protocol.NewFrameDATA(echoPayload)}, 0)
+	s, err := h.newSession(ctx, req)
 	if err != nil {
-		log.Error("[STREAM] icmp bootstrap", "target", target, "err", err)
-		return nil, err
+		return nil, fmt.Errorf("icmp bootstrap: %w", err)
 	}
-	log.Debug("[STREAM] merged ICMP echo payload into bootstrap record", "bytes", len(echoPayload))
+	log.Debug("[STREAM] merged ICMP echo payload into bootstrap record", "bytes", req.firstPayloadBytes())
 	defer s.stream.Close() //nolint:errcheck
-	// 此路径只接收：echo 载荷已随引导记录发送，tx 永远不会被写入。它仍然持有
-	// 一个池化的 64KB 记录缓冲区（shaper.New 从 bytespool 取出，只有 Close 会
-	// 归还）和一个 cover 注入器，因此必须关闭。它声明在 stream 的 defer 之后，
-	// 因此会先执行（LIFO），避免向已关闭的流做冲刷。
+	// 此路径只接收，但 tx 仍持有池化的记录缓冲区与 cover 注入器，必须关闭。声明在 stream 的
+	// defer 之后，因此先执行（LIFO），避免向已关闭的流做冲刷。
 	defer s.tx.Close() //nolint:errcheck
 
 	frame, err := s.rx.ReadFrame()
 	err = classifyFirstReadError(err)
 	if err != nil {
-		log.Error("[STREAM] icmp read reply", "target", target, "err", err)
 		return nil, fmt.Errorf("read first reply frame: %w", err)
 	}
 
 	if frame.Type == protocol.FrameRST {
-		log.Error("[STREAM] icmp rejected", "target", target)
 		return nil, fmt.Errorf("icmp rejected by server")
 	}
 
@@ -356,39 +365,32 @@ func (h *StreamHandler) icmpStream(ctx context.Context, endpoint string, proto p
 	return frame.Payload, nil
 }
 
-// session 汇集了引导握手之后每种协议所需的东西：传输流、整形 c2s 写入器和
-// s2c 帧读取器。将它们一起构建（参见 newSession）使写入/读取对保持在同一个
-// 地方，这样 TCP、UDP 和 ICMP 在会话协商方式上不会发生偏离。
 type session struct {
 	stream transport.Stream
 	tx     shaper.Shaper
 	rx     *crypto.DecryptedReader
 }
 
-// newSession 打开流，发送引导记录（握手帧加上合并进来的任何帧），并派生会话的
-// 读取/写入对。
-// batchWindowMS 大于 0 时覆盖配置的 shaper 批处理窗口（UDP 使用较短的 1ms
-// 窗口，使数据报突发合并进单条记录）。
-func (h *StreamHandler) newSession(ctx context.Context, endpoint string, proto protocol.Proto, target string, method protocol.Method, extraFrames []protocol.Frame, batchWindowMS int) (*session, error) {
-	bs, err := h.openAndBootstrap(ctx, endpoint, proto, target, method, extraFrames)
+func (h *StreamHandler) newSession(ctx context.Context, req streamRequest) (*session, error) {
+	bs, err := h.openAndBootstrap(ctx, req)
 	if err != nil {
 		return nil, err
 	}
 	stream := bs.stream
 
-	txWriter, err := bs.sk.NewWriter(stream, crypto.DirC2S, method)
+	txWriter, err := bs.sk.NewWriter(stream, crypto.DirC2S, req.method)
 	if err != nil {
 		stream.Close() //nolint:errcheck
 		return nil, fmt.Errorf("c2s session writer: %w", err)
 	}
 
 	shaperCfg := h.shaperCfg
-	if batchWindowMS > 0 {
-		shaperCfg.BatchWindowMS = batchWindowMS
+	if req.batchWindowMS > 0 {
+		shaperCfg.BatchWindowMS = req.batchWindowMS
 	}
 	tx := shaper.New(txWriter, shaperCfg)
 
-	rx, err := bs.sk.NewReader(stream, crypto.DirS2C, method)
+	rx, err := bs.sk.NewReader(stream, crypto.DirS2C, req.method)
 	if err != nil {
 		_ = tx.Close()
 		stream.Close() //nolint:errcheck
@@ -398,32 +400,32 @@ func (h *StreamHandler) newSession(ctx context.Context, endpoint string, proto p
 	return &session{stream: stream, tx: tx, rx: rx}, nil
 }
 
-func (h *StreamHandler) openStream(ctx context.Context, endpoint string, proto protocol.Proto, target string, method protocol.Method, localConn net.Conn) error {
-	log.Debug("[STREAM] opening", "endpoint", endpoint, "target", target)
+func (h *StreamHandler) openStream(ctx context.Context, req streamRequest, localConn net.Conn) error {
+	log.Debug("[STREAM] opening", "endpoint", req.endpoint, "target", req.target)
 
-	var extraFrames []protocol.Frame
 	if localConn != nil {
 		_ = localConn.SetReadDeadline(time.Now().Add(8 * time.Millisecond))
-		buf := bytespool.Get(config.TCPStreamBufferSize)
+		// 这一读只取连接建立时已到达的首批数据，因此用最小档位起步。NewFrameDATA 会复制载荷，
+		// 缓冲可以拼帧后立即归还。
+		buf := bytespool.Get(protocol.MinRecordBufferSize)
 		n, rErr := localConn.Read(buf)
 		_ = localConn.SetReadDeadline(time.Time{})
 		if n > 0 {
-			extraFrames = []protocol.Frame{protocol.NewFrameDATA(buf[:n])}
+			req = req.withFrames(protocol.NewFrameDATA(buf[:n]))
 			log.Debug("[STREAM] merged first DATA into bootstrap record", "bytes", n, "read_err", rErr)
 		}
 		bytespool.MustPut(buf)
 	}
 
-	s, err := h.newSession(ctx, endpoint, proto, target, method, extraFrames, 0)
+	s, err := h.newSession(ctx, req)
 	if err != nil {
-		log.Error("[STREAM] bootstrap", "endpoint", endpoint, "target", target, "err", err)
-		return err
+		return fmt.Errorf("tcp bootstrap: %w", err)
 	}
 	defer s.tx.Close() //nolint:errcheck
-	log.Debug("[STREAM] handshake sent", "target", target)
+	log.Debug("[STREAM] handshake sent", "target", req.target)
 
-	err = h.relay(target, localConn, s.tx, s.rx, s.stream)
-	log.Debug("[STREAM] relay finished", "endpoint", endpoint, "target", target, "err", err)
+	err = h.relay(req.target, localConn, s.tx, s.rx, s.stream)
+	log.Debug("[STREAM] relay finished", "endpoint", req.endpoint, "target", req.target, "err", err)
 	return err
 }
 
@@ -433,11 +435,8 @@ func (h *StreamHandler) relay(target string, localConn net.Conn, tx shaper.Shape
 
 	closeAll := relay.CloseBoth(stream, localConn)
 
-	// 驱逐即将到来的 slot 上的空闲流：一旦 slot 处于到期（连接超过时长/字节上限）
-	// 或降级（确认变慢）状态，空闲达到 ExpiringStreamDrainIdle 的流就是残留的
-	// keep-alive 或半关闭连接——提前关闭它，使 slot 的轮换/退役不必等到完整的
-	// 空闲超时。活跃流（有数据流动）会重置中继的空闲时钟，永远不会被 drain。
-	// 传输层未实现 SlotDrainingStream 的流保持原有行为。
+	// 提前关闭即将被驱逐的 slot 上的空闲流：它们就是残留的 keep-alive 或半关闭连接，关掉能
+	// 让 slot 的轮换不必等完整的空闲超时。
 	var drainWhen func() bool
 	if ds, ok := stream.(transport.SlotDrainingStream); ok {
 		drainWhen = ds.SlotDraining
@@ -470,20 +469,27 @@ func (h *StreamHandler) relay(target string, localConn net.Conn, tx shaper.Shape
 	return nil
 }
 
+// 读缓冲按需增长；TCP 上缩短缓冲只会多几次 Read，不会丢数据。
 func (h *StreamHandler) copyLocalToRemote(src net.Conn, tx shaper.Shaper, signalActivity func()) error {
-	buf := bytespool.Get(config.TCPStreamBufferSize)
-	defer bytespool.MustPut(buf)
+	r := netbuf.NewReader(protocol.MinRecordBufferSize, config.TCPStreamBufferSize)
+	defer r.Release()
 	for {
+		buf := r.Buf()
 		n, err := src.Read(buf)
 		if n > 0 {
 			signalActivity()
 			stats.RecordRawBytesSent(n)
 			if pErr := tx.PushData(buf[:n]); pErr != nil {
 				_ = tx.Flush()
-				if errors.Is(pErr, io.ErrClosedPipe) {
+				// 整形器已进入关闭流程时 Push 返回 ErrClosed，与写端关闭一样属于收尾常态。
+				if errors.Is(pErr, io.ErrClosedPipe) || errors.Is(pErr, shaper.ErrClosed) {
 					return nil
 				}
 				return pErr
+			}
+			// 交出数据之后才换档：Grow 会把 buf 归还池。
+			if n == len(buf) {
+				r.Grow()
 			}
 		}
 		if err != nil {
@@ -504,33 +510,47 @@ func (h *StreamHandler) copyLocalToRemote(src net.Conn, tx shaper.Shaper, signal
 	}
 }
 
+// 下行预读必须与本地写解耦：h2 连接级窗口只在应用读 body 时归还，本地写一阻塞就会把本流的
+// 接收窗口钉死，进而拖住同一连接上的其他流。队列满即恢复背压，深度决定单流最多预读多少帧
+// （约 1–2MB 明文）。
+const remotePrefetchFrames = 64
+
 func (h *StreamHandler) copyRemoteToLocal(rx *crypto.DecryptedReader, dst net.Conn, signalActivity func(), m *stats.StreamMeter) error {
-	type frameItem struct {
+	// err 非空表示读端已终止；终态与数据走同一条队列，不再需要第二组完成信号。
+	type prefetchedFrame struct {
 		data []byte
 		fin  bool
 		rst  bool
+		err  error
 	}
 
-	ch := make(chan frameItem, 64)
-	readDone := make(chan error, 1)
+	frames := make(chan prefetchedFrame, remotePrefetchFrames)
 	done := make(chan struct{})
 	defer close(done)
 
 	go func() {
-		defer close(ch)
+		defer close(frames)
 		first := true
 		for {
+			// 消费者已返回时不再解密下一帧：send 上的 select 在两边都就绪时会随机选中队列。
+			select {
+			case <-done:
+				return
+			default:
+			}
+
 			frame, err := rx.ReadFrame()
 			if first {
 				first = false
 				err = classifyFirstReadError(err)
 			}
 			if err != nil {
-				if errors.Is(err, io.EOF) {
-					readDone <- nil
-				} else {
+				if !errors.Is(err, io.EOF) {
 					log.Debug("[STREAM] remote read error", "err", err)
-					readDone <- err
+					select {
+					case frames <- prefetchedFrame{err: err}:
+					case <-done:
+					}
 				}
 				return
 			}
@@ -538,36 +558,36 @@ func (h *StreamHandler) copyRemoteToLocal(rx *crypto.DecryptedReader, dst net.Co
 			switch frame.Type {
 			case protocol.FrameDATA:
 				signalActivity()
-				if len(frame.Payload) > 0 {
-					select {
-					case ch <- frameItem{data: frame.Payload}:
-					case <-done:
-						readDone <- nil
-						return
-					}
+				if len(frame.Payload) == 0 {
+					continue
+				}
+				select {
+				case frames <- prefetchedFrame{data: frame.Payload}:
+				case <-done:
+					return
 				}
 			case protocol.FrameFIN:
 				signalActivity()
 				select {
-				case ch <- frameItem{fin: true}:
+				case frames <- prefetchedFrame{fin: true}:
 				case <-done:
 				}
-				readDone <- nil
 				return
 			case protocol.FrameRST:
 				select {
-				case ch <- frameItem{rst: true}:
+				case frames <- prefetchedFrame{rst: true}:
 				case <-done:
 				}
-				readDone <- nil
 				return
 			case protocol.FramePADDING, protocol.FrameCOVER:
-				continue
 			}
 		}
 	}()
 
-	for item := range ch {
+	for item := range frames {
+		if item.err != nil {
+			return item.err
+		}
 		if item.rst {
 			return fmt.Errorf("%w", ErrStreamReset)
 		}
@@ -585,13 +605,11 @@ func (h *StreamHandler) copyRemoteToLocal(rx *crypto.DecryptedReader, dst net.Co
 		stats.RecordRawBytesRecv(len(item.data))
 		m.Add(len(item.data), "read_remote")
 	}
-
-	return <-readDone
+	return nil
 }
 
-// isTransientStreamError 报告流失败是否是瞬时或预期的（空闲超时、对端重置、
-// 握手被拒绝、HTTP/2 连接断开、流已关闭）。这类失败在连接死亡或服务器拒绝时
-// 常会同时命中许多流，应以 Debug 级别记录，而不是逐流刷满 Error 日志。
+// 瞬时或预期的流失败（空闲超时、对端重置、握手被拒、连接断开等）记 Debug：
+// 连接判死时它们会同时命中许多流。
 func isTransientStreamError(err error) bool {
 	if errors.Is(err, ErrStreamIdleTimeout) || errors.Is(err, ErrStreamReset) {
 		return true
@@ -599,21 +617,22 @@ func isTransientStreamError(err error) bool {
 	if errors.Is(err, ErrServerRejectedHandshake) || transport.IsHandshakeRejected(err) {
 		return true
 	}
+	if errors.Is(err, transport.ErrConnRetired) {
+		return true
+	}
 	if err == nil {
 		return false
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "client connection lost") ||
+		strings.Contains(msg, "force closed via clientconn.close") ||
 		strings.Contains(msg, "http2: stream closed") ||
 		strings.Contains(msg, "connection reset by peer") ||
 		strings.Contains(msg, "broken pipe") ||
 		strings.Contains(msg, "connection was aborted")
 }
 
-// isLocalConnClosedError 报告 err 是否表示本地连接已消失（我们自己关闭了它，
-// 或对端拒绝/重置了它），而不是流级别的失败。它刻意不把 "connection reset by
-// peer" 归类进去：该情况由 isTransientStreamError 负责，如果两者都归类同一个
-// 字符串，同一个失败会因先执行哪个检查而被报告成两种不同的东西。
+// 刻意不归类"connection reset by peer"：那是流级别失败，由 isTransientStreamError 负责。
 func isLocalConnClosedError(err error) bool {
 	if err == nil {
 		return false
@@ -629,7 +648,6 @@ func isLocalConnClosedError(err error) bool {
 		strings.Contains(msg, "broken pipe")
 }
 
-// encodedLen 返回一组帧的总线上大小（头部 + 载荷）。
 func encodedLen(frames []protocol.Frame) int {
 	total := 0
 	for _, f := range frames {
@@ -645,38 +663,48 @@ type UDPExchange struct {
 	target    string
 	lastSeen  atomic.Int64 // UnixNano，由 Send/Receive 写入，由 LastSeen 读取
 	firstRead atomic.Bool  // 在首次 ReadFrame 时置位，启用拒绝分类
+	closed    atomic.Bool  // 在 Close 开始时置位，使并发的 Send 快速失败
 	mu        sync.Mutex
 	closeOnce sync.Once
+}
+
+// udpCloseGrace 是 UDP 交换优雅收尾的预算：FIN/Flush/tx.Close 可能排在该流 shaper 的
+// 写锁后面，而 shaper 的写最终排进同一条 HTTP/2 连接的唯一写循环。预算耗尽后直接发起
+// 关流（取消请求），阻塞的写随即失败；连接级停写由 WriteByteTimeout 兜底，因此 FIN
+// 只是尽力而为，服务端在客户端关流时同样会立即回收关联。
+const udpCloseGrace = time.Second
+
+// 手工拼装不经过整形器的预冲刷边界，可用载荷必须自己算：明文上限减去 target 与帧头
+// 9 字节（3+3+3）。
+func bootstrapMaxPayload(target string) int {
+	return protocol.MaxWriteRecordPlaintext - len(target) - 9
 }
 
 func (h *StreamHandler) OpenUDPExchange(ctx context.Context, target string, method protocol.Method, firstPayload []byte) (*UDPExchange, error) {
 	stats.RecordUDPAssociation()
 	log.Debug("[UDP_EXCHANGE] opening", "target", target)
 
-	// 仅在合并后的明文保证能放进 MaxPlainRecordSize 时，才把第一个数据报合并进
-	// 引导记录：HANDSHAKE 帧（3 + 3 + len(target)）加上 DATAGRAM 帧头（3）再
-	// 加上载荷，填充会自行适应（记录将要溢出时 BuildPaddingFrame 会退避）。
-	// 过大的首个数据报（例如巨型包加上很长的目标名）改为在握手之后立即发送，
-	// 而不是让整个交换失败。
-	var extraFrames []protocol.Frame
+	// 只有合并后的明文保证能被加密层接受时才合并首个数据报（见 bootstrapMaxPayload）。过大
+	// 的首个数据报改为在握手之后立即发送，而不是让整个交换失败。
+	req := udpStreamRequest(target, method)
 	mergeFirst := false
 	if len(firstPayload) > 0 {
-		if len(firstPayload)+len(target)+9 <= protocol.MaxPlainRecordSize {
+		if len(firstPayload) <= bootstrapMaxPayload(target) {
 			mergeFirst = true
-			extraFrames = []protocol.Frame{protocol.NewFrameDATAGRAM(firstPayload)}
+			req = req.withFrames(protocol.NewFrameDATAGRAM(firstPayload))
+			// 合并进引导记录的数据报不走 Send，上行记账只能在这里补，放在创建点而不是各调用方。
+			stats.RecordRawBytesSent(len(firstPayload))
 			log.Debug("[UDP_EXCHANGE] merged first DATAGRAM into bootstrap record", "bytes", len(firstPayload))
 		} else {
 			log.Debug("[UDP_EXCHANGE] first DATAGRAM too large for bootstrap, sending after handshake", "bytes", len(firstPayload))
 		}
 	}
 
-	// UDP 使用较短的 1ms 批处理窗口而不是每个数据报强制冲刷：数据报突发会被
-	// 合并进单条加密记录，同时由空闲触发的定时器把稀疏流量（DNS、游戏）的交互
-	// 延迟限制在约 1ms。
-	s, err := h.newSession(ctx, config.EndpointUDP, protocol.ProtoUDP, target, method, extraFrames, 1)
+	// UDP 用较短的 1ms 批处理窗口而非每个数据报强制冲刷：突发合并进单条记录，空闲触发的
+	// 定时器把稀疏流量的延迟限制在约 1ms。
+	s, err := h.newSession(ctx, req.withBatchWindow(1))
 	if err != nil {
-		log.Error("[UDP_EXCHANGE] bootstrap", "target", target, "err", err)
-		return nil, err
+		return nil, fmt.Errorf("udp bootstrap: %w", err)
 	}
 
 	log.Debug("[UDP_EXCHANGE] opened", "target", target)
@@ -697,11 +725,20 @@ func (h *StreamHandler) OpenUDPExchange(ctx context.Context, target string, meth
 	return ue, nil
 }
 
+// 上行记账在这里、下行在 Receive：UDP 交换不经过 relay.Bidirectional，
+// 这两个方法是 UDP 流量进入「原始字节」计数器的唯一位置。
 func (ue *UDPExchange) Send(data []byte) error {
 	ue.mu.Lock()
 	defer ue.mu.Unlock()
+	// 检查必须在锁内：Close 先置位再抢同一把锁，已进入的 Send 仍排在 FIN 之前。
+	if ue.closed.Load() {
+		return shaper.ErrClosed
+	}
 	ue.lastSeen.Store(time.Now().UnixNano())
-	frame := protocol.NewFrameDATAGRAM(data)
+	// 用 NewFrameWithPayload 而非 NewFrameDATAGRAM：后者会复制一份载荷，而整形器在 PushFrame
+	// 内就会拷贝。载荷所有权不变（putPayload 为 false）。
+	frame := protocol.NewFrameWithPayload(protocol.FrameDATAGRAM, data)
+	stats.RecordRawBytesSent(len(data))
 	return ue.tx.PushFrame(frame)
 }
 
@@ -717,6 +754,8 @@ func (ue *UDPExchange) Receive() ([]byte, error) {
 		ue.lastSeen.Store(time.Now().UnixNano())
 		switch frame.Type {
 		case protocol.FrameDATAGRAM:
+			// 下行记账与 Send 配对：只有真正交给客户端的 DATAGRAM 才算流量。
+			stats.RecordRawBytesRecv(len(frame.Payload))
 			return frame.Payload, nil
 		case protocol.FrameFIN:
 			return nil, io.EOF
@@ -730,21 +769,35 @@ func (ue *UDPExchange) Receive() ([]byte, error) {
 	}
 }
 
-// Close 终止交换。它在关闭 shaper 与流之前发送一个 FIN 帧，使服务器能立即回收
-// 其 UDP 关联，而不是等待空闲超时。FIN 必须在 tx.Close 之前推入：shaper 一旦
-// 开始关闭，PushFrame 就会丢弃帧。并发的 Close 调用方（空闲清理、receiveLoop
-// 退出、发送失败）通过 closeOnce 和 mu 串行化。FIN 的投递是尽力而为；如果失败，
-// 服务器会回退到其空闲超时。
+// FIN 必须在 tx.Close 之前推入：shaper 一旦开始关闭，PushFrame 就会丢弃帧。收尾放在
+// 后台并在 udpCloseGrace 后直接发起关流：Send 可能正卡在网络写上并持有 ue.mu，同步等锁
+// 会让关闭被传输层背压拖到没有上界。关流本身也可能阻塞在连接写锁上，所以超时后不再等它。
 func (ue *UDPExchange) Close() error {
 	ue.closeOnce.Do(func() {
-		ue.mu.Lock()
-		defer ue.mu.Unlock()
-		if ue.tx != nil {
-			_ = ue.tx.PushFrame(protocol.NewFrameFIN())
-			_ = ue.tx.Flush()
-			_ = ue.tx.Close()
+		ue.closed.Store(true)
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			ue.mu.Lock()
+			if ue.tx != nil {
+				_ = ue.tx.PushFrame(protocol.NewFrameFIN())
+				_ = ue.tx.Flush()
+				_ = ue.tx.Close()
+			}
+			ue.mu.Unlock()
+			_ = ue.stream.Close()
+		}()
+
+		timer := time.NewTimer(udpCloseGrace)
+		defer timer.Stop()
+		select {
+		case <-done:
+		case <-timer.C:
+			// 关闭带未读响应体的 HTTP/2 流要拿连接写锁（标准库自己也标注这里可能
+			// 无限等待），不能让它把 Close 拖出预算；连接级停写由 WriteByteTimeout
+			// 兜底，这里只发起关闭。
+			go func() { _ = ue.stream.Close() }()
 		}
-		_ = ue.stream.Close()
 	})
 	return nil
 }

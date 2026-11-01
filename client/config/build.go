@@ -3,13 +3,13 @@ package config
 import (
 	"encoding/json"
 	"fmt"
-	"strings"
 
-	"github.com/nange/easyss/v3/client/tsnet"
-	sharedconfig "github.com/nange/easyss/v3/config"
+	"github.com/nange/easyss/v3/config"
+	"github.com/nange/easyss/v3/log"
+	"github.com/nange/easyss/v3/shaper"
 )
 
-func BuildSimpleConfig(s *sharedconfig.SimpleConfig) (*ClientConfig, error) {
+func BuildSimpleConfig(s *config.SimpleConfig) (*ClientConfig, error) {
 	if s.Server == "" {
 		return nil, fmt.Errorf("server is required")
 	}
@@ -21,11 +21,15 @@ func BuildSimpleConfig(s *sharedconfig.SimpleConfig) (*ClientConfig, error) {
 	if err != nil {
 		return nil, err
 	}
+	tunConfig, err := jsonTunConfig(s.TunConfig)
+	if err != nil {
+		return nil, err
+	}
 
 	cfg := &ClientConfig{
 		ConfigVersion: 3,
 		Servers: []*ServerProfile{{
-			Address:  s.Server,
+			Host:     s.Server,
 			Port:     s.ServerPort,
 			Password: s.Password,
 			Method:   s.Method,
@@ -41,7 +45,8 @@ func BuildSimpleConfig(s *sharedconfig.SimpleConfig) (*ClientConfig, error) {
 			EnableForwardDNS: s.EnableForwardDNS,
 			EnableTun2socks:  s.EnableTun2socks,
 			EnableQUIC:       s.EnableQUIC,
-			TunConfig:        jsonTunConfig(s.TunConfig),
+			TunMTU:           s.TunMTU,
+			TunConfig:        tunConfig,
 		},
 		Routing: RoutingConfig{
 			ProxyRule:  s.ProxyRule,
@@ -51,54 +56,50 @@ func BuildSimpleConfig(s *sharedconfig.SimpleConfig) (*ClientConfig, error) {
 		},
 		Transport: TransportConfig{
 			Protocol:     proto,
-			ConnCountMax: sharedconfig.DefaultConnCountMax,
+			ConnCountMax: config.DefaultConnCountMax,
 		},
-		Shaper: ShaperConfig{
-			BatchWindowMS: sharedconfig.DefaultBatchWindowMS,
+		Shaper: shaper.Config{
+			BatchWindowMS: config.DefaultBatchWindowMS,
 		},
-		Log: LogConfig{
+		Log: log.Config{
 			Level:    s.LogLevel,
 			FilePath: s.LogFilePath,
-		},
-		Tsnet: tsnet.Config{
-			Enable:       s.TsnetEnable,
-			AuthKey:      s.TsnetAuthKey,
-			ControlURL:   s.TsnetControlURL,
-			StateDir:     s.TsnetStateDir,
-			Hostname:     s.TsnetHostname,
-			ExtraSubnets: splitSubnets(s.TsnetExtraSubnets),
 		},
 		Timeout: s.Timeout,
 	}
 
 	if cfg.Servers[0].Port == 0 {
-		cfg.Servers[0].Port = sharedconfig.DefaultServerPort
+		cfg.Servers[0].Port = config.DefaultServerPort
 	}
 	if cfg.Servers[0].Method == "" {
-		cfg.Servers[0].Method = sharedconfig.DefaultMethod
+		cfg.Servers[0].Method = config.DefaultMethod
 	}
 	if cfg.Log.Level == "" {
-		cfg.Log.Level = sharedconfig.DefaultLogLevel
+		cfg.Log.Level = config.DefaultLogLevel
 	}
 	if cfg.Routing.ProxyRule == "" {
-		cfg.Routing.ProxyRule = sharedconfig.DefaultProxyRule
+		cfg.Routing.ProxyRule = config.DefaultProxyRule
 	}
 	if cfg.Routing.IPV6Rule == "" {
-		cfg.Routing.IPV6Rule = sharedconfig.DefaultIPV6Rule
+		cfg.Routing.IPV6Rule = config.DefaultIPV6Rule
 	}
-	if cfg.Local.HTTPPort == 0 && cfg.Local.SocksPort > 0 {
-		cfg.Local.HTTPPort = cfg.Local.SocksPort + 1000
-	}
+	// http_port 的推导（socks_port + DefaultHTTPPortOffset）在 applyDefaults 里，
+	// 两种模式共用同一实现；这里显式传进来的 HTTPPort 优先，不会被推导覆盖。
 
 	applyDefaults(cfg)
+	if err := cfg.validateServers(); err != nil {
+		return nil, err
+	}
 	return cfg, nil
 }
 
-func ApplySimpleOverrides(cfg *ClientConfig, s *sharedconfig.SimpleConfig) {
+// 覆盖后必须再过一次 validateServers：命令行同样可能把端口写进 host（-s example.com:443），
+// 不校验就会拼出 https://example.com:443:443 这种要等到拨号才暴露的错误。
+func ApplySimpleOverrides(cfg *ClientConfig, s *config.SimpleConfig) error {
 	srv := cfg.DefaultServer()
 	if srv != nil {
 		if s.Server != "" {
-			srv.Address = s.Server
+			srv.Host = s.Server
 		}
 		if s.ServerPort > 0 {
 			srv.Port = s.ServerPort
@@ -118,9 +119,6 @@ func ApplySimpleOverrides(cfg *ClientConfig, s *sharedconfig.SimpleConfig) {
 	}
 	if s.LocalPort > 0 {
 		cfg.Local.SocksPort = s.LocalPort
-		if cfg.Local.HTTPPort == 0 {
-			cfg.Local.HTTPPort = s.LocalPort + 1000
-		}
 	}
 	if s.HTTPPort > 0 {
 		cfg.Local.HTTPPort = s.HTTPPort
@@ -139,7 +137,7 @@ func ApplySimpleOverrides(cfg *ClientConfig, s *sharedconfig.SimpleConfig) {
 	}
 	if s.Timeout > 0 {
 		// 命令行/简单模式覆盖同样要过归一化：它是全部派生超时的唯一旋钮。
-		cfg.Timeout = sharedconfig.NormalizeTimeout(s.Timeout)
+		cfg.Timeout = config.NormalizeTimeout(s.Timeout)
 	}
 	if s.LogLevel != "" {
 		cfg.Log.Level = s.LogLevel
@@ -159,62 +157,46 @@ func ApplySimpleOverrides(cfg *ClientConfig, s *sharedconfig.SimpleConfig) {
 	if s.EnableQUIC {
 		cfg.Local.EnableQUIC = true
 	}
+	if s.TunMTU > 0 {
+		// 与上面的 timeout 同理：覆盖值也要过唯一的归一化入口。
+		cfg.Local.TunMTU = config.NormalizeTunMTU(s.TunMTU)
+	}
 	if s.BindAll {
 		cfg.Local.BindAll = true
 	}
 	if s.TunConfig != "" {
-		cfg.Local.TunConfig = jsonTunConfig(s.TunConfig)
-	}
-	if s.TsnetEnable {
-		cfg.Tsnet.Enable = true
-	}
-	if s.TsnetAuthKey != "" {
-		cfg.Tsnet.AuthKey = s.TsnetAuthKey
-	}
-	if s.TsnetControlURL != "" {
-		cfg.Tsnet.ControlURL = s.TsnetControlURL
-	}
-	if s.TsnetStateDir != "" {
-		cfg.Tsnet.StateDir = s.TsnetStateDir
-	}
-	if s.TsnetHostname != "" {
-		cfg.Tsnet.Hostname = s.TsnetHostname
-	}
-	if s.TsnetExtraSubnets != "" {
-		cfg.Tsnet.ExtraSubnets = splitSubnets(s.TsnetExtraSubnets)
-	}
-}
-
-func splitSubnets(s string) []string {
-	if s == "" {
-		return nil
-	}
-	var res []string
-	for _, part := range strings.Split(s, ",") {
-		part = strings.TrimSpace(part)
-		if part != "" {
-			res = append(res, part)
+		tunConfig, err := jsonTunConfig(s.TunConfig)
+		if err != nil {
+			return err
 		}
+		cfg.Local.TunConfig = tunConfig
 	}
-	return res
+
+	// 覆盖完成后再补齐 http_port，与 applyDefaults 共用唯一实现 normalizeHTTPPort。
+	normalizeHTTPPort(cfg)
+
+	return cfg.validateServers()
 }
 
-func jsonTunConfig(s string) json.RawMessage {
+// jsonTunConfig 把简化模式里的 tun_config 字符串转成 RawMessage。简化模式把它当字符串
+// 存、完整模式直接存 JSON 对象，两者必须过同一个形状校验。
+func jsonTunConfig(s string) (json.RawMessage, error) {
 	if s == "" {
-		return nil
+		return nil, nil
 	}
-	return json.RawMessage(s)
+	raw := json.RawMessage(s)
+	if _, err := ParseTunConfig(raw); err != nil {
+		return nil, err
+	}
+	return raw, nil
 }
 
-// OutboundProtoToProtocol 将面向用户的 outbound_proto 值映射为传输协议。
-// 目前只实现了 h2，因此 "native"（历史上的空值）和 "h2" 都选中它——该映射
-// 由配置文件与 --outbound-proto 标志共用，两者不会发生偏离。
 func OutboundProtoToProtocol(proto string) (string, error) {
 	switch proto {
 	case "", "native":
-		return sharedconfig.DefaultProtocol, nil
-	case sharedconfig.DefaultProtocol:
-		return sharedconfig.DefaultProtocol, nil
+		return config.DefaultProtocol, nil
+	case config.DefaultProtocol:
+		return config.DefaultProtocol, nil
 	default:
 		return "", fmt.Errorf("invalid outbound_proto %q: valid values are empty, native, h2", proto)
 	}

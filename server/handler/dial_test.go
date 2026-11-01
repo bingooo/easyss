@@ -10,21 +10,19 @@ import (
 	"time"
 )
 
-// dialAttemptRecord 是一次假拨号的记录：拨给哪个地址，以及本次拨号拿到的预算
-// （ctx 截止时间与调用时刻之差；调用方没有截止时间时为 0）。
+// dialAttemptRecord 记录一次假拨号的地址与预算（ctx 截止时间与调用时刻之差，无截止时间时为 0）。
 type dialAttemptRecord struct {
 	addr   string
 	budget time.Duration
 }
 
-// stubDialAttempt 替换 dialAttempt，记录每个候选拿到的地址与预算，并把实际拨号
-// 交给 behavior。预算切分是这里唯一无法用真实网络稳定复现的行为，因此测试注入
-// 确定性的假拨号（可以在预算内"挂起"，模拟被墙 IP 的 SYN 黑洞）。
-func stubDialAttempt(t *testing.T, behavior func(ctx context.Context, addr string) (net.Conn, error)) *[]dialAttemptRecord {
+// stubDialAttempt 记录每个候选的地址与预算，把实际拨号交给 behavior：
+// 预算切分无法用真实网络稳定复现，只能在假拨号里"挂起"来模拟 SYN 黑洞。
+func stubDialAttempt(t *testing.T, behavior func(ctx context.Context, addr string) (net.Conn, error)) (*[]dialAttemptRecord, *dialer) {
 	t.Helper()
 	var records []dialAttemptRecord
-	prev := dialAttempt
-	dialAttempt = func(_ *net.Dialer, ctx context.Context, _, addr string) (net.Conn, error) {
+	d := newTestDialer()
+	d.deps.attempt = func(_ *net.Dialer, ctx context.Context, _, addr string) (net.Conn, error) {
 		rec := dialAttemptRecord{addr: addr}
 		if deadline, ok := ctx.Deadline(); ok {
 			rec.budget = time.Until(deadline)
@@ -32,28 +30,21 @@ func stubDialAttempt(t *testing.T, behavior func(ctx context.Context, addr strin
 		records = append(records, rec)
 		return behavior(ctx, addr)
 	}
-	t.Cleanup(func() { dialAttempt = prev })
-	return &records
+	return &records, d
 }
 
-// hangUntilBudget 模拟 SYN 黑洞：一直阻塞到本次预算耗尽，再返回超时错误。
 func hangUntilBudget(ctx context.Context, addr string) (net.Conn, error) {
 	<-ctx.Done()
 	return nil, fmt.Errorf("dial %s: %w", addr, ctx.Err())
 }
 
-// refuseNow 模拟立刻被拒绝的候选（连接被 RST / 端口未监听）。
 func refuseNow(_ context.Context, addr string) (net.Conn, error) {
 	return nil, fmt.Errorf("dial %s: connection refused", addr)
 }
 
-// shrinkDialAttemptMinBudget 把候选的最小预算调小，使测试可以用毫秒级的总预算
-// 验证切分，而不必真的等满 2s。
-func shrinkDialAttemptMinBudget(t *testing.T, d time.Duration) {
-	t.Helper()
-	prev := dialAttemptMinBudget
-	dialAttemptMinBudget = d
-	t.Cleanup(func() { dialAttemptMinBudget = prev })
+// shrinkDialAttemptMinBudget 调小候选的最小预算，让测试用毫秒级总预算验证切分，不必等满 2s。
+func shrinkDialAttemptMinBudget(d *dialer, budget time.Duration) {
+	d.attemptMinBudget = budget
 }
 
 func testAddrs(t *testing.T, raw ...string) []netip.Addr {
@@ -65,9 +56,10 @@ func testAddrs(t *testing.T, raw ...string) []netip.Addr {
 	return addrs
 }
 
-// TestOrderByFamily 固定候选的排序规则：首选族先出现，两族交错，族内保持解析器
-// 给出的顺序（RFC 6724 已经排过），无偏好时原样返回。
+// TestOrderByFamily 固定排序规则：首选族先出现、两族交错，族内保持解析器顺序（RFC 6724 已排过）。
 func TestOrderByFamily(t *testing.T) {
+	t.Parallel()
+
 	v4, v6 := netip.MustParseAddr(testPublicV4), netip.MustParseAddr(testPublicV6)
 	v4b, v6b := netip.MustParseAddr("93.184.216.35"), netip.MustParseAddr("2606:2800:220:1:248:1893:25c8:1947")
 
@@ -111,6 +103,7 @@ func TestOrderByFamily(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			before := make([]netip.Addr, len(tt.addrs))
 			copy(before, tt.addrs)
 
@@ -133,33 +126,33 @@ func TestOrderByFamily(t *testing.T) {
 	}
 }
 
-// TestDialCandidatesInterleavesFamilies 验证 dialCandidates 端到端地使用交错排序：
-// 首选族的第一个地址在最前，另一个族的第一个地址紧随其后。
+// TestDialCandidatesInterleavesFamilies 验证 dialer.candidates 端到端使用交错排序。
 func TestDialCandidatesInterleavesFamilies(t *testing.T) {
-	stubResolveHost(t, []string{testPublicV6, testPublicV4}, nil)
+	t.Parallel()
+
+	_, d := stubResolveHost(t, []string{testPublicV6, testPublicV4}, nil)
 	prefer := netip.MustParseAddr(testPublicV4)
 
-	got, err := dialCandidates(withPreferredFamily(t.Context(), prefer), "example.com:443")
+	got, err := d.candidates(withPreferredFamily(t.Context(), prefer), "example.com:443")
 	if err != nil {
-		t.Fatalf("dialCandidates: %v", err)
+		t.Fatalf("candidates: %v", err)
 	}
 	if len(got) != 2 || got[0] != prefer || got[1] != netip.MustParseAddr(testPublicV6) {
 		t.Fatalf("candidates = %v, want [%v %v]", got, prefer, testPublicV6)
 	}
 }
 
-// TestDialAddrsSharedBudget 验证整批候选共享一份拨号预算：每个候选只拿到剩余预算
-// 的一部分（而不是各吃满一份 d.Timeout），预算用尽后停止尝试，总耗时回到单份
-// d.Timeout 之内。旧行为下 3 个黑洞候选会串行吃掉 3×d.Timeout。
+// TestDialAddrsSharedBudget 验证整批候选共享一份拨号预算：各吃满一份 d.Timeout 的话，
+// 3 个黑洞候选会串行吃掉 3×d.Timeout，而换候选本该只等一个子预算。
 func TestDialAddrsSharedBudget(t *testing.T) {
-	shrinkDialAttemptMinBudget(t, 40*time.Millisecond)
-	records := stubDialAttempt(t, hangUntilBudget)
+	records, d := stubDialAttempt(t, hangUntilBudget)
+	shrinkDialAttemptMinBudget(d, 40*time.Millisecond)
 
 	const budget = 300 * time.Millisecond
-	dialer := outboundDialer(budget, 0)
+	nd := outboundDialer(budget, 0)
 
 	start := time.Now()
-	_, err := dialAddrs(t.Context(), dialer, "tcp", "example.com:443", testAddrs(t, "1.1.1.1", "1.1.1.2", "1.1.1.3"))
+	_, err := d.dialAddrs(t.Context(), nd, "tcp", "example.com:443", testAddrs(t, "1.1.1.1", "1.1.1.2", "1.1.1.3"))
 	elapsed := time.Since(start)
 
 	if err == nil {
@@ -171,8 +164,6 @@ func TestDialAddrsSharedBudget(t *testing.T) {
 	if elapsed > 2*budget {
 		t.Fatalf("dialAddrs took %v, want at most one shared budget (%v) instead of one per candidate", elapsed, budget)
 	}
-	// 第一个候选只拿 1/3 的预算，最后一个拿到剩余的全部：这是"换候选只需等一个
-	// 子预算"的依据。
 	if first := (*records)[0].budget; first > budget/3+60*time.Millisecond {
 		t.Fatalf("first candidate got %v, want roughly one third of the budget (%v)", first, budget/3)
 	}
@@ -181,52 +172,80 @@ func TestDialAddrsSharedBudget(t *testing.T) {
 	}
 }
 
-// TestDialAddrsBudgetFloor 验证单个候选的最小预算：按候选数均分后低于
-// dialAttemptMinBudget 时按最小值给（剩余预算不足时给剩余量），因此尝试次数远小于
-// 候选数，并且每个候选拿到的是下限而不是"总预算/候选数"。
+// TestAttemptDeadline 钉住预算切分公式（与 net.Dialer 的 partialDeadline 同构）：剩余预算按
+// 剩余候选数均分，低于 dialAttemptMinBudget（默认 2s）按下限给，剩余不足下限则全部用掉。
+func TestAttemptDeadline(t *testing.T) {
+	t.Parallel()
+
+	now := time.Unix(0, 0)
+
+	for _, tc := range []struct {
+		name           string
+		budget         time.Duration
+		candidatesLeft int
+		want           time.Duration
+	}{
+		{"均分高于下限", 9 * time.Second, 3, 3 * time.Second},
+		{"均分低于下限：按下限给", 10 * time.Second, 10, 2 * time.Second},
+		{"剩余预算本身低于下限：全部用掉", 1500 * time.Millisecond, 10, 1500 * time.Millisecond},
+		{"只剩一个候选：拿到全部剩余", 9 * time.Second, 1, 9 * time.Second},
+		{"预算已耗尽", 0, 5, 0},
+		{"预算已超时", -time.Second, 5, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := attemptDeadline(now, now.Add(tc.budget), tc.candidatesLeft, defaultDialAttemptMinBudget)
+			if want := now.Add(tc.want); !got.Equal(want) {
+				t.Fatalf("attemptDeadline(budget=%v, candidatesLeft=%d) = %v, want %v",
+					tc.budget, tc.candidatesLeft, got.Sub(now), tc.want)
+			}
+		})
+	}
+}
+
+// TestDialAddrsBudgetFloor 验证最小预算：均分后低于 dialAttemptMinBudget 时按下限给，
+// 候选不会被逐个试满。断言刻意只涉及与调度无关的事实——尝试次数取决于计时器粒度与 CI 负载，
+// 精确的切分公式由 TestAttemptDeadline 覆盖。
 func TestDialAddrsBudgetFloor(t *testing.T) {
 	const (
 		budget    = 100 * time.Millisecond
 		minBudget = 40 * time.Millisecond
+		// slack 容忍测量粒度：假拨号用 time.Until 读预算，只会比切分出的份额小。
+		slack = 20 * time.Millisecond
 	)
-	shrinkDialAttemptMinBudget(t, minBudget)
-	records := stubDialAttempt(t, hangUntilBudget)
+	records, d := stubDialAttempt(t, hangUntilBudget)
+	shrinkDialAttemptMinBudget(d, minBudget)
 
-	dialer := outboundDialer(budget, 0)
+	nd := outboundDialer(budget, 0)
 	addrs := testAddrs(t, "1.1.1.1", "1.1.1.2", "1.1.1.3", "1.1.1.4", "1.1.1.5",
 		"1.1.1.6", "1.1.1.7", "1.1.1.8", "1.1.1.9", "1.1.1.10")
 
-	if _, err := dialAddrs(t.Context(), dialer, "tcp", "example.com:443", addrs); err == nil {
+	if _, err := d.dialAddrs(t.Context(), nd, "tcp", "example.com:443", addrs); err == nil {
 		t.Fatal("dialAddrs should fail when every candidate hangs")
 	}
 
-	// 100ms 预算按 40ms 一片只能切出 2~4 次尝试（最后一片按剩余量给，切分点落在
-	// 计时器粒度上时会多切一次）；没有下限时这里会试满 10 个候选。
-	if n := len(*records); n < 2 || n > 4 {
-		t.Fatalf("attempts = %d, want the budget spent in min-budget slices (2..4) instead of one per candidate (%d)",
+	// 共享预算必须限制尝试次数：没有下限时每次只拿 100ms/10 = 10ms，足以试完 10 个候选。
+	if n := len(*records); n >= len(addrs) {
+		t.Fatalf("attempts = %d, want fewer than the %d candidates: the shared budget must bound the loop",
 			n, len(addrs))
 	}
 
-	// 平摊（100ms/10 = 10ms）与下限（40ms）的区别：至少要有一个候选拿到下限级别
-	// 的预算，否则说明切分退回了平均分配。
-	var largest time.Duration
-	for _, rec := range *records {
-		largest = max(largest, rec.budget)
-	}
-	if largest < 30*time.Millisecond {
-		t.Fatalf("largest per-candidate budget = %v, want the dialAttemptMinBudget floor (%v)", largest, minBudget)
+	// 没有候选拿到超过下限的预算：既排除整份预算给第一个候选，也排除按候选数平摊。
+	for i, rec := range *records {
+		if rec.budget > minBudget+slack {
+			t.Fatalf("attempt %d (%s) got %v, want at most one min-budget slice (%v): the split must not hand out a flat budget/candidates share",
+				i+1, rec.addr, rec.budget, minBudget)
+		}
 	}
 }
 
-// TestDialAddrsBudgetExhaustedKeepsDialError 验证预算耗尽不是"客户端离开"：返回的
-// 必须是最后一个真实的拨号错误，否则上层的 isTransientStreamError 会把真正的拨号
-// 故障静音成预期拆除。
+// TestDialAddrsBudgetExhaustedKeepsDialError 验证预算耗尽不返回 errClientGone：否则上层
+// isTransientStreamError 会把真正的拨号故障静音成预期拆除。
 func TestDialAddrsBudgetExhaustedKeepsDialError(t *testing.T) {
-	shrinkDialAttemptMinBudget(t, 20*time.Millisecond)
-	stubDialAttempt(t, hangUntilBudget)
+	_, d := stubDialAttempt(t, hangUntilBudget)
+	shrinkDialAttemptMinBudget(d, 20*time.Millisecond)
 
-	dialer := outboundDialer(60*time.Millisecond, 0)
-	_, err := dialAddrs(t.Context(), dialer, "tcp", "example.com:443", testAddrs(t, "1.1.1.1", "1.1.1.2"))
+	nd := outboundDialer(60*time.Millisecond, 0)
+	_, err := d.dialAddrs(t.Context(), nd, "tcp", "example.com:443", testAddrs(t, "1.1.1.1", "1.1.1.2"))
 	if err == nil {
 		t.Fatal("dialAddrs should fail when the budget runs out")
 	}
@@ -238,19 +257,17 @@ func TestDialAddrsBudgetExhaustedKeepsDialError(t *testing.T) {
 	}
 }
 
-// TestDialAddrsCallerGoneWinsOverBudget 验证调用方离开优先于预算：即使整体预算还
-// 没到，只要请求 ctx 失效就必须返回 errClientGone（客户端拆除走静默路径）。
+// TestDialAddrsCallerGoneWinsOverBudget 验证调用方离开优先于预算：请求 ctx 失效即返回 errClientGone。
 func TestDialAddrsCallerGoneWinsOverBudget(t *testing.T) {
-	shrinkDialAttemptMinBudget(t, 50*time.Millisecond)
-
 	ctx, cancel := context.WithCancel(t.Context())
-	records := stubDialAttempt(t, func(_ context.Context, addr string) (net.Conn, error) {
+	records, d := stubDialAttempt(t, func(_ context.Context, addr string) (net.Conn, error) {
 		cancel() // 第一次拨号期间客户端离开
 		return nil, fmt.Errorf("dial %s: operation was canceled", addr)
 	})
+	shrinkDialAttemptMinBudget(d, 50*time.Millisecond)
 
-	dialer := outboundDialer(5*time.Second, 0)
-	_, err := dialAddrs(ctx, dialer, "tcp", "example.com:443", testAddrs(t, "1.1.1.1", "1.1.1.2", "1.1.1.3"))
+	nd := outboundDialer(5*time.Second, 0)
+	_, err := d.dialAddrs(ctx, nd, "tcp", "example.com:443", testAddrs(t, "1.1.1.1", "1.1.1.2", "1.1.1.3"))
 	if !errors.Is(err, errClientGone) {
 		t.Fatalf("dialAddrs = %v, want errClientGone once the caller's context is gone", err)
 	}
@@ -259,12 +276,13 @@ func TestDialAddrsCallerGoneWinsOverBudget(t *testing.T) {
 	}
 }
 
-// TestDialAddrsWithoutTimeout 验证 d.Timeout <= 0 时不加整体预算：候选仍逐个尝试，
-// 截止时间完全由调用方 ctx 决定（此时不该给候选编造一个 deadline）。
+// TestDialAddrsWithoutTimeout 验证 d.Timeout <= 0 时不加整体预算，截止时间全由调用方 ctx 决定。
 func TestDialAddrsWithoutTimeout(t *testing.T) {
-	records := stubDialAttempt(t, refuseNow)
+	t.Parallel()
 
-	_, err := dialAddrs(t.Context(), &net.Dialer{}, "tcp", "example.com:443", testAddrs(t, "1.1.1.1", "1.1.1.2"))
+	records, d := stubDialAttempt(t, refuseNow)
+
+	_, err := d.dialAddrs(t.Context(), &net.Dialer{}, "tcp", "example.com:443", testAddrs(t, "1.1.1.1", "1.1.1.2"))
 	if err == nil {
 		t.Fatal("dialAddrs should return the last failure")
 	}
@@ -278,10 +296,11 @@ func TestDialAddrsWithoutTimeout(t *testing.T) {
 	}
 }
 
-// TestDialAddrsEmptyCandidates 验证空候选列表返回错误而不是 (nil, nil)：后者会让
-// 调用方拿到一个 nil 连接。
+// TestDialAddrsEmptyCandidates 验证空候选列表返回错误而不是 (nil, nil)。
 func TestDialAddrsEmptyCandidates(t *testing.T) {
-	conn, err := dialAddrs(t.Context(), outboundDialer(time.Second, 0), "tcp", "example.com:443", nil)
+	t.Parallel()
+
+	conn, err := newTestDialer().dialAddrs(t.Context(), outboundDialer(time.Second, 0), "tcp", "example.com:443", nil)
 	if err == nil {
 		t.Fatal("dialAddrs should reject an empty candidate list")
 	}
@@ -290,21 +309,20 @@ func TestDialAddrsEmptyCandidates(t *testing.T) {
 	}
 }
 
-// TestDialAddrsFallbackKeepsBudget 验证候选失败后仍然回退到下一个，并且整体耗时
-// 受共享预算约束（成功路径不受子预算切分的负面影响）。
+// TestDialAddrsFallbackKeepsBudget 验证候选失败后回退到下一个，成功路径不受子预算切分影响。
 func TestDialAddrsFallbackKeepsBudget(t *testing.T) {
-	shrinkDialAttemptMinBudget(t, 20*time.Millisecond)
 	conn := newStubConn(nil)
 	t.Cleanup(func() { _ = conn.Close() })
 
-	records := stubDialAttempt(t, func(_ context.Context, addr string) (net.Conn, error) {
+	records, d := stubDialAttempt(t, func(_ context.Context, addr string) (net.Conn, error) {
 		if addr == "1.1.1.2:443" {
 			return conn, nil
 		}
 		return nil, fmt.Errorf("dial %s: connection refused", addr)
 	})
+	shrinkDialAttemptMinBudget(d, 20*time.Millisecond)
 
-	got, err := dialAddrs(t.Context(), outboundDialer(time.Second, 0), "tcp", "example.com:443", testAddrs(t, "1.1.1.1", "1.1.1.2"))
+	got, err := d.dialAddrs(t.Context(), outboundDialer(time.Second, 0), "tcp", "example.com:443", testAddrs(t, "1.1.1.1", "1.1.1.2"))
 	if err != nil {
 		t.Fatalf("dialAddrs: %v", err)
 	}

@@ -1,25 +1,27 @@
 package config
 
 import (
+	"bytes"
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
+	"net"
+	"net/netip"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	utls "github.com/refraction-networking/utls"
 
-	"github.com/nange/easyss/v3/client/tsnet"
 	"github.com/nange/easyss/v3/config"
 	"github.com/nange/easyss/v3/log"
+	"github.com/nange/easyss/v3/shaper"
 	"github.com/nange/easyss/v3/util"
 )
 
-// DirectDNSServers 是用于直连（不走代理）DNS 查询的公共 DNS 服务器列表。
-// IPv4 项在前、IPv6 项在后，顺序是唯一的优先级依据：服务端域名的预解析按顺序
-// 串行尝试（见 dns.Cache.PrePopulateWithFallback），在线查询则把整个列表并发
-// 下发、取首个成功结果（见 dns.QueryWithBuiltinFirst 与 proxy.resolveDirectDNS）。
-// 区域内可达性有差异的服务器（如北京联通 123.123.123.123）排在国家级公共 DNS 之后。
+// DirectDNSServers 是直连 DNS 查询的公共 DNS 列表，IPv4 在前、IPv6 在后。顺序即优先级：
+// 预解析按顺序串行尝试，在线查询并发下发取首个成功。
 var DirectDNSServers = []string{
 	"223.5.5.5:53",       // AliDNS
 	"119.29.29.29:53",    // DNSPod
@@ -29,25 +31,56 @@ var DirectDNSServers = []string{
 	"[2400:3200:baba::1]:53",
 }
 
-// ProxyDNSServer 是通过隧道代理 DNS 查询时使用的上游 DNS 服务器。
 const ProxyDNSServer = "8.8.8.8:53"
 
-// DefaultSystemDNS 是写入系统解析器配置的保底裸 IPv4，等于 DirectDNSServers
-// 中第一个 IPv4 项。TUN 启动时实际取值优先用 dns.PreferredSystemDNS()——本会话
-// 实测可达的内置直连 DNS，其次是实测可达的系统 DNS（DHCP/内网解析器，覆盖
-// "全部内置 DNS 都不可用"的网络）——两者都没有记录时才回退到这里。
+// DefaultSystemDNS 是写入系统解析器配置的保底裸 IPv4，等于 DirectDNSServers 的第一个 IPv4
+// 项。TUN 启动时优先用 dns.PreferredSystemDNS()，都没有记录时才回退到这里。
 const DefaultSystemDNS = "223.5.5.5"
 
+// ServerProfile 描述一个服务端端点。Host 是主机名或 IP 字面量，不含端口；Name 是托盘
+// 菜单的展示名（切换失败通知也会带上），服务器身份始终是 host:port。
 type ServerProfile struct {
-	Address  string `json:"address"`
+	Host     string `json:"host"`
 	Port     int    `json:"port"`
 	Password string `json:"password"`
 	Method   string `json:"method"`
 	SNI      string `json:"sn"`
 	CAPath   string `json:"ca_path"`
 	Default  bool   `json:"default"`
+	Name     string `json:"name"`
 }
 
+// UnmarshalJSON 兼容旧版完整模式配置里的 servers[].address（等价于 host）。新旧键同时出现
+// 属于歧义配置，直接报错而不是静默选择其中一个。
+func (s *ServerProfile) UnmarshalJSON(data []byte) error {
+	type plain ServerProfile
+	var p plain
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+
+	var legacy struct {
+		Address string `json:"address"`
+	}
+	if err := json.Unmarshal(data, &legacy); err != nil {
+		return err
+	}
+
+	if legacy.Address != "" {
+		if p.Host != "" {
+			return fmt.Errorf(`servers[]: both "host" (%q) and deprecated "address" (%q) are set; use "host" only`,
+				p.Host, legacy.Address)
+		}
+		p.Host = legacy.Address
+	}
+
+	*s = ServerProfile(p)
+	return nil
+}
+
+// LocalConfig 是本地入口配置。EnableForwardDNS 只服务路由器透明代理部署：需要 socks_port > 0
+// （否则 runner 拒绝启动），TUN 未生效时由转发器逐条拒答——没有 TUN 的转发只剩直连解析。
+// 移动端没有发布 TUN 运行期状态的会话，mobile.Start 直接拒绝该配置。
 type LocalConfig struct {
 	SocksPort        int             `json:"socks_port"`
 	HTTPPort         int             `json:"http_port"`
@@ -56,6 +89,7 @@ type LocalConfig struct {
 	EnableForwardDNS bool            `json:"enable_forward_dns"`
 	EnableTun2socks  bool            `json:"enable_tun2socks"`
 	EnableQUIC       bool            `json:"enable_quic"`
+	TunMTU           int             `json:"tun_mtu,omitempty"`
 	TunConfig        json.RawMessage `json:"tun_config,omitempty"`
 }
 
@@ -71,33 +105,39 @@ type TransportConfig struct {
 	ConnCountMax      int     `json:"conn_count_max"`
 	StreamThreshold   int     `json:"stream_threshold"`
 	PrioritySlotRatio float64 `json:"priority_slot_ratio"`
-	ConnMaxBytes      int64   `json:"conn_max_bytes"` // 连接在任一方向上承载的最大字节数，0 表示使用默认值
+	ConnMaxBytes      int64   `json:"conn_max_bytes"` // 单个连接在任一方向承载的最大字节数，0 用默认值
 }
 
-type ShaperConfig struct {
-	BatchWindowMS    int     `json:"batch_window_ms"`
-	CoverBudgetRatio float64 `json:"cover_budget_ratio"`
-	CoverBudgetCap   int     `json:"cover_budget_cap"`
-}
-
-type LogConfig struct {
-	Level    string `json:"level"`
-	FilePath string `json:"file_path"`
-}
-
+// ClientConfig 是完整模式客户端配置。
 type ClientConfig struct {
 	ConfigVersion int              `json:"version"`
 	Servers       []*ServerProfile `json:"servers"`
 	Local         LocalConfig      `json:"local"`
 	Routing       RoutingConfig    `json:"routing"`
 	Transport     TransportConfig  `json:"transport"`
-	Shaper        ShaperConfig     `json:"shaper"`
-	Log           LogConfig        `json:"log"`
-	Tsnet         tsnet.Config     `json:"tsnet"`
+	Shaper        shaper.Config    `json:"shaper"`
+	Log           log.Config       `json:"log"`
 	Timeout       int              `json:"timeout"`
 	AuthUsername  string           `json:"auth_username"`
 	AuthPassword  string           `json:"auth_password"`
 	PprofEnabled  bool             `json:"pprof_enabled"`
+}
+
+// validateServers 固定服务端条目的契约：host 必填且不得含端口。冒号只在 host 是合法 IP
+// 字面量（IPv6）时才允许——带端口的域名会被拼成 https://<host>:<port>:<port>，失败点离配置很远。
+func (c *ClientConfig) validateServers() error {
+	for i, srv := range c.Servers {
+		if srv == nil {
+			return fmt.Errorf("servers[%d] is null", i)
+		}
+		if srv.Host == "" {
+			return fmt.Errorf("servers[%d].host is required", i)
+		}
+		if _, err := netip.ParseAddr(srv.Host); err != nil && strings.Contains(srv.Host, ":") {
+			return fmt.Errorf("servers[%d].host %q must not include a port; use servers[%d].port", i, srv.Host, i)
+		}
+	}
+	return nil
 }
 
 func (c *ClientConfig) DefaultServer() *ServerProfile {
@@ -117,21 +157,23 @@ func (c *ClientConfig) ServerURL() string {
 	if srv == nil {
 		return ""
 	}
-	return fmt.Sprintf("https://%s:%d", srv.Address, srv.Port)
+	return "https://" + net.JoinHostPort(srv.Host, strconv.Itoa(srv.Port))
 }
 
-// TimeoutDuration 返回归一化后的基础超时：非正值取默认值，越界值钳制到
-// [config.MinTimeout, config.MaxTimeout]（见 config.NormalizeTimeout）。
 func (c *ClientConfig) TimeoutDuration() time.Duration {
 	return config.TimeoutDuration(c.Timeout)
 }
 
-// ConnLifetimeDuration 返回传输层连接轮换前的最大存活时长，由基础超时派生
-// （config.ConnLifetime = 12 倍 timeout，默认 360s）。该值刻意不可配置：
-// 单一旋钮 timeout 即同时缩放空闲、拨号与轮换节奏，慢链路把 timeout 调大时
-// 连接不会相对更频繁地被轮换。
+// ConnLifetimeDuration 是连接轮换前的最大存活时长，由基础超时派生（12 倍，默认 360s）。
+// 刻意不可配置：单一旋钮 timeout 同时缩放空闲、拨号与轮换节奏。
 func (c *ClientConfig) ConnLifetimeDuration() time.Duration {
 	return config.ConnLifetime(c.TimeoutDuration())
+}
+
+// TunMTU 返回归一化后的 TUN MTU，它是设备真实 MTU 与 tun2socks netstack MTU 的共同来源。
+// 再归一化一次是为了覆盖不经过 applyDefaults 的构造路径。
+func (c *ClientConfig) TunMTU() int {
+	return config.NormalizeTunMTU(c.Local.TunMTU)
 }
 
 func (c *ClientConfig) UTLSConfig() *utls.Config {
@@ -142,7 +184,7 @@ func (c *ClientConfig) UTLSConfig() *utls.Config {
 
 	sni := srv.SNI
 	if sni == "" {
-		sni = srv.Address
+		sni = srv.Host
 	}
 
 	utlsCfg := &utls.Config{
@@ -191,20 +233,26 @@ func LoadConfig(path string) (*ClientConfig, error) {
 		return BuildSimpleConfig(&s)
 	}
 
-	var cfg ClientConfig
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		return nil, err
-	}
-	applyDefaults(&cfg)
+	// 完整模式与 ParseConfigJSON 共用同一条解析/归一化/校验路径，否则"从文件加载"与
+	// "从字符串加载"会对同一份配置给出不同结果。
+	return ParseConfigJSON(string(data))
+}
 
-	return &cfg, nil
+// normalizeHTTPPort 在 http_port 未配置（0）时由 socks_port 推导。socks_port 为 0（不启动
+// 本地代理）时不推导。
+func normalizeHTTPPort(c *ClientConfig) {
+	if c.Local.HTTPPort == 0 && c.Local.SocksPort > 0 {
+		c.Local.HTTPPort = c.Local.SocksPort + config.DefaultHTTPPortOffset
+	}
 }
 
 func applyDefaults(c *ClientConfig) {
-	// timeout 是全部派生超时（流空闲/UDP 空闲/拨号/DNS 响应/连接轮换）的唯一旋钮：
-	// 非正值取默认值，越界值钳制到 [MinTimeout, MaxTimeout]，使内存中的配置与
-	// 之后派生的值始终一致（见 config.NormalizeTimeout）。
+	// timeout 是全部派生超时的唯一旋钮：越界值绝不留到各消费点去兜底，否则内存中的配置与
+	// 派生的值会不一致。
 	c.Timeout = config.NormalizeTimeout(c.Timeout)
+	// MTU 与 timeout 同理：它同时作用于 TUN 设备与 netstack，两者不一致会造成静默丢包。
+	c.Local.TunMTU = config.NormalizeTunMTU(c.Local.TunMTU)
+	normalizeHTTPPort(c)
 	if c.Transport.Protocol == "" {
 		c.Transport.Protocol = config.DefaultProtocol
 	}
@@ -226,8 +274,8 @@ func applyDefaults(c *ClientConfig) {
 	if c.Transport.ConnMaxBytes <= 0 {
 		c.Transport.ConnMaxBytes = config.DefaultConnMaxBytes
 	}
-	// shaper 设置在构建 shaper 时归一化（shaper.Config.Normalize），
-	// 由它持有这些默认值与边界；在这里再保留一份副本正是导致两者偏离的原因。
+	// shaper 设置在构建 shaper 时由 shaper.Config.Normalize 归一化并持有默认值与边界，
+	// 在这里再保留一份副本正是两者偏离的原因。
 	if c.Routing.ProxyRule == "" {
 		c.Routing.ProxyRule = config.DefaultProxyRule
 	}
@@ -247,10 +295,8 @@ func applyDefaults(c *ClientConfig) {
 	}
 }
 
-// ResolveFilePaths 将配置中的相对文件路径解析为相对可执行文件目录的路径，
-// 前提是这些路径无法在当前工作目录中找到。在 macOS 上应用常由 Finder/launchd
-// 以 cwd=/ 启动，因此 direct.txt、proxy.txt 或 ca_path 等相对路径即使与
-// 二进制/.app bundle 位于同一目录，也照样无法被找到。
+// ResolveFilePaths 把相对路径解析为相对可执行文件目录（前提是当前工作目录找不到）。macOS
+// 上应用常由 Finder/launchd 以 cwd=/ 启动，相对路径即使与二进制同目录也找不到。
 func (c *ClientConfig) ResolveFilePaths() {
 	c.Routing.DirectFile = util.ResolvePath(c.Routing.DirectFile)
 	c.Routing.ProxyFile = util.ResolvePath(c.Routing.ProxyFile)
@@ -259,14 +305,20 @@ func (c *ClientConfig) ResolveFilePaths() {
 	}
 }
 
+// Clone 返回深拷贝。值拷贝覆盖标量与 json:"-" 字段，引用类型必须逐个复制；新增引用
+// 字段时这里与 TestClone 一起改，否则并发读者会看到半更新的快照。
 func (c *ClientConfig) Clone() *ClientConfig {
-	data, err := json.Marshal(c)
-	if err != nil {
-		return nil
-	}
-	var clone ClientConfig
-	if err := json.Unmarshal(data, &clone); err != nil {
-		return nil
+	clone := *c
+	clone.Local.TunConfig = bytes.Clone(c.Local.TunConfig)
+	if c.Servers != nil {
+		clone.Servers = make([]*ServerProfile, len(c.Servers))
+		for i, srv := range c.Servers {
+			if srv == nil {
+				continue
+			}
+			v := *srv
+			clone.Servers[i] = &v
+		}
 	}
 	return &clone
 }
@@ -280,9 +332,23 @@ func (c *ClientConfig) SetDefaultServerIndex(i int) {
 func (c *ClientConfig) ServerListAddrs() []string {
 	var addrs []string
 	for _, s := range c.Servers {
-		addrs = append(addrs, fmt.Sprintf("%s:%d", s.Address, s.Port))
+		addrs = append(addrs, serverAddr(s))
 	}
 	return addrs
+}
+
+// ServerListNames 返回与 ServerListAddrs 一一对应的菜单展示名：配置了 name 就用它，
+// 否则回退为 host:port。
+func (c *ClientConfig) ServerListNames() []string {
+	var names []string
+	for _, s := range c.Servers {
+		if name := strings.TrimSpace(s.Name); name != "" {
+			names = append(names, name)
+			continue
+		}
+		names = append(names, serverAddr(s))
+	}
+	return names
 }
 
 func (c *ClientConfig) DefaultServerAddr() string {
@@ -290,7 +356,13 @@ func (c *ClientConfig) DefaultServerAddr() string {
 	if srv == nil {
 		return ""
 	}
-	return fmt.Sprintf("%s:%d", srv.Address, srv.Port)
+	return serverAddr(srv)
+}
+
+// serverAddr 是 host:port 的唯一拼装入口：IPv6 字面量必须带方括号才是合法的 dial 地址与
+// URL authority（net.JoinHostPort 负责加）。
+func serverAddr(s *ServerProfile) string {
+	return net.JoinHostPort(s.Host, strconv.Itoa(s.Port))
 }
 
 func (c *ClientConfig) DefaultServerIndex() int {
@@ -308,17 +380,13 @@ func ParseConfigJSON(jsonStr string) (*ClientConfig, error) {
 		return nil, err
 	}
 	applyDefaults(&cfg)
-	return &cfg, nil
-}
-
-func DefaultConfig() *ClientConfig {
-	cfg := &ClientConfig{
-		ConfigVersion: 3,
-		Local: LocalConfig{
-			SocksPort: config.DefaultSocksPort,
-			HTTPPort:  config.DefaultHTTPPort,
-		},
+	if err := cfg.validateServers(); err != nil {
+		return nil, err
 	}
-	applyDefaults(cfg)
-	return cfg
+	// tun_config 是 RawMessage，形状不对不会在 Unmarshal 阶段暴露；完整模式与简化模式
+	// 必须共用 ParseTunConfig，否则同一份配置换条路径就有两种结果。
+	if _, err := ParseTunConfig(cfg.Local.TunConfig); err != nil {
+		return nil, err
+	}
+	return &cfg, nil
 }
