@@ -342,12 +342,6 @@ func (m *Manager) updateSubnetRoutes() {
 		return
 	}
 
-	// If user has explicitly configured extra_subnets, skip auto-fetch —
-	// the custom subnets are already registered in Start() and take priority.
-	m.mu.RLock()
-	hasCustomSubnets := len(m.customSubnets) > 0
-	m.mu.RUnlock()
-
 	// Cache self IP and hostname
 	var selfIPs []string
 	var selfHostname string
@@ -363,21 +357,29 @@ func (m *Manager) updateSubnetRoutes() {
 	var newNets []*net.IPNet
 	routeMap := make(map[string]struct{})
 
-	if !hasCustomSubnets {
-		// Auto-fetch active PrimaryRoutes announced in Tailscale mesh
-		for _, peer := range st.Peer {
-			if peer.PrimaryRoutes != nil {
-				for _, r := range peer.PrimaryRoutes.AsSlice() {
-					if ipnet := prefixToIPNet(r); ipnet != nil {
-						if _, ok := routeMap[ipnet.String()]; !ok {
-							routeMap[ipnet.String()] = struct{}{}
-							newNets = append(newNets, ipnet)
-						}
+	// Auto-fetch active PrimaryRoutes announced in Tailscale mesh
+	for _, peer := range st.Peer {
+		if peer.PrimaryRoutes != nil {
+			for _, r := range peer.PrimaryRoutes.AsSlice() {
+				if ipnet := prefixToIPNet(r); ipnet != nil {
+					if _, ok := routeMap[ipnet.String()]; !ok {
+						routeMap[ipnet.String()] = struct{}{}
+						newNets = append(newNets, ipnet)
 					}
 				}
 			}
 		}
 	}
+
+	// Also merge any user-configured extra_subnets
+	m.mu.RLock()
+	for _, cidr := range m.customSubnets {
+		if _, ok := routeMap[cidr.String()]; !ok {
+			routeMap[cidr.String()] = struct{}{}
+			newNets = append(newNets, cidr)
+		}
+	}
+	m.mu.RUnlock()
 
 	m.statusMu.Lock()
 	m.selfIPs = selfIPs
@@ -386,7 +388,7 @@ func (m *Manager) updateSubnetRoutes() {
 	m.lastStatus = time.Now()
 	m.statusMu.Unlock()
 
-	if m.router != nil && !hasCustomSubnets {
+	if m.router != nil {
 		for _, n := range newNets {
 			m.router.AddDirectCIDR(n.String())
 		}
@@ -396,11 +398,7 @@ func (m *Manager) updateSubnetRoutes() {
 	for _, n := range newNets {
 		routeStrs = append(routeStrs, n.String())
 	}
-	if hasCustomSubnets {
-		log.Info("[TSNET] using user-configured extra_subnets, skipping auto-fetch")
-	} else {
-		log.Info("[TSNET] updated active primary subnet routes", "count", len(newNets), "routes", strings.Join(routeStrs, ", "))
-	}
+	log.Info("[TSNET] updated active subnet routes", "count", len(newNets), "routes", strings.Join(routeStrs, ", "))
 }
 
 func prefixToIPNet(p netip.Prefix) *net.IPNet {
